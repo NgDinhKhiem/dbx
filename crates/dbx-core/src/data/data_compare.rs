@@ -88,6 +88,10 @@ pub struct DataCompareMissingTargetOptions {
     pub key_columns: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fetch_batch_size: Option<usize>,
+    /// Same limits as the regular table compare: above `full_compare_max_rows`
+    /// only a bounded preview is fetched, above `sample_max_rows` nothing is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degradation_threshold: Option<DegradationThreshold>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -363,9 +367,12 @@ pub async fn prepare_data_compare_from_tables(
     let source_column_names = aligned_source_column_names(&options.columns, options.source_columns.as_ref());
     let source_key_columns = aligned_source_key_columns(&options.columns, &source_column_names, &options.key_columns);
 
+    let full_row_limit = usize::try_from(threshold.full_compare_max_rows).unwrap_or(usize::MAX);
+    let mut source_truncated = false;
+    let mut target_truncated = false;
     let (source_rows, target_rows, sampling_rate, verification_method) = match &degradation_level {
         DegradationLevel::Full => {
-            let (src, tgt) = tokio::try_join!(
+            let ((src, src_truncated), (tgt, tgt_truncated)) = tokio::try_join!(
                 fetch_compare_rows(
                     state,
                     &options.source_connection_id,
@@ -376,6 +383,7 @@ pub async fn prepare_data_compare_from_tables(
                     &source_key_columns,
                     source_database_type,
                     fetch_batch_size,
+                    full_row_limit,
                 ),
                 fetch_compare_rows(
                     state,
@@ -387,8 +395,13 @@ pub async fn prepare_data_compare_from_tables(
                     &options.key_columns,
                     target_database_type,
                     fetch_batch_size,
+                    full_row_limit,
                 )
             )?;
+            // The tables grew past the full-compare limit after they were counted.
+            // Stop at the limit instead of loading an unbounded result.
+            source_truncated = src_truncated;
+            target_truncated = tgt_truncated;
             (src, tgt, 1.0, "full_compare".to_string())
         }
         DegradationLevel::Sample => {
@@ -435,22 +448,11 @@ pub async fn prepare_data_compare_from_tables(
     )
     .await?;
 
-    let source_checksums = if enable_checksum && !source_rows.is_empty() {
-        Some(compute_column_checksums(&options.columns, &source_rows))
-    } else {
-        None
-    };
-    let target_checksums = if enable_checksum && !target_rows.is_empty() {
-        Some(compute_column_checksums(&options.columns, &target_rows))
-    } else {
-        None
-    };
-
     let row_count_match = source_row_count == target_row_count;
     let confidence_score =
         compute_confidence(sampling_rate, &degradation_level, row_count_match, source_row_count, target_row_count);
 
-    let preparation = prepare_data_compare(DataComparePreparationOptions {
+    let preparation_options = DataComparePreparationOptions {
         table_name: options.target_table,
         schema: Some(options.target_schema),
         columns: options.columns,
@@ -459,7 +461,19 @@ pub async fn prepare_data_compare_from_tables(
         source_rows,
         target_rows,
         database_type: Some(target_database_type),
-    })?;
+    };
+    // Hashing, diffing and SQL generation are CPU-bound over up to
+    // `full_compare_max_rows` rows; keep them off the async worker threads.
+    let (preparation, source_checksums, target_checksums) = run_compare_blocking(move || {
+        let checksums_for = |rows: &[Vec<Value>]| {
+            (enable_checksum && !rows.is_empty())
+                .then(|| compute_column_checksums(&preparation_options.columns, rows))
+        };
+        let source_checksums = checksums_for(&preparation_options.source_rows);
+        let target_checksums = checksums_for(&preparation_options.target_rows);
+        prepare_data_compare(preparation_options).map(|preparation| (preparation, source_checksums, target_checksums))
+    })
+    .await?;
 
     Ok(DataCompareFromTablesPreparation {
         result: preparation.result,
@@ -468,8 +482,8 @@ pub async fn prepare_data_compare_from_tables(
         pre_sync_statements: Vec::new(),
         source_row_count,
         target_row_count,
-        source_truncated: false,
-        target_truncated: false,
+        source_truncated,
+        target_truncated,
         degradation_level: Some(degradation_level.to_string()),
         sampling_rate: Some(sampling_rate),
         confidence_score: Some(confidence_score),
@@ -509,19 +523,39 @@ pub async fn prepare_data_compare_missing_target(
     )
     .await?;
     let source_row_count = first_count(&source_count_result.rows)?;
-    let source_rows = fetch_compare_rows(
-        state,
-        &options.source_connection_id,
-        &options.source_database,
-        &options.source_schema,
-        &options.source_table,
-        &column_names,
-        &options.key_columns,
-        source_database_type,
-        fetch_batch_size,
-    )
-    .await?;
-    let result = missing_target_diff(&column_names, &options.key_columns, source_rows);
+    let threshold = options.degradation_threshold.clone().unwrap_or_default();
+    // Every source row becomes an INSERT, so the full-compare limit of the
+    // regular compare applies here too. A sampled subset is not offered: the
+    // sync plan would then silently copy only part of the table, so above the
+    // limit only the CREATE TABLE statements are produced and the result is
+    // flagged as truncated (use data transfer to copy large tables).
+    let degradation_level = missing_target_degradation(source_row_count, &threshold);
+    let (source_rows, source_truncated) = if degradation_level == DegradationLevel::Full {
+        fetch_compare_rows(
+            state,
+            &options.source_connection_id,
+            &options.source_database,
+            &options.source_schema,
+            &options.source_table,
+            &column_names,
+            &options.key_columns,
+            source_database_type,
+            fetch_batch_size,
+            usize::try_from(threshold.full_compare_max_rows).unwrap_or(usize::MAX),
+        )
+        .await?
+    } else {
+        (Vec::new(), source_row_count > 0)
+    };
+    // The table grew past the limit after it was counted: drop the prefix
+    // rather than planning INSERTs for part of the table.
+    let source_rows = if source_truncated { Vec::new() } else { source_rows };
+    let degradation_level = if source_truncated { DegradationLevel::SkipWithRisk } else { degradation_level };
+    let (sampling_rate, confidence_score, verification_method) = if source_truncated {
+        (0.0, 0.0, "missing_target_skipped")
+    } else {
+        (1.0, 1.0, "missing_target_full")
+    };
     let mut pre_sync_statements = Vec::new();
     pre_sync_statements.push(format!(
         "{};",
@@ -549,16 +583,24 @@ pub async fn prepare_data_compare_missing_target(
     );
 
     let column_info = source_columns.iter().cloned().map(data_grid_column_info).collect::<Vec<_>>();
-    let sync_plan = build_data_compare_sync_plan_from_refs(&[DataCompareSyncPlanTableRef {
-        table_name: &options.target_table,
-        schema: Some(&options.target_schema),
-        columns: &column_names,
-        key_columns: &options.key_columns,
-        column_info: &column_info,
-        diff: &result,
-        database_type: Some(target_database_type),
-        pre_sync_statements: &pre_sync_statements,
-    }]);
+    let target_table = options.target_table;
+    let target_schema = options.target_schema;
+    let key_columns = options.key_columns;
+    let (result, sync_plan, pre_sync_statements) = run_compare_blocking(move || {
+        let result = missing_target_diff(&column_names, &key_columns, source_rows);
+        let sync_plan = build_data_compare_sync_plan_from_refs(&[DataCompareSyncPlanTableRef {
+            table_name: &target_table,
+            schema: Some(&target_schema),
+            columns: &column_names,
+            key_columns: &key_columns,
+            column_info: &column_info,
+            diff: &result,
+            database_type: Some(target_database_type),
+            pre_sync_statements: &pre_sync_statements,
+        }]);
+        Ok((result, sync_plan, pre_sync_statements))
+    })
+    .await?;
 
     Ok(DataCompareFromTablesPreparation {
         result,
@@ -567,12 +609,12 @@ pub async fn prepare_data_compare_missing_target(
         pre_sync_statements,
         source_row_count,
         target_row_count: 0,
-        source_truncated: false,
+        source_truncated,
         target_truncated: false,
-        degradation_level: Some("full".to_string()),
-        sampling_rate: Some(1.0),
-        confidence_score: Some(1.0),
-        verification_method: Some("missing_target_full".to_string()),
+        degradation_level: Some(degradation_level.to_string()),
+        sampling_rate: Some(sampling_rate),
+        confidence_score: Some(confidence_score),
+        verification_method: Some(verification_method.to_string()),
         source_checksums: None,
         target_checksums: None,
     })
@@ -1200,20 +1242,21 @@ async fn fetch_compare_rows(
     key_columns: &[String],
     database_type: DatabaseType,
     fetch_batch_size: usize,
-) -> Result<Vec<Vec<Value>>, String> {
+    row_limit: usize,
+) -> Result<(Vec<Vec<Value>>, bool), String> {
     let mut rows = Vec::new();
     let mut offset = 0usize;
+    // Read one row past the limit so a table that grew after it was counted is
+    // reported as truncated rather than silently loaded without bound.
+    let fetch_limit = row_limit.saturating_add(1);
 
     loop {
-        let sql = build_data_compare_select_sql(
-            database_type,
-            schema,
-            table_name,
-            columns,
-            key_columns,
-            fetch_batch_size,
-            offset,
-        );
+        let page_size = fetch_batch_size.min(fetch_limit - rows.len());
+        if page_size == 0 {
+            break;
+        }
+        let sql =
+            build_data_compare_select_sql(database_type, schema, table_name, columns, key_columns, page_size, offset);
         let result = execute_sql_statement_with_options(
             state,
             connection_id,
@@ -1221,7 +1264,7 @@ async fn fetch_compare_rows(
             &sql,
             Some(schema),
             None,
-            QueryExecutionOptions { max_rows: Some(fetch_batch_size), ..Default::default() },
+            QueryExecutionOptions { max_rows: Some(page_size), ..Default::default() },
         )
         .await?;
         let fetched = result.rows.len();
@@ -1229,13 +1272,25 @@ async fn fetch_compare_rows(
             break;
         }
         rows.extend(result.rows);
-        if fetched < fetch_batch_size {
+        if fetched < page_size {
             break;
         }
         offset += fetched;
     }
 
-    Ok(rows)
+    let truncated = rows.len() > row_limit;
+    rows.truncate(row_limit);
+    Ok((rows, truncated))
+}
+
+/// Runs CPU-bound compare work (hashing, diffing, SQL generation) on the
+/// blocking pool so large compares do not stall the async runtime.
+async fn run_compare_blocking<T, F>(work: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tokio::task::spawn_blocking(work).await.map_err(|error| format!("Data compare worker failed: {error}"))?
 }
 
 fn where_by_key(
@@ -1292,6 +1347,13 @@ fn data_grid_column_info(column: crate::types::ColumnInfo) -> DataGridColumnInfo
         is_primary_key: column.is_primary_key,
         column_default: column.column_default,
         extra: column.extra,
+    }
+}
+
+fn missing_target_degradation(source_row_count: u64, threshold: &DegradationThreshold) -> DegradationLevel {
+    match should_degrade(source_row_count, 0, threshold) {
+        DegradationLevel::Full => DegradationLevel::Full,
+        DegradationLevel::Sample | DegradationLevel::SkipWithRisk => DegradationLevel::SkipWithRisk,
     }
 }
 
@@ -2992,6 +3054,45 @@ mod tests {
             "SELECT TOP (3) [id], [tenant_id], [name] FROM [dbo].[EVENTS] ORDER BY [id] DESC, [tenant_id] DESC"
         ));
         assert!(!sql.contains(" LIMIT "));
+    }
+
+    #[test]
+    fn missing_target_only_loads_rows_within_full_compare_limit() {
+        let threshold = DegradationThreshold::default();
+        assert_eq!(missing_target_degradation(0, &threshold), DegradationLevel::Full);
+        assert_eq!(missing_target_degradation(threshold.full_compare_max_rows, &threshold), DegradationLevel::Full);
+        assert_eq!(
+            missing_target_degradation(threshold.full_compare_max_rows + 1, &threshold),
+            DegradationLevel::SkipWithRisk
+        );
+        assert_eq!(missing_target_degradation(20_000_000, &threshold), DegradationLevel::SkipWithRisk);
+    }
+
+    #[test]
+    fn missing_target_options_accept_optional_degradation_threshold() {
+        let options: DataCompareMissingTargetOptions = serde_json::from_value(serde_json::json!({
+            "sourceConnectionId": "s",
+            "sourceDatabase": "db",
+            "sourceSchema": "public",
+            "sourceTable": "users",
+            "targetConnectionId": "t",
+            "targetDatabase": "db",
+            "targetSchema": "public",
+            "targetTable": "users",
+        }))
+        .unwrap();
+        assert!(options.degradation_threshold.is_none());
+    }
+
+    #[tokio::test]
+    async fn compare_blocking_work_runs_off_the_async_worker() {
+        let rows = vec![vec![json!(1), json!("a")], vec![json!(2), json!("b")]];
+        let columns = vec!["id".to_string(), "name".to_string()];
+        let expected = compute_column_checksums(&columns, &rows);
+        let checksums = run_compare_blocking(move || Ok(compute_column_checksums(&columns, &rows))).await.unwrap();
+        assert_eq!(checksums, expected);
+        let error = run_compare_blocking::<(), _>(|| Err("boom".to_string())).await.unwrap_err();
+        assert_eq!(error, "boom");
     }
 
     #[test]

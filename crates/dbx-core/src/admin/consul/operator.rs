@@ -464,11 +464,26 @@ fn document(kind: String, value: serde_json::Value) -> ConsulOperatorDocument {
                 serde_json::Value::String(value) => value.clone(),
                 _ => value.to_string(),
             };
-            rendered.truncate(4096);
+            truncate_on_char_boundary(&mut rendered, OPERATOR_FIELD_MAX_BYTES);
             fields.push(ConsulOperatorField { name: name.clone(), value: rendered });
         }
     }
     ConsulOperatorDocument { kind, fields }
+}
+
+const OPERATOR_FIELD_MAX_BYTES: usize = 4096;
+
+/// `String::truncate` panics when the cut is inside a multibyte character
+/// (CJK or accented names in Consul operator JSON), so back off to a boundary.
+fn truncate_on_char_boundary(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
 }
 
 fn redact_nested_sensitive_fields(value: &mut serde_json::Value) {
@@ -511,6 +526,20 @@ mod tests {
         assert!(!serialized.contains("top-secret"));
         assert!(!serialized.contains("nested-secret"));
         assert!(serialized.contains("safe"));
+    }
+
+    #[test]
+    fn operator_document_truncates_multibyte_values_without_panicking() {
+        // 4095 ASCII bytes followed by a 3-byte character straddles the limit.
+        let value = format!("{}{}", "a".repeat(4095), "节点".repeat(10));
+        let document = document("raft".to_string(), serde_json::json!({ "Node": value }));
+        let rendered = &document.fields[0].value;
+        assert_eq!(rendered.len(), 4095);
+        assert!(rendered.chars().all(|ch| ch == 'a'));
+
+        let mut short = "é".to_string();
+        truncate_on_char_boundary(&mut short, 4096);
+        assert_eq!(short, "é");
     }
 
     #[test]

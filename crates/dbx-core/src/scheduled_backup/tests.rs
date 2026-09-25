@@ -640,3 +640,16 @@ fn live_postgres_worker_exports_selected_tables_across_schemas() {
         cleanup.unwrap();
     });
 }
+
+#[test]
+fn worker_runtime_names_worker_and_blocking_threads() {
+    let runtime = super::worker_runtime().unwrap();
+    let worker_name = runtime.block_on(async {
+        tokio::spawn(async { std::thread::current().name().map(str::to_string) }).await.unwrap()
+    });
+    let blocking_name = runtime.block_on(async {
+        tokio::task::spawn_blocking(|| std::thread::current().name().map(str::to_string)).await.unwrap()
+    });
+    assert_eq!(worker_name.as_deref(), Some(super::WORKER_THREAD_NAME));
+    assert_eq!(blocking_name.as_deref(), Some(super::WORKER_THREAD_NAME));
+}

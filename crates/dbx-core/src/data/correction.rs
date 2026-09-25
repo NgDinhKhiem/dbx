@@ -426,7 +426,13 @@ fn summary(text: &str, max_len: usize) -> String {
     if cleaned.len() <= max_len {
         cleaned
     } else {
-        format!("{}...", &cleaned[..max_len.min(cleaned.len())])
+        // `max_len` is a byte budget; back off to a char boundary so CJK or
+        // accented table names cannot panic the slice.
+        let mut end = max_len.min(cleaned.len());
+        while !cleaned.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &cleaned[..end])
     }
 }
 
@@ -440,6 +446,16 @@ mod tests {
     use crate::schema_diff::{SchemaDiffPreparation, TableDiff};
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn summary_cuts_multibyte_text_on_char_boundary() {
+        let text = "表".repeat(40);
+        let result = summary(&text, 80);
+        assert!(result.ends_with("..."));
+        assert_eq!(result.trim_end_matches("..."), "表".repeat(26));
+        assert_eq!(summary("héllo\nworld", 2), "h...");
+        assert_eq!(summary("short", 80), "short");
+    }
 
     fn sample_table_diff(diff_type: &str, name: &str) -> TableDiff {
         TableDiff {

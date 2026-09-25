@@ -3074,7 +3074,9 @@ fn oracle_export_date_parts(value: &str) -> Option<OracleExportDateParts<'_>> {
     if bytes.len() < 10 || bytes.get(4) != Some(&b'-') || bytes.get(7) != Some(&b'-') {
         return None;
     }
-    let date = &value[..10];
+    // `get` rather than slicing: only a few bytes were checked, so byte 10 may
+    // fall inside a multibyte character (e.g. "2024-01-0é").
+    let date = value.get(..10)?;
     if !date.as_bytes().iter().enumerate().all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit()) {
         return None;
     }
@@ -3088,11 +3090,11 @@ fn oracle_export_date_parts(value: &str) -> Option<OracleExportDateParts<'_>> {
     if bytes.len() < 19 || bytes.get(13) != Some(&b':') || bytes.get(16) != Some(&b':') {
         return None;
     }
-    let time = &value[11..19];
+    let time = value.get(11..19)?;
     if !time.as_bytes().iter().enumerate().all(|(index, byte)| matches!(index, 2 | 5) || byte.is_ascii_digit()) {
         return None;
     }
-    let rest = &value[19..];
+    let rest = value.get(19..)?;
     if rest.is_empty() || is_timezone_suffix(rest) {
         return Some(OracleExportDateParts { date, time, fraction: None, zone: (!rest.is_empty()).then_some(rest) });
     }
@@ -8081,6 +8083,9 @@ where
     // every previously read row (quadratic in table size).
     let mut keyset_cursor: Vec<serde_json::Value> = Vec::new();
     let mut keyset_usable = true;
+    // SQL source metadata is loaded once per table, not once per page: each
+    // lookup is a catalog query that also reloads key information.
+    let mut sql_source_columns: Option<(Vec<db::ColumnInfo>, Vec<String>, Vec<String>)> = None;
 
     loop {
         if is_cancelled(&request.transfer_id).await {
@@ -8112,42 +8117,47 @@ where
             total_rows = Some(result.total);
             mongo_documents_for_transfer(result, is_mongodb_transfer_type(target_db_type))
         } else {
-            let columns = get_columns_for_transfer(
-                state,
-                source_pool_key,
-                &request.source_connection_id,
-                &request.source_database,
-                &request.source_schema,
-                table,
-                request.source_catalog.as_deref(),
-            )
-            .await?;
-            let col_names = columns.iter().map(|column| column.name.clone()).collect::<Vec<_>>();
-            let primary_key_columns = transfer_key_columns(&columns, source_db_type);
+            if sql_source_columns.is_none() {
+                let columns = get_columns_for_transfer(
+                    state,
+                    source_pool_key,
+                    &request.source_connection_id,
+                    &request.source_database,
+                    &request.source_schema,
+                    table,
+                    request.source_catalog.as_deref(),
+                )
+                .await?;
+                let col_names = columns.iter().map(|column| column.name.clone()).collect::<Vec<_>>();
+                let primary_key_columns = transfer_key_columns(&columns, source_db_type);
+                sql_source_columns = Some((columns, col_names, primary_key_columns));
+            }
+            let (columns, col_names, primary_key_columns) =
+                sql_source_columns.as_ref().expect("SQL source columns loaded above");
             let keyset_indexes = if keyset_usable {
-                transfer_keyset_column_indexes(&columns, &primary_key_columns, source_db_type)
+                transfer_keyset_column_indexes(columns, primary_key_columns, source_db_type)
             } else {
                 None
             };
             let sql = if keyset_indexes.is_some() {
                 keyset_pagination_sql(
-                    &col_names,
+                    col_names,
                     table,
                     &request.source_schema,
                     source_db_type,
-                    &primary_key_columns,
+                    primary_key_columns,
                     &keyset_cursor,
                     batch_size,
                 )
             } else {
                 pagination_sql_with_order(
-                    &col_names,
+                    col_names,
                     table,
                     &request.source_schema,
                     source_db_type,
                     offset,
                     batch_size,
-                    &primary_key_columns,
+                    primary_key_columns,
                     request.source_catalog.as_deref(),
                 )
             };
@@ -8168,7 +8178,7 @@ where
                     }
                 }
             }
-            sql_rows_to_mongo_documents(&col_names, &result.rows)
+            sql_rows_to_mongo_documents(col_names, &result.rows)
         };
 
         let row_count = documents.len();
@@ -10459,6 +10469,18 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oracle_export_date_parts_reject_multibyte_text_without_panicking() {
+        assert!(oracle_export_date_parts("2024-01-0é").is_none());
+        assert!(oracle_export_date_parts("2024-01-01 12:34:5é").is_none());
+        assert!(oracle_export_date_parts("2024-01-01 12:34:56é").is_none());
+        assert!(oracle_export_date_parts("日本語日本語日本語").is_none());
+        let parts = oracle_export_date_parts("2024-01-01 12:34:56.123").expect("valid timestamp");
+        assert_eq!(parts.date, "2024-01-01");
+        assert_eq!(parts.time, "12:34:56");
+        assert_eq!(parts.fraction, Some(".123"));
+    }
 
     #[test]
     fn transfer_query_timeout_errors_are_classified() {
