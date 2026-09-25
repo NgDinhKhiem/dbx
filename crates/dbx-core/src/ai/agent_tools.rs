@@ -1959,8 +1959,9 @@ for line in sys.stdin:
         ] {
             assert!(write_requires_confirmation(sql, db_type, &permissions).unwrap(), "{sql}");
         }
-        assert!(!write_requires_confirmation("SELECT count(*) FROM users", DatabaseType::Postgres, &permissions)
-            .unwrap());
+        assert!(
+            !write_requires_confirmation("SELECT count(*) FROM users", DatabaseType::Postgres, &permissions).unwrap()
+        );
 
         // Strict contexts: no write permission, or a grant bound to one exact statement.
         assert!(strict_read_only_context(&AgentSqlPermissions::default()));

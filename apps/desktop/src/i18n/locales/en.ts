@@ -3110,7 +3110,7 @@ export default {
     configNameExists: "Config name '{name}' already exists",
     deepLinkInvalid: "Unable to open AI configuration link: {message}",
     deepLinkConfirmTitle: "AI configuration link",
-    deepLinkConfirm: "A link wants to add the AI configuration \"{name}\". Prompts, query context and the API key you enter will be sent to:\n\n{endpoint}\n\nOnly continue if you trust this endpoint.",
+    deepLinkConfirm: 'A link wants to add the AI configuration "{name}". Prompts, query context and the API key you enter will be sent to:\n\n{endpoint}\n\nOnly continue if you trust this endpoint.',
     deepLinkClipboardTitle: "Import API Key",
     deepLinkClipboardPrompt: "Read the API key from the clipboard?",
     deepLinkClipboardEmpty: "The clipboard does not contain an API key. Enter it manually.",

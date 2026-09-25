@@ -393,7 +393,8 @@ mod tests {
     #[test]
     fn streamed_csv_with_bom_matches_formatted_csv() {
         let columns = vec!["id".to_string(), "note \"x\"".to_string()];
-        let rows = vec![vec![json!(1), json!("a,b")], vec![json!(2), serde_json::Value::Null], vec![json!(3), json!("中文")]];
+        let rows =
+            vec![vec![json!(1), json!("a,b")], vec![json!(2), serde_json::Value::Null], vec![json!(3), json!("中文")]];
         for mode in [CsvQuoteMode::All, CsvQuoteMode::Necessary] {
             let mut streamed = Vec::new();
             super::write_query_result_csv_with_bom(&mut streamed, &columns, &rows, mode).unwrap();
@@ -403,7 +404,8 @@ mod tests {
 
         let mut empty = Vec::new();
         super::write_query_result_csv_with_bom(&mut empty, &columns, &[], CsvQuoteMode::All).unwrap();
-        let expected = format!("\u{FEFF}{}", super::format_query_result_csv_with_quote_mode(&columns, &[], CsvQuoteMode::All));
+        let expected =
+            format!("\u{FEFF}{}", super::format_query_result_csv_with_quote_mode(&columns, &[], CsvQuoteMode::All));
         assert_eq!(String::from_utf8(empty).unwrap(), expected);
     }
 

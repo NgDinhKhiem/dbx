@@ -276,7 +276,8 @@ where
         if buffer.len() > MAX_BRIDGE_HEADER_BYTES {
             return Err(BridgeRejection::new("431 Request Header Fields Too Large", "Request headers are too large."));
         }
-        let read = stream.read(&mut chunk).await.map_err(|_| BridgeRejection::new("400 Bad Request", "Bad request."))?;
+        let read =
+            stream.read(&mut chunk).await.map_err(|_| BridgeRejection::new("400 Bad Request", "Bad request."))?;
         if read == 0 {
             return Err(BridgeRejection::new("400 Bad Request", "Incomplete request."));
         }
@@ -311,7 +312,8 @@ where
     }
     let mut body = buffer.split_off(header_end + 4);
     while body.len() < content_length {
-        let read = stream.read(&mut chunk).await.map_err(|_| BridgeRejection::new("400 Bad Request", "Bad request."))?;
+        let read =
+            stream.read(&mut chunk).await.map_err(|_| BridgeRejection::new("400 Bad Request", "Bad request."))?;
         if read == 0 {
             return Err(BridgeRejection::new("400 Bad Request", "Incomplete request body."));
         }

@@ -21,7 +21,21 @@ import { supportsTransaction } from "@/lib/database/databaseFeatureSupport";
 import { formatError, isManualTransactionSessionExpired } from "@/lib/backend/errorUtils";
 import { fetchSqlFileTargetOptions } from "@/composables/useDatabaseOptions";
 import { requiresSqlFileTargetDatabaseSelection, supportsConnectionLevelDatabaseBootstrap } from "@/lib/connection/connectionLevelDatabaseBootstrap";
-import { beginManualTransaction, commitManualTransaction, rollbackManualTransaction, cancelSqlFileExecution, executeSqlFiles, inspectSqlFileTables, listenSqlFileProgress, pickExternalFiles, previewSqlFile, type SqlFilePreview, type SqlFileProgress, type SqlFileStatus, type SqlFileTable } from "@/lib/backend/api";
+import {
+  beginManualTransaction,
+  commitManualTransaction,
+  rollbackManualTransaction,
+  cancelSqlFileExecution,
+  executeSqlFiles,
+  inspectSqlFileTables,
+  listenSqlFileProgress,
+  pickExternalFiles,
+  previewSqlFile,
+  type SqlFilePreview,
+  type SqlFileProgress,
+  type SqlFileStatus,
+  type SqlFileTable,
+} from "@/lib/backend/api";
 import { buildDisplayFileNames, tooltipText as computeTooltipText } from "./sqlFilePreviewLabel";
 import { parseSqlFilePathInput } from "./sqlFilePathInput";
 import SqlFileProgressIndicator from "./SqlFileProgressIndicator.vue";

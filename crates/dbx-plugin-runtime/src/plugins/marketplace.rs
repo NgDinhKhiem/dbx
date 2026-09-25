@@ -1486,7 +1486,9 @@ mod tests {
         ] {
             assert!(parse_http_url(allowed, "URL").is_ok(), "{allowed} should be accepted");
         }
-        for refused in ["http://plugins.example.com/plugin.dbxp", "http://10.0.0.5/catalog.json", "http://localhost.evil.com/x"] {
+        for refused in
+            ["http://plugins.example.com/plugin.dbxp", "http://10.0.0.5/catalog.json", "http://localhost.evil.com/x"]
+        {
             let error = parse_http_url(refused, "URL").unwrap_err();
             assert!(error.contains("must use HTTPS"), "unexpected error for {refused}: {error}");
         }

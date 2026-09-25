@@ -3994,7 +3994,9 @@ const snippetPassphraseTooShortForNew = computed(() => !snippetId.value.trim() &
 const snippetSecretsPassphraseTooShort = computed(() => snippetIncludeSecrets.value && isSyncPassphraseTooShort(snippetSecretsPassphrase.value));
 const webdavReady = computed(() => !!webdavEndpoint.value.trim() && !webdavEndpointInsecure.value && !webdavBusy.value && (!webdavSyncSecrets.value || !!webdavSecretsPassphrase.value.trim() || webdavHasSavedSecretsPassphrase.value));
 const webdavUploadReady = computed(() => webdavReady.value && !webdavSecretsPassphraseTooShort.value);
-const snippetReady = computed(() => !snippetSyncSettingsLoading.value && !snippetBusy.value && (snippetProvider.value !== "gitlab" || (!snippetInstanceError.value && !snippetInstanceInsecure.value && snippetInstanceUrl.value === activeSnippetInstanceUrl.value)) && (!!snippetToken.value.trim() || snippetHasSavedToken.value));
+const snippetReady = computed(
+  () => !snippetSyncSettingsLoading.value && !snippetBusy.value && (snippetProvider.value !== "gitlab" || (!snippetInstanceError.value && !snippetInstanceInsecure.value && snippetInstanceUrl.value === activeSnippetInstanceUrl.value)) && (!!snippetToken.value.trim() || snippetHasSavedToken.value),
+);
 const snippetUploadReady = computed(() => snippetReady.value && !!snippetPassphrase.value.trim() && !snippetPassphraseTooShortForNew.value && (!snippetIncludeSecrets.value || (!!snippetSecretsPassphrase.value.trim() && !snippetSecretsPassphraseTooShort.value)));
 // Legacy plaintext snippets have no outer encryption password. Let the
 // backend require one only after it detects an encrypted envelope so those

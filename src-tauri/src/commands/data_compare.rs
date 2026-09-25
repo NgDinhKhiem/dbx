@@ -5,7 +5,9 @@ use crate::commands::connection::AppState;
 
 /// Row diffing is CPU-heavy; synchronous commands run on the main thread and
 /// would freeze the UI, so the work runs on the blocking pool.
-async fn run_blocking<T: Send + 'static>(job: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
+async fn run_blocking<T: Send + 'static>(
+    job: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
     tauri::async_runtime::spawn_blocking(job).await.map_err(|error| format!("Data compare task failed: {error}"))?
 }
 

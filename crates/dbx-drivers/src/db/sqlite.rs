@@ -756,7 +756,8 @@ mod tests {
         drop(finished.begin().unwrap());
         finished.abandon();
         assert_eq!(*finished.state.lock().unwrap(), StatementState::Finished);
-        let sql = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 1000) SELECT count(*) FROM c";
+        let sql =
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 1000) SELECT count(*) FROM c";
         let count: i64 =
             pool.with_connection(|conn| conn.query_row(sql, [], |row| row.get(0)).map_err(|e| e.to_string())).unwrap();
         assert_eq!(count, 1000);

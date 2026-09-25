@@ -886,7 +886,12 @@ impl SecretSlot {
     }
 
     fn optional(field: &str) -> Self {
-        Self { path: field.to_string(), parent: String::new(), field: field.to_string(), kind: SecretSlotKind::Optional }
+        Self {
+            path: field.to_string(),
+            parent: String::new(),
+            field: field.to_string(),
+            kind: SecretSlotKind::Optional,
+        }
     }
 }
 
@@ -1201,11 +1206,11 @@ pub fn merge_stored_connection_secrets(
     }
 
     let mut plugin_secrets = incoming.connection_secrets.clone();
-    plugin_secrets.retain(|key, secret| {
-        !(secret.is_empty() && cleared.contains(format!("connection_secrets.{key}").as_str()))
-    });
+    plugin_secrets
+        .retain(|key, secret| !(secret.is_empty() && cleared.contains(format!("connection_secrets.{key}").as_str())));
     if let Some(stored) = stored.filter(|stored| {
-        stored.plugin_id == incoming.plugin_id && stored.plugin_connection_provider == incoming.plugin_connection_provider
+        stored.plugin_id == incoming.plugin_id
+            && stored.plugin_connection_provider == incoming.plugin_connection_provider
     }) {
         for (key, secret) in &stored.connection_secrets {
             if secret.is_empty() || cleared.contains(format!("connection_secrets.{key}").as_str()) {
@@ -2050,13 +2055,16 @@ mod tests {
 
         let redacted = super::redact_connection_for_client(&config).unwrap();
         let text = redacted.to_string();
-        for secret in ["db-secret", "url-secret", "ssh-secret", "pp-value", "tunnel-token", "plugin-secret", "Password=cs"] {
+        for secret in
+            ["db-secret", "url-secret", "ssh-secret", "pp-value", "tunnel-token", "plugin-secret", "Password=cs"]
+        {
             assert!(!text.contains(secret), "{secret} leaked: {text}");
         }
         assert_eq!(redacted["url_params"], "sslmode=require&password=;apiKey=");
         assert!(redacted["connection_string"].is_null());
         assert!(redacted.get("connection_secrets").is_none());
-        let saved = redacted["saved_secrets"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect::<Vec<_>>();
+        let saved =
+            redacted["saved_secrets"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect::<Vec<_>>();
         assert_eq!(
             saved,
             vec![

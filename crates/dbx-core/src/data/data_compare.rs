@@ -466,8 +466,7 @@ pub async fn prepare_data_compare_from_tables(
     // `full_compare_max_rows` rows; keep them off the async worker threads.
     let (preparation, source_checksums, target_checksums) = run_compare_blocking(move || {
         let checksums_for = |rows: &[Vec<Value>]| {
-            (enable_checksum && !rows.is_empty())
-                .then(|| compute_column_checksums(&preparation_options.columns, rows))
+            (enable_checksum && !rows.is_empty()).then(|| compute_column_checksums(&preparation_options.columns, rows))
         };
         let source_checksums = checksums_for(&preparation_options.source_rows);
         let target_checksums = checksums_for(&preparation_options.target_rows);
@@ -551,11 +550,8 @@ pub async fn prepare_data_compare_missing_target(
     // rather than planning INSERTs for part of the table.
     let source_rows = if source_truncated { Vec::new() } else { source_rows };
     let degradation_level = if source_truncated { DegradationLevel::SkipWithRisk } else { degradation_level };
-    let (sampling_rate, confidence_score, verification_method) = if source_truncated {
-        (0.0, 0.0, "missing_target_skipped")
-    } else {
-        (1.0, 1.0, "missing_target_full")
-    };
+    let (sampling_rate, confidence_score, verification_method) =
+        if source_truncated { (0.0, 0.0, "missing_target_skipped") } else { (1.0, 1.0, "missing_target_full") };
     let mut pre_sync_statements = Vec::new();
     pre_sync_statements.push(format!(
         "{};",

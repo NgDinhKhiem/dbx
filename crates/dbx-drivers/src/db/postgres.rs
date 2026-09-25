@@ -10658,7 +10658,11 @@ mod tests {
         let notices = buffer.take();
         assert_eq!(notices.len(), MAX_POSTGRES_NOTICES_PER_STATEMENT + 1);
         assert_eq!(notices[0].message, "notice 0");
-        assert!(notices.last().unwrap().message.starts_with("25 notices dropped"), "{}", notices.last().unwrap().message);
+        assert!(
+            notices.last().unwrap().message.starts_with("25 notices dropped"),
+            "{}",
+            notices.last().unwrap().message
+        );
 
         // The next statement starts with an empty buffer and no dropped count.
         buffer.push(test_query_message("next"));

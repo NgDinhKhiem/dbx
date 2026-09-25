@@ -119,7 +119,9 @@ mod tests {
         let second = public_key_b64(&signing_key(2));
         let keys = trusted_registry_keys_from(&[first.as_str()], &format!(" {second},\n")).unwrap();
         assert_eq!(keys.len(), 2);
-        assert!(trusted_registry_keys_from(&[], "not-a-key").unwrap_err().contains("Invalid agent registry public key"));
+        assert!(trusted_registry_keys_from(&[], "not-a-key")
+            .unwrap_err()
+            .contains("Invalid agent registry public key"));
         assert!(trusted_registry_keys_from(&[], &BASE64.encode([0_u8; 31])).unwrap_err().contains("32 bytes"));
     }
 
