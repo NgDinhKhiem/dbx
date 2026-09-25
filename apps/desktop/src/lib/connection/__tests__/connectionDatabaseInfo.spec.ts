@@ -69,7 +69,12 @@ describe("connectionDatabaseInfo", () => {
     const original = config({ transport_layers: [{ id: "ssh", type: "ssh", host: "jump", port: 22, user: "root", password: "hop-secret" }] });
     const reordered = Object.fromEntries(Object.entries(original).reverse()) as unknown as ConnectionConfig;
     expect(connectionConfigFingerprint(reordered)).toBe(connectionConfigFingerprint(original));
-    expect(connectionConfigFingerprint({ ...original, password: "changed" })).not.toBe(connectionConfigFingerprint(original));
+    // Secrets stay in the backend: the saved in-memory copy carries blanks plus
+    // `saved_secrets`, so secret values never distinguish two configs.
+    expect(connectionConfigFingerprint({ ...original, password: "changed" })).toBe(connectionConfigFingerprint(original));
+    expect(connectionConfigFingerprint({ ...original, password: "", saved_secrets: ["password"] })).toBe(connectionConfigFingerprint(original));
+    expect(connectionConfigFingerprint({ ...original, transport_layers: [{ ...original.transport_layers![0], password: "" }] })).toBe(connectionConfigFingerprint(original));
+    expect(connectionConfigFingerprint({ ...original, username: "other" })).not.toBe(connectionConfigFingerprint(original));
     expect(connectionConfigFingerprint({ ...original, name: "Renamed" })).not.toBe(connectionConfigFingerprint(original));
     expect(connectionConfigFingerprint({ ...original, transport_layers: [{ ...original.transport_layers![0], host: "other-jump" }] })).not.toBe(connectionConfigFingerprint(original));
     expect(connectionConfigFingerprint(original, "")).not.toBe(connectionConfigFingerprint(original, original.name));

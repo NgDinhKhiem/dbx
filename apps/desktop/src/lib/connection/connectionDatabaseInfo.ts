@@ -93,9 +93,30 @@ function fnv1a(value: string, seed: number): number {
   return hash >>> 0;
 }
 
+// Secret values stay in the backend: the in-memory copy of a saved connection
+// carries blanks plus `saved_secrets`, while a config submitted for connecting
+// may still hold the typed value. Neither describes a different endpoint, so
+// secrets and their bookkeeping are left out of the fingerprint.
+const FINGERPRINT_SECRET_FIELDS = ["password", "redis_sentinel_password", "saved_secrets", "cleared_secrets", "secrets_from_connection_id"] as const;
+const FINGERPRINT_LAYER_SECRET_FIELDS = ["password", "key_passphrase", "token"] as const;
+
+function withoutSecrets(config: Record<string, unknown>): Record<string, unknown> {
+  const copy: Record<string, unknown> = { ...config };
+  for (const field of FINGERPRINT_SECRET_FIELDS) delete copy[field];
+  if (Array.isArray(copy.transport_layers)) {
+    copy.transport_layers = copy.transport_layers.map((layer) => {
+      if (!layer || typeof layer !== "object") return layer;
+      const layerCopy: Record<string, unknown> = { ...(layer as Record<string, unknown>) };
+      for (const field of FINGERPRINT_LAYER_SECRET_FIELDS) delete layerCopy[field];
+      return layerCopy;
+    });
+  }
+  return copy;
+}
+
 export function connectionConfigFingerprint(config: ConnectionConfig, sourceName = config.name): string {
   const { database_info: _databaseInfo, default_schema: _defaultSchema, note: _note, ...submittedConfig } = config;
-  const serialized = JSON.stringify(stableValue({ config: submittedConfig, sourceName }));
+  const serialized = JSON.stringify(stableValue({ config: withoutSecrets(submittedConfig as Record<string, unknown>), sourceName }));
   const first = fnv1a(serialized, 0x811c9dc5).toString(16).padStart(8, "0");
   const second = fnv1a(serialized, 0x9e3779b9).toString(16).padStart(8, "0");
   return `${first}${second}`;

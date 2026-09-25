@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, type HTMLAttributes } from "vue";
 import { useI18n } from "vue-i18n";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
@@ -16,7 +16,7 @@ const props = defineProps<{
   clearedSecrets: readonly string[];
   transportLayers?: readonly TransportLayerConfig[];
   pluginFields?: readonly PluginFormField[];
-  labelClass?: unknown;
+  labelClass?: HTMLAttributes["class"];
 }>();
 
 const emit = defineEmits<{
