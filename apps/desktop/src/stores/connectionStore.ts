@@ -70,6 +70,7 @@ import {
 import {
   applyTableVGroupsToChildren,
   collectTableTreeNames,
+  clearTableVGroupPlacement as clearTableVGroupPlacementOp,
   createTableVGroup as createTableVGroupOp,
   deleteTableVGroups as deleteTableVGroupsOp,
   emptyTableVGroupLayout,
@@ -82,8 +83,11 @@ import {
   reorderTableVGroupEntry as reorderTableVGroupEntryOp,
   renameTableVGroup as renameTableVGroupOp,
   resolveTableVGroupScopeFromNode,
+  setTableVGroupRule as setTableVGroupRuleOp,
   setTableVGroupsEnabled as setTableVGroupsEnabledOp,
+  type TableVGroupRule,
   stripTableVGroupsFromChildren,
+  tableVGroupCandidateNames,
   tableVGroupKindOfContainerNode,
   tableVGroupPathForTable as tableVGroupPathForTableOp,
   tableVGroupScopeKey,
@@ -1954,7 +1958,9 @@ export const useConnectionStore = defineStore("connection", () => {
       treeNodeLoads.invalidateDescendants(parent.id);
     }
     if (parent.children && parent.children.length > 0) {
-      const oldMap = new Map(parent.children.map((c) => [c.id, c] as const));
+      // Rows may sit inside projected virtual groups; look through them so
+      // grouped rows keep their expansion and loaded children.
+      const oldMap = new Map(stripTableVGroupsFromChildren(parent.children).map((c) => [c.id, c] as const));
       const nextIds = new Set(children.map((child) => child.id));
       // Discarded shells collect here so their persisted-cache deletes can be
       // aggregated into one prefix request per ancestor (issue #9779).
@@ -10051,12 +10057,30 @@ export const useConnectionStore = defineStore("connection", () => {
       const resolved = resolveTableVGroupScope(scope);
       return resolved ? tableVGroupLayouts.value[resolved.scopeKey] : undefined;
     },
-    createTableVGroup(scope: TableVGroupScope, name: string, parentGroupId?: string | null) {
+    /** Names currently loaded in the container a scope arranges (regex preview). */
+    tableVGroupCandidateNamesFor(scope: TableVGroupScope): string[] {
+      const resolved = resolveTableVGroupScope(scope);
+      if (!resolved) return [];
+      const container = findTableVGroupContainerNode(treeNodes.value, resolved.scope);
+      return container ? tableVGroupCandidateNames(container) : [];
+    },
+    /** Scope of the database groups directly under a connection. */
+    databaseVGroupScope(connectionId: string): TableVGroupScope {
+      return { connectionId, objectType: "databases" };
+    },
+    createTableVGroup(scope: TableVGroupScope, name: string, parentGroupId?: string | null, rule?: TableVGroupRule | null) {
       const resolved = resolveTableVGroupScope(scope);
       if (!resolved) return null;
-      const result = createTableVGroupOp(tableVGroupLayouts.value[resolved.scopeKey] ?? emptyTableVGroupLayout(), name, parentGroupId);
+      const result = createTableVGroupOp(tableVGroupLayouts.value[resolved.scopeKey] ?? emptyTableVGroupLayout(), name, parentGroupId, rule);
       updateTableVGroupLayout(resolved.scope, resolved.scopeKey, result.layout);
       return result.groupId;
+    },
+    setTableVGroupRule(scope: TableVGroupScope, groupId: string, rule: TableVGroupRule | null) {
+      updateTableVGroupLayoutFor(scope, (layout) => setTableVGroupRuleOp(layout, groupId, rule));
+    },
+    /** Let rule groups decide again where this row goes. */
+    clearTableVGroupPlacement(scope: TableVGroupScope, tableName: string, rowType?: string) {
+      updateTableVGroupLayoutFor(scope, (layout) => clearTableVGroupPlacementOp(layout, tableName, rowType), tableName, rowType);
     },
     renameTableVGroup(scope: TableVGroupScope, groupId: string, name: string) {
       updateTableVGroupLayoutFor(scope, (layout) => renameTableVGroupOp(layout, groupId, name));

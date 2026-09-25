@@ -39,6 +39,7 @@ import {
   Search,
   FolderInput,
   FolderPlus,
+  Regex,
   Eraser,
   Scissors,
   CopyPlus,
@@ -85,7 +86,22 @@ import { canTreeNodePin, canTreeNodeShowExpander } from "@/lib/sidebar/sidebarTr
 import { sidebarConnectionVisibleFilterMenu } from "@/lib/sidebar/sidebarVisibleFilterMenu";
 import { supportsSidebarObjectNameFilter } from "@/lib/sidebar/sidebarObjectNameFilter";
 import { connectionGroupDestinationRows } from "@/lib/sidebar/sidebarLayout";
-import { hasTableVGroupEntries, isTableVGroupContainerNode, isTableVGroupGroupableRowType, resolveTableVGroupScopeFromNode, selectedTableVGroupMoveTargets, tableVGroupDestinationRows, tableVGroupPathForTable, tableVGroupScopeKey, tableVGroupsEnabled } from "@/lib/table/tableVGroup";
+import {
+  hasTableVGroupEntries,
+  isDatabaseVGroupRow,
+  isTableVGroupContainerNode,
+  isTableVGroupGroupableRowType,
+  resolveTableVGroupScopeFromNode,
+  selectedTableVGroupMoveTargets,
+  tableVGroupDestinationRows,
+  tableVGroupHasExplicitPlacement,
+  tableVGroupLayoutHasRules,
+  tableVGroupPathForTable,
+  tableVGroupRowName,
+  tableVGroupScopeKey,
+  tableVGroupsEnabled,
+  type TableVGroupScope,
+} from "@/lib/table/tableVGroup";
 import { objectTypesForGroupNode } from "@/lib/table/tableTree";
 import { loadSidebarObjectGroup } from "@/lib/sidebar/sidebarObjectGroupRouting";
 import { requestObjectBrowserSearchFocus } from "@/lib/tabs/objectBrowserSearchFocus";
@@ -221,13 +237,9 @@ import {
   sidebarDangerRunningCancel,
   sidebarFormTarget,
   showDeleteConfirm,
-  showTableVGroupDialog,
+  openTableVGroupDialog,
   showTableVGroupDeleteConfirm,
   tableVGroupDeleteTarget,
-  tableVGroupName,
-  tableVGroupDialogScope,
-  tableVGroupDialogParentGroupId,
-  tableVGroupDialogTableNames,
   showDropTableConfirm,
   showDropTableChildObjectConfirm,
   showBatchDropConfirm,
@@ -5564,6 +5576,11 @@ function buildConnectionSidebarMenu(context: SidebarMenuFactoryContext): boolean
     const connectionUrlCopyMenu = connectionUrlCopyMenuItem();
     if (connectionUrlCopyMenu) items.push(connectionUrlCopyMenu);
     items.push({ label: "", separator: true });
+    const databaseGroupItems = tableVGroupContainerMenuItems(node);
+    if (databaseGroupItems.length) {
+      items.push({ label: t("tableVGroup.databaseGroupsMenu"), icon: FolderInput, children: databaseGroupItems });
+      items.push({ label: "", separator: true });
+    }
     const supportsQueryActions = supportsConnectionQueryActions(currentDatabaseType());
     const supportsAiContext = supportsAiAssistantContext(currentDatabaseType());
     if (supportsQueryActions) {
@@ -5761,6 +5778,8 @@ function buildConnectionSidebarMenu(context: SidebarMenuFactoryContext): boolean
 
 function buildDatabaseSidebarMenu(context: SidebarMenuFactoryContext): boolean {
   const { node, items } = context;
+  const databaseGroupItems = buildDatabaseVGroupMoveMenuItems(node);
+  if (databaseGroupItems.length) items.push({ label: t("tableVGroup.moveDatabaseToGroup"), icon: FolderInput, children: databaseGroupItems });
   appendTableVGroupContainerItems(node, items);
   // 4. Database / Schema
   if (node.type === "database" || node.type === "schema") {
@@ -6621,28 +6640,91 @@ function buildTableVGroupMoveMenuItems(node: TreeNode): ContextMenuItem[] {
   items.push({ label: "", separator: true });
   items.push({
     label: t("tableVGroup.moveToNewGroup"),
-    action: () => {
-      tableVGroupDialogScope.value = node;
-      tableVGroupDialogParentGroupId.value = null;
-      tableVGroupDialogTableNames.value = targetNames;
-      tableVGroupName.value = "";
-      showTableVGroupDialog.value = true;
-    },
+    action: () => openTableVGroupDialog({ scope: node, tableNames: targetNames }),
     icon: FolderPlus,
   });
   return items;
 }
 
-function appendTableVGroupContainerItems(node: TreeNode, items: ContextMenuItem[]) {
-  if (!isTableVGroupContainerNode(node)) return;
-  const layout = connectionStore.tableVGroupLayoutFor(node);
-  if (!hasTableVGroupEntries(layout)) return;
-  const enabled = tableVGroupsEnabled(layout);
+/** "Move to Group" for database/schema rows directly under a connection. */
+function buildDatabaseVGroupMoveMenuItems(node: TreeNode): ContextMenuItem[] {
+  if (!node.connectionId || !isDatabaseVGroupRow(connectionStore.treeNodes, node)) return [];
+  const scope = connectionStore.databaseVGroupScope(node.connectionId);
+  const selected = selectedTreeNodesInVisibleOrder().filter((candidate) => candidate.type === node.type && candidate.connectionId === node.connectionId && isDatabaseVGroupRow(connectionStore.treeNodes, candidate));
+  const targets = selected.some((candidate) => candidate.id === node.id) ? selected : [node];
+  const names = targets.map((target) => tableVGroupRowName(target)).filter(Boolean);
+  if (!names.length) return [];
+  const rowType = node.type;
+  const layout = connectionStore.tableVGroupLayoutFor(scope);
+  const inGroup = (groupId: string) => names.every((name) => tableVGroupPathForTable(layout, name, rowType).includes(groupId));
+  const items: ContextMenuItem[] = tableVGroupDestinationRows(layout).map((row) => ({
+    label: row.name,
+    title: row.path.join(" / "),
+    disabled: inGroup(row.id),
+    action: () => {
+      for (const name of names) connectionStore.moveTableToVGroup(scope, name, row.id, rowType);
+    },
+  }));
+  if (names.some((name) => tableVGroupPathForTable(layout, name, rowType).length > 0)) {
+    items.push({
+      label: t("tableVGroup.removeFromGroup"),
+      action: () => {
+        for (const name of names) connectionStore.moveTableToVGroup(scope, name, null, rowType);
+      },
+    });
+  }
+  if (tableVGroupLayoutHasRules(layout) && names.some((name) => tableVGroupHasExplicitPlacement(layout, name, rowType))) {
+    items.push({
+      label: t("tableVGroup.useRules"),
+      action: () => {
+        for (const name of names) connectionStore.clearTableVGroupPlacement(scope, name, rowType);
+      },
+      icon: Regex,
+    });
+  }
+  if (items.length) items.push({ label: "", separator: true });
   items.push({
-    label: enabled ? t("tableVGroup.disableGroups") : t("tableVGroup.enableGroups"),
-    action: () => connectionStore.setTableVGroupsEnabled(node, !enabled),
-    icon: FolderInput,
+    label: t("tableVGroup.moveToNewGroup"),
+    action: () => openTableVGroupDialog({ scope, kind: "databases", tableNames: names, rowType }),
+    icon: FolderPlus,
   });
+  return items;
+}
+
+/** New group / regex group / show-hide entries for a container's own groups. */
+function tableVGroupContainerMenuItems(node: TreeNode): ContextMenuItem[] {
+  if (!isTableVGroupContainerNode(node)) return [];
+  const isDatabases = node.type === "connection";
+  const scope: TableVGroupScope | TreeNode = isDatabases ? connectionStore.databaseVGroupScope(node.connectionId ?? node.id) : node;
+  const kind = isDatabases ? "databases" : "tables";
+  const candidateNames = connectionStore.tableVGroupCandidateNamesFor(scope);
+  const items: ContextMenuItem[] = [];
+  if (isDatabases) {
+    // Groups of databases only make sense once the database list is loaded.
+    if (!candidateNames.length) return [];
+    items.push({ label: t("tableVGroup.newDatabaseGroup"), action: () => openTableVGroupDialog({ scope, kind }), icon: FolderPlus });
+  }
+  items.push({
+    label: isDatabases ? t("tableVGroup.newDatabaseRuleGroupMenu") : t("tableVGroup.newRuleGroupMenu"),
+    action: () => openTableVGroupDialog({ scope, kind, ruleMode: true, candidateNames: connectionStore.tableVGroupCandidateNamesFor(scope) }),
+    icon: Regex,
+  });
+  const layout = connectionStore.tableVGroupLayoutFor(scope);
+  if (hasTableVGroupEntries(layout)) {
+    const enabled = tableVGroupsEnabled(layout);
+    items.push({
+      label: enabled ? t("tableVGroup.disableGroups") : t("tableVGroup.enableGroups"),
+      action: () => connectionStore.setTableVGroupsEnabled(scope, !enabled),
+      icon: FolderInput,
+    });
+  }
+  return items;
+}
+
+function appendTableVGroupContainerItems(node: TreeNode, items: ContextMenuItem[]) {
+  const groupItems = tableVGroupContainerMenuItems(node);
+  if (!groupItems.length) return;
+  items.push({ label: t("tableVGroup.groupsMenu"), icon: FolderInput, children: groupItems });
   items.push({ label: "", separator: true });
 }
 
@@ -6650,16 +6732,25 @@ function buildTableVGroupSidebarMenu(context: SidebarMenuFactoryContext): boolea
   const { node, items } = context;
   if (node.type !== "table-vgroup" || !node.vgroupId) return false;
   const groupId = node.vgroupId;
+  const kind = node.vgroupKind === "databases" ? "databases" : "tables";
+  const candidateNames = () => connectionStore.tableVGroupCandidateNamesFor(node);
   items.push({
     label: t("tableVGroup.newSubgroup"),
-    action: () => {
-      tableVGroupDialogScope.value = node;
-      tableVGroupDialogParentGroupId.value = groupId;
-      tableVGroupDialogTableNames.value = [];
-      tableVGroupName.value = "";
-      showTableVGroupDialog.value = true;
-    },
+    action: () => openTableVGroupDialog({ scope: node, kind, parentGroupId: groupId }),
     icon: FolderPlus,
+  });
+  items.push({
+    label: t("tableVGroup.newRuleSubgroup"),
+    action: () => openTableVGroupDialog({ scope: node, kind, parentGroupId: groupId, ruleMode: true, candidateNames: candidateNames() }),
+    icon: Regex,
+  });
+  items.push({
+    label: node.vgroupPattern ? t("tableVGroup.editRule") : t("tableVGroup.addRule"),
+    action: () => {
+      const group = connectionStore.tableVGroupLayoutFor(node)?.groups.find((candidate) => candidate.id === groupId);
+      openTableVGroupDialog({ scope: node, kind, ruleMode: true, editGroupId: groupId, pattern: group?.pattern ?? "", ignoreCase: group?.patternIgnoreCase !== false, candidateNames: candidateNames() });
+    },
+    icon: Regex,
   });
   items.push({ label: t("connectionGroup.renameGroup"), action: () => emit("request-group-rename", node.id), icon: Pencil, shortcut: shortcutRename });
   items.push({

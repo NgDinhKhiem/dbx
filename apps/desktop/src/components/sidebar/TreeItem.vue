@@ -252,7 +252,8 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
     case "connection-group":
       return { icon: node.isExpanded ? FolderOpen : FolderClosed, colorClass: "text-amber-500" };
     case "table-vgroup":
-      return { icon: node.isExpanded ? FolderOpen : FolderClosed, colorClass: "text-emerald-500" };
+      // Rule (regex) groups get their own color so they read differently from manual groups.
+      return { icon: node.isExpanded ? FolderOpen : FolderClosed, colorClass: node.vgroupPattern ? "text-violet-500" : "text-emerald-500" };
     case "database":
       return { icon: Database, colorClass: "text-yellow-500" };
     case "tablespace":
@@ -459,6 +460,7 @@ function treeNodeSecondaryValue(node: TreeNode): string | undefined {
   if (node.type === "type-member") return (node.meta as CustomTypeTreeMemberMeta | undefined)?.displayValue;
   if (node.type === "datafile") return node.xuguDatafilePath;
   if (node.type === "elasticsearch-index") return elasticsearchIndexAliasLabel(node);
+  if (node.type === "table-vgroup" && node.vgroupPattern) return `/${node.vgroupPattern}/`;
   return undefined;
 }
 

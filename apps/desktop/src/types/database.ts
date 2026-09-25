@@ -1579,9 +1579,19 @@ export interface SidebarLayout {
 
 export type TableVGroupOrderEntry = { type: "group"; id: string; children?: TableVGroupOrderEntry[] } | { type: "table"; name: string; /** 行类型（view/procedure/…）。同名双行容器（包 spec/body、type/type-body）靠它区分成员；缺省 = 按名字匹配（历史数据与表）。 */ rowType?: string };
 
+/**
+ * A virtual group definition. `pattern` turns it into a rule group: rows the
+ * layout does not place explicitly join the first rule group whose regular
+ * expression matches their name.
+ */
+export interface TableVGroupDefinition extends ConnectionGroup {
+  pattern?: string;
+  patternIgnoreCase?: boolean;
+}
+
 export interface TableVGroupLayout {
   version?: number;
-  groups: ConnectionGroup[];
+  groups: TableVGroupDefinition[];
   order: TableVGroupOrderEntry[];
   /** Toggled by the container context menu to hide groups without deleting them. */
   enabled?: boolean;
@@ -1646,6 +1656,8 @@ export interface TreeNode {
   vgroupId?: string;
   /** 投影时盖章的分组类别（tables/views/…），供拖拽落点 O(1) 类别判定。 */
   vgroupKind?: string;
+  /** Regular expression of a rule-based virtual group (display only). */
+  vgroupPattern?: string;
   meta?: ColumnInfo | IndexInfo | ForeignKeyInfo | TriggerInfo | ConstraintInfo | PartitionInfo | SubpartitionInfo | ExtensionInfo | VectorCollectionMeta | MongoCollectionMeta | CustomTypeTreeMemberMeta;
   loadMore?: {
     parentId: string;
