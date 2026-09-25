@@ -128,6 +128,14 @@ impl SecretCodec {
                 default_key_path().or_else(|| Some(managed_key_path(data_dir))),
                 allow_create,
             ),
+            // Development/test switch (set in .cargo/config.toml): behave like the
+            // desktop's LocalKeyFile policy and never touch the OS credential
+            // store. Test binaries are new unsigned programs to macOS, so every
+            // run would otherwise raise Keychain prompts.
+            SecretKeyPolicy::PlatformDefault if os_keyring_disabled() => Self::resolve_local_key_file(
+                default_key_path().or_else(|| Some(managed_key_path(data_dir))),
+                allow_create,
+            ),
             SecretKeyPolicy::PlatformDefault => {
                 Self::resolve_platform_default(default_key_path(), allow_create, platform_keyring_codec)
             }
@@ -373,6 +381,13 @@ fn read_key_file_with_retry(path: &std::path::Path, reject_symlink: bool) -> Res
         }
     }
     Err("KEY_FILE_UNAVAILABLE".to_string())
+}
+
+/// `DBX_DISABLE_OS_KEYRING=1` makes `PlatformDefault` use only the per-user
+/// key file, like `LocalKeyFile`, never the OS credential store. Cargo sets it
+/// for every build/test in this repository.
+fn os_keyring_disabled() -> bool {
+    std::env::var_os("DBX_DISABLE_OS_KEYRING").is_some_and(|value| !value.is_empty() && value != "0")
 }
 
 fn default_key_path() -> Option<std::path::PathBuf> {
