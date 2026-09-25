@@ -612,14 +612,14 @@ pub(super) fn build_add_column_sql(
         statements.push(format!(
             "COMMENT ON COLUMN {table}.{} IS {};",
             quote_ident(dialect, &column.name),
-            quote_string(&clean(&column.comment))
+            quote_string(dialect, &clean(&column.comment))
         ));
     }
     if dialect == StructureDialect::ClickHouse && !clean(&column.comment).is_empty() {
         statements.push(format!(
             "ALTER TABLE {table} COMMENT COLUMN {} {};",
             quote_ident(dialect, &column.name),
-            quote_string(&clean(&column.comment))
+            quote_string(dialect, &clean(&column.comment))
         ));
     }
     if dialect == StructureDialect::SqlServer && !clean(&column.comment).is_empty() {

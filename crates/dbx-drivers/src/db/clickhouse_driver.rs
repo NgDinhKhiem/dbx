@@ -192,6 +192,28 @@ fn append_extra_params(url: &mut String, extra_params: Option<&str>) {
     }
 }
 
+/// Log-safe form of a request URL. The query string carries the user's `url_params` (which may
+/// hold credentials, tokens or other server settings) and any `user:pass@` userinfo is dropped too.
+fn redact_url_for_log(url: &str) -> String {
+    let without_query = url.split(['?', '#']).next().unwrap_or(url);
+    let redacted = match without_query.split_once("://") {
+        Some((scheme, rest)) => {
+            let (authority, path) = match rest.find('/') {
+                Some(index) => rest.split_at(index),
+                None => (rest, ""),
+            };
+            let host = authority.rsplit_once('@').map(|(_, host)| host).unwrap_or(authority);
+            format!("{scheme}://{host}{path}")
+        }
+        None => without_query.to_string(),
+    };
+    if without_query.len() < url.len() {
+        format!("{redacted}?<redacted>")
+    } else {
+        redacted
+    }
+}
+
 fn build_connection_test_url(base_url: &str, extra_params: Option<&str>) -> String {
     let mut url = format!("{}/?query=SELECT%201", base_url);
     append_extra_params(&mut url, extra_params);
@@ -309,7 +331,12 @@ async fn ch_query_with_limit(
         QueryResultLimit::Limited(max_rows) => Some(max_rows),
     };
     let url = build_query_url(&client.base_url, database, limit, client.extra_params.as_deref());
-    log::info!("[clickhouse] query url={url} user={:?} has_pass={}", client.username, client.password.is_some());
+    log::info!(
+        "[clickhouse] query url={} user={:?} has_pass={}",
+        redact_url_for_log(&url),
+        client.username,
+        client.password.is_some()
+    );
     let req = build_request(client, client.http.post(&url).body(sql.to_string()));
     let resp = req.send().await.map_err(|e| format!("ClickHouse request failed: {e}"))?;
     log::info!("[clickhouse] response status={}", resp.status());
@@ -382,7 +409,12 @@ async fn stream_query_once(
         QueryResultFormat::JsonCompactEachRowWithNamesAndTypes,
         client.extra_params.as_deref(),
     );
-    log::info!("[clickhouse] stream query url={url} user={:?} has_pass={}", client.username, client.password.is_some());
+    log::info!(
+        "[clickhouse] stream query url={} user={:?} has_pass={}",
+        redact_url_for_log(&url),
+        client.username,
+        client.password.is_some()
+    );
     let req = build_request(client, client.http.post(&url).body(sql.to_string()));
     let resp = req.send().await.map_err(|e| format!("ClickHouse request failed: {e}"))?;
     log::info!("[clickhouse] stream response status={}", resp.status());
@@ -733,8 +765,8 @@ pub async fn get_columns(client: &ChClient, database: &str, table: &str) -> Resu
     let sql = format!(
         "SELECT name, type, default_kind, default_expression, is_in_primary_key, is_in_partition_key, comment \
          FROM system.columns WHERE database = '{}' AND table = '{}' ORDER BY position",
-        database.replace('\'', "\\'"),
-        table.replace('\'', "\\'")
+        clickhouse_literal(database),
+        clickhouse_literal(table)
     );
     let result = ch_query(client, &sql, Some(database)).await?;
     Ok(result
@@ -860,6 +892,26 @@ pub async fn execute_query_with_max_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redacts_query_parameters_and_userinfo_from_logged_urls() {
+        assert_eq!(
+            redact_url_for_log("http://localhost:8123/?default_format=JSONCompact&password=secret&token=abc"),
+            "http://localhost:8123/?<redacted>"
+        );
+        assert_eq!(
+            redact_url_for_log("https://user:pass@ch.example.com:8443/proxy/?database=db"),
+            "https://ch.example.com:8443/proxy/?<redacted>"
+        );
+        assert_eq!(redact_url_for_log("http://localhost:8123/"), "http://localhost:8123/");
+    }
+
+    #[test]
+    fn clickhouse_literal_escapes_backslashes_before_quotes() {
+        // `x\' OR 1=1 --` must not turn into `x\\'` (an escaped backslash followed by a live quote).
+        assert_eq!(clickhouse_literal("x\\' OR 1=1 --"), "x\\\\\\' OR 1=1 --");
+        assert_eq!(clickhouse_literal("it's"), "it\\'s");
+    }
 
     async fn read_http_request(socket: &mut tokio::net::TcpStream) -> String {
         use tokio::io::AsyncReadExt;

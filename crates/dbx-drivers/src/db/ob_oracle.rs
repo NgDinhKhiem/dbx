@@ -12,8 +12,11 @@ where
     row.get_opt::<T, I>(index).and_then(|result| result.ok())
 }
 
+/// Oracle-mode string literal. OceanBase's Oracle mode keeps backslashes literal (see the data
+/// grid literal rules), so the only escape is doubling the quote; a backslash-escaped `\'` would
+/// close the literal and let the rest of the value run as SQL.
 fn quote_value(s: &str) -> String {
-    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
+    format!("'{}'", s.replace('\'', "''"))
 }
 
 fn metadata_owner_sql(schema: &str) -> String {
@@ -339,6 +342,14 @@ pub async fn list_triggers(pool: &mysql_async::Pool, schema: &str, table: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quote_value_uses_oracle_quote_doubling() {
+        assert_eq!(quote_value("it's"), "'it''s'");
+        assert_eq!(quote_value("a\\b"), "'a\\b'");
+        // The old `\'` form closed the literal in Oracle mode, where backslash is not an escape.
+        assert_eq!(quote_value("x\\' OR 1=1 --"), "'x\\'' OR 1=1 --'");
+    }
 
     #[test]
     fn ob_oracle_list_objects_sql_includes_routines() {

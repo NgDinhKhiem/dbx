@@ -1,3 +1,5 @@
+use crate::models::connection::DatabaseType;
+
 pub fn format_pg_array_sql_literal(arr: &[serde_json::Value]) -> String {
     if arr.is_empty() {
         return "'{}'".to_string();
@@ -147,4 +149,105 @@ pub fn format_postgres_vector_element(value: &serde_json::Value) -> String {
 
 pub fn quote_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Quote a string literal for engines whose ordinary string literals treat a backslash as an
+/// escape character (the MySQL family, ClickHouse, ...).
+///
+/// Backslashes are doubled *and* single quotes are doubled (`''`, never `\'`). The result stays
+/// a single closed literal whether or not MySQL's `NO_BACKSLASH_ESCAPES` SQL mode is active:
+/// with backslash escapes `\\` is one backslash and `''` one quote; without them `\\` is two
+/// backslashes and `''` is still one quote. Doubling only the quote would let a value ending in
+/// `\` (e.g. `x\'; DROP TABLE t; -- `) escape the closing delimiter, and `\'` would terminate
+/// the literal early under `NO_BACKSLASH_ESCAPES`.
+pub fn quote_backslash_escaped_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
+}
+
+/// Engines whose ordinary `'...'` literals interpret backslash escapes (at least in their default
+/// configuration). Engines that may or may not do so depending on a profile are included as
+/// well, because [`quote_backslash_escaped_string_literal`] is injection-safe either way.
+pub fn database_uses_backslash_string_escapes(database_type: DatabaseType) -> bool {
+    matches!(
+        database_type,
+        DatabaseType::Mysql
+            | DatabaseType::Doris
+            | DatabaseType::StarRocks
+            | DatabaseType::Goldendb
+            | DatabaseType::Sundb
+            | DatabaseType::Databend
+            | DatabaseType::Gbase
+            | DatabaseType::ClickHouse
+            | DatabaseType::ManticoreSearch
+    )
+}
+
+/// Quote a string literal for the given target engine. MySQL-family engines and ClickHouse use
+/// [`quote_backslash_escaped_string_literal`], Manticore uses `\\` and `\'`, and everything else
+/// doubles single quotes only.
+pub fn quote_string_literal_for_database(database_type: Option<DatabaseType>, value: &str) -> String {
+    match database_type {
+        // Manticore's SphinxQL lexer only understands backslash escapes, not `''`.
+        Some(DatabaseType::ManticoreSearch) => format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'")),
+        Some(database_type) if database_uses_backslash_string_escapes(database_type) => {
+            quote_backslash_escaped_string_literal(value)
+        }
+        _ => quote_string_literal(value),
+    }
+}
+
+/// Minimal MySQL literal scanner used to prove the quoted output is exactly one token.
+#[cfg(test)]
+pub(crate) fn mysql_literal_is_single_token(sql: &str, backslash_escapes: bool) -> bool {
+    let Some(inner) = sql.strip_prefix('\'').and_then(|value| value.strip_suffix('\'')) else {
+        return false;
+    };
+    let mut chars = inner.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' if backslash_escapes => {
+                if chars.next().is_none() {
+                    return false;
+                }
+            }
+            '\'' => {
+                if chars.next() != Some('\'') {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backslash_escaped_literal_neutralizes_trailing_backslash_breakout() {
+        let payload = "x\\'; DROP TABLE users; -- ";
+        let quoted = quote_backslash_escaped_string_literal(payload);
+        assert_eq!(quoted, "'x\\\\''; DROP TABLE users; -- '");
+        // Every quote from the value is doubled and every backslash is paired, so the only
+        // unpaired quotes are the delimiters, both with and without backslash escapes.
+        assert!(mysql_literal_is_single_token(&quoted, true));
+        assert!(mysql_literal_is_single_token(&quoted, false));
+        // Quote doubling alone lets the payload break out under backslash escapes.
+        assert!(!mysql_literal_is_single_token(&quote_string_literal(payload), true));
+    }
+
+    #[test]
+    fn quote_string_literal_for_database_is_dialect_aware() {
+        assert_eq!(quote_string_literal_for_database(Some(DatabaseType::Mysql), "a\\b'c"), "'a\\\\b''c'");
+        assert_eq!(quote_string_literal_for_database(Some(DatabaseType::ClickHouse), "a\\b"), "'a\\\\b'");
+        assert_eq!(quote_string_literal_for_database(Some(DatabaseType::Postgres), "a\\b'c"), "'a\\b''c'");
+        assert_eq!(quote_string_literal_for_database(Some(DatabaseType::Oracle), "a\\b'c"), "'a\\b''c'");
+        assert_eq!(quote_string_literal_for_database(None, "it's"), "'it''s'");
+        assert_eq!(
+            quote_string_literal_for_database(Some(DatabaseType::ManticoreSearch), "a\\b'c"),
+            "'a\\\\b\\'c'"
+        );
+    }
 }

@@ -598,23 +598,189 @@ fn value_is_falsy(value: &Value) -> bool {
     }
 }
 
+/// Functions whose call from an otherwise read-only statement has effects outside the statement's
+/// own result: data or sequence writes, locks, session/server control, file-system or network
+/// access, or remote execution. Matched case-insensitively on the last name part, so a schema
+/// qualified call (`pg_catalog.pg_terminate_backend(...)`) is caught as well. KingbaseES `sys_*`
+/// spellings of PostgreSQL `pg_*` functions are matched through the `pg_` name.
 const SIDE_EFFECT_SELECT_FUNCTIONS: &[&str] = &[
-    "lo_create",
-    "lo_import",
-    "lo_unlink",
+    // PostgreSQL family
+    "cursor_to_xml",
+    "http",
+    "loread",
+    "lowrite",
     "nextval",
-    "pg_advisory_lock",
-    "pg_advisory_unlock",
-    "pg_advisory_unlock_all",
-    "pg_advisory_xact_lock",
     "pg_cancel_backend",
+    "pg_extension_config_dump",
+    "pg_log_backend_memory_contexts",
+    "pg_logdir_ls",
+    "pg_logical_emit_message",
+    "pg_notify",
+    "pg_promote",
     "pg_reload_conf",
+    "pg_replication_slot_advance",
+    "pg_rotate_logfile",
+    "pg_rotate_logfile_old",
+    "pg_signal_backend",
+    "pg_sleep",
+    "pg_sleep_for",
+    "pg_sleep_until",
+    "pg_start_backup",
+    "pg_stat_file",
+    "pg_stat_statements_reset",
+    "pg_stop_backup",
+    "pg_switch_wal",
+    "pg_switch_xlog",
     "pg_terminate_backend",
-    "pg_try_advisory_lock",
-    "pg_try_advisory_xact_lock",
+    "query_to_xml",
+    "query_to_xml_and_xmlschema",
+    "query_to_xmlschema",
+    "set_config",
     "setval",
-    "sys_cancel_backend",
+    // MySQL family
+    "benchmark",
+    "get_lock",
+    "load_file",
+    "master_pos_wait",
+    "release_all_locks",
+    "release_lock",
+    "sleep",
+    "source_pos_wait",
+    "sys_eval",
+    "sys_exec",
+    "wait_for_executed_gtid_set",
+    "wait_until_sql_thread_after_gtids",
+    // SQL Server
+    "opendatasource",
+    "openquery",
+    "openrowset",
+    // SQLite (loadable-extension and CLI file helpers)
+    "edit",
+    "fts3_tokenizer",
+    "load_extension",
+    "readfile",
+    "writefile",
+    // Oracle
+    "httpuritype",
 ];
+
+/// Name prefixes with the same meaning as [`SIDE_EFFECT_SELECT_FUNCTIONS`]: PostgreSQL admin,
+/// replication, large-object, file and `dblink` families, MySQL locking/keyring/audit
+/// services, and Oracle `DBMS_*` / `UTL_*` packages (see [`oracle_package_call_is_read_only`]).
+const SIDE_EFFECT_FUNCTION_PREFIXES: &[&str] = &[
+    "audit_log_",
+    "binary_upgrade_",
+    "dblink",
+    "dbms_",
+    "http_",
+    "keyring_",
+    "lo_",
+    "pg_advisory_",
+    "pg_backup_",
+    "pg_clear_",
+    "pg_copy_",
+    "pg_create_",
+    "pg_drop_",
+    "pg_file_",
+    "pg_import_",
+    "pg_logical_slot_",
+    "pg_ls_",
+    "pg_read_",
+    "pg_replication_origin_",
+    "pg_restore_",
+    "pg_set_",
+    "pg_stat_reset",
+    "pg_try_advisory_",
+    "pg_wal_replay_",
+    "pg_write",
+    "pg_xlog_replay_",
+    "service_get_",
+    "service_release_",
+    "utl_",
+    "version_tokens_",
+    "xp_",
+];
+
+/// Table functions (`FROM name(...)`) that read or write outside the database: ClickHouse's
+/// file/URL/remote-server and script-execution table functions.
+const SIDE_EFFECT_TABLE_FUNCTIONS: &[&str] = &[
+    "azureblobstorage",
+    "executable",
+    "file",
+    "gcs",
+    "hdfs",
+    "hdfscluster",
+    "jdbc",
+    "mysql",
+    "odbc",
+    "postgresql",
+    "remote",
+    "remotesecure",
+    "s3",
+    "s3cluster",
+    "url",
+    "urlcluster",
+];
+
+/// Oracle packages whose members are side-effect free (or only touch the caller's own session in
+/// a harmless way). Every other `DBMS_*` / `UTL_*` call is treated as side-effecting.
+fn oracle_package_call_is_read_only(package: &str, member: Option<&str>) -> bool {
+    match package {
+        "dbms_assert" | "dbms_crypto" | "dbms_metadata" | "dbms_obfuscation_toolkit" | "dbms_random" => true,
+        "dbms_lob" => member.is_some_and(|member| {
+            matches!(
+                member,
+                "compare" | "get_storage_limit" | "getchunksize" | "getlength" | "instr" | "isopen" | "istemporary"
+                    | "substr"
+            )
+        }),
+        _ => false,
+    }
+}
+
+fn is_side_effect_function_name(name: &str) -> bool {
+    SIDE_EFFECT_SELECT_FUNCTIONS.contains(&name) || SIDE_EFFECT_FUNCTION_PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+/// Whether a (possibly qualified) function name is a known side-effecting call.
+fn is_side_effect_function(name_parts: &[String]) -> bool {
+    let lowered = name_parts.iter().map(|part| part.to_ascii_lowercase()).collect::<Vec<_>>();
+    let Some(last) = lowered.last() else {
+        return false;
+    };
+    // Oracle packages: `DBMS_LOCK.SLEEP`, `SYS.UTL_HTTP.REQUEST`, ...
+    if let Some(index) = lowered.iter().position(|part| part.starts_with("dbms_") || part.starts_with("utl_")) {
+        return !oracle_package_call_is_read_only(&lowered[index], lowered.get(index + 1).map(String::as_str));
+    }
+    // pg_cron job management (`cron.schedule(...)`).
+    if lowered.len() >= 2 && lowered[lowered.len() - 2] == "cron" {
+        return true;
+    }
+    is_side_effect_function_name(last)
+        || last.strip_prefix("sys_").is_some_and(|rest| is_side_effect_function_name(&format!("pg_{rest}")))
+}
+
+fn object_name_parts(name: &sqlparser::ast::ObjectName) -> Vec<String> {
+    name.0
+        .iter()
+        .map(|part| part.as_ident().map(|ident| ident.value.clone()).unwrap_or_else(|| part.to_string()))
+        .collect()
+}
+
+/// Name of a table-valued function call in `FROM`, if the table factor is one.
+fn table_factor_function_name(table_factor: &TableFactor) -> Option<&sqlparser::ast::ObjectName> {
+    match table_factor {
+        TableFactor::Table { name, args: Some(_), .. } | TableFactor::Function { name, .. } => Some(name),
+        _ => None,
+    }
+}
+
+fn is_side_effect_table_function(name_parts: &[String]) -> bool {
+    is_side_effect_function(name_parts)
+        || name_parts
+            .last()
+            .is_some_and(|name| SIDE_EFFECT_TABLE_FUNCTIONS.contains(&name.to_ascii_lowercase().as_str()))
+}
 
 fn query_is_write_capable(query: &Query, detect_select_into: bool) -> bool {
     query
@@ -663,22 +829,76 @@ fn set_expr_is_dangerous(expr: &SetExpr, detect_select_into: bool) -> bool {
     }
 }
 
+/// Full-statement walk (the `visitor` feature also reaches FROM subqueries, LATERAL derived
+/// tables and table functions, which `visit_expressions` skips).
 fn query_calls_known_side_effect_function(query: &Query) -> bool {
-    visit_expressions(query, |expr| {
-        let is_side_effect = if let Expr::Function(function) = expr {
-            function.name.0.last().and_then(|part| part.as_ident()).is_some_and(|name| {
-                SIDE_EFFECT_SELECT_FUNCTIONS.iter().any(|candidate| name.value.eq_ignore_ascii_case(candidate))
-            })
-        } else {
-            false
-        };
-        if is_side_effect {
-            ControlFlow::Break(())
-        } else {
-            ControlFlow::Continue(())
+    let mut visitor = SideEffectCallVisitor;
+    query.visit(&mut visitor).is_break()
+}
+
+struct SideEffectCallVisitor;
+
+impl Visitor for SideEffectCallVisitor {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+        if let Expr::Function(function) = expr {
+            if is_side_effect_function(&object_name_parts(&function.name)) {
+                return ControlFlow::Break(());
+            }
         }
-    })
-    .is_break()
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, table_factor: &TableFactor) -> ControlFlow<()> {
+        if table_factor_function_name(table_factor)
+            .is_some_and(|name| is_side_effect_table_function(&object_name_parts(name)))
+        {
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// One `name(` / `schema.name(` call found by the token-level scan.
+struct TokenFunctionCall {
+    parts: Vec<String>,
+    quoted: bool,
+}
+
+/// Token-level function-call scan for SQL the parser rejects. Returns `None` when the text
+/// cannot even be tokenized.
+fn function_calls_in_tokens(sql: &str, dialect: &dyn sqlparser::dialect::Dialect) -> Option<Vec<TokenFunctionCall>> {
+    let tokens = Tokenizer::new(dialect, sql).tokenize().ok()?;
+    let significant = tokens.iter().filter(|token| !matches!(token, Token::Whitespace(_))).collect::<Vec<_>>();
+    let mut calls = Vec::new();
+    for (index, token) in significant.iter().enumerate() {
+        let Token::Word(word) = token else {
+            continue;
+        };
+        if !matches!(significant.get(index + 1), Some(Token::LParen)) {
+            continue;
+        }
+        let mut parts = vec![word.value.clone()];
+        let mut cursor = index;
+        while cursor >= 2 {
+            match (significant[cursor - 1], significant[cursor - 2]) {
+                (Token::Period, Token::Word(qualifier)) => {
+                    parts.insert(0, qualifier.value.clone());
+                    cursor -= 2;
+                }
+                _ => break,
+            }
+        }
+        calls.push(TokenFunctionCall { parts, quoted: word.quote_style.is_some() });
+    }
+    Some(calls)
+}
+
+/// Parse-failure fallback of the side-effect denylist.
+fn sql_tokens_call_side_effect_function(sql: &str, dialect: &dyn sqlparser::dialect::Dialect) -> bool {
+    function_calls_in_tokens(sql, dialect)
+        .is_some_and(|calls| calls.iter().any(|call| is_side_effect_table_function(&call.parts)))
 }
 
 /// Classify SQL risk using sqlparser AST analysis.
@@ -733,7 +953,11 @@ pub fn is_dangerous_sql_for_database(sql: &str, database_type: DatabaseType) -> 
                 || has_unparsed_dialect_specific_write
                 || statements.iter().any(|statement| statement_is_dangerous(statement, detect_select_into))
         }
-        _ => has_locking_clause || crate::query_execution_sql::is_write_sql_for_database(sql, database_type),
+        _ => {
+            has_locking_clause
+                || crate::query_execution_sql::is_write_sql_for_database(sql, database_type)
+                || sql_tokens_call_side_effect_function(sql, parser_dialect.as_ref())
+        }
     }
 }
 
@@ -847,7 +1071,9 @@ fn classify_sql_risk_with_database(
                 || crate::query_execution_sql::is_write_sql(sql),
                 |database_type| crate::query_execution_sql::is_write_sql_for_database(sql, database_type),
             );
-            if is_write || has_locking_clause {
+            // The keyword classifier cannot see calls such as `SELECT pg_terminate_backend(1)`,
+            // so the side-effect denylist is applied at token level as well.
+            if is_write || has_locking_clause || sql_tokens_call_side_effect_function(sql, parser_dialect.as_ref()) {
                 Ok(SqlRisk::Write)
             } else {
                 Ok(SqlRisk::ReadOnly)
@@ -1212,6 +1438,567 @@ impl Visitor for ProofFunctionVisitor<'_> {
             return ControlFlow::Break(());
         }
         ControlFlow::Continue(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Strict read-only function check for security-sensitive read-only contexts
+//
+// `classify_sql_risk*` only rejects *known* side-effect functions. In the strict contexts (MCP
+// read-only policy, read-only connections, AI auto-execution without a confirmation) a read
+// must additionally not call anything DBX cannot vouch for: on MySQL- and PostgreSQL-family
+// databases user-defined functions can write, so any function outside a reviewed allowlist of
+// pure built-ins makes the statement unproven. Other engines only get the denylist, because
+// their functions cannot write from a SELECT (SQL Server, SQLite) or their function vocabulary
+// is not covered by an allowlist yet.
+// ---------------------------------------------------------------------------
+
+/// Pure built-ins shared by the MySQL and PostgreSQL strict allowlists (aggregates, window
+/// functions and common scalar functions).
+const COMMON_STRICT_SAFE_FUNCTIONS: &[&str] = &[
+    "acos",
+    "array_agg",
+    "asin",
+    "atan",
+    "atan2",
+    "bit_and",
+    "bit_length",
+    "bit_or",
+    "cast",
+    "ceil",
+    "char",
+    "cos",
+    "cot",
+    "cume_dist",
+    "current_role",
+    "current_user",
+    "decode",
+    "degrees",
+    "dense_rank",
+    "extract",
+    "first_value",
+    "json_array",
+    "json_arrayagg",
+    "json_object",
+    "json_objectagg",
+    "json_value",
+    "lag",
+    "last_value",
+    "lead",
+    "localtime",
+    "localtimestamp",
+    "nth_value",
+    "ntile",
+    "nvl",
+    "nvl2",
+    "octet_length",
+    "percent_rank",
+    "pi",
+    "radians",
+    "random",
+    "rank",
+    "regexp_instr",
+    "regexp_like",
+    "regexp_replace",
+    "regexp_substr",
+    "row_number",
+    "session_user",
+    "sin",
+    "stddev",
+    "stddev_pop",
+    "stddev_samp",
+    "sum",
+    "sysdate",
+    "system_user",
+    "tan",
+    "trim",
+    "user",
+    "var_pop",
+    "var_samp",
+    "variance",
+];
+
+/// Extra MySQL-family pure built-ins for the strict check (on top of the manual-transaction
+/// proof list, which stays deliberately small).
+const MYSQL_STRICT_SAFE_FUNCTIONS: &[&str] = &[
+    "adddate",
+    "addtime",
+    "any_value",
+    "bin_to_uuid",
+    "bit_count",
+    "bit_xor",
+    "charset",
+    "coercibility",
+    "collation",
+    "connection_id",
+    "convert",
+    "convert_tz",
+    "database",
+    "date",
+    "date_add",
+    "date_sub",
+    "day",
+    "elt",
+    "export_set",
+    "field",
+    "find_in_set",
+    "found_rows",
+    "from_base64",
+    "from_days",
+    "from_unixtime",
+    "get_format",
+    "group_concat",
+    "inet6_aton",
+    "inet6_ntoa",
+    "insert",
+    "is_ipv4",
+    "is_ipv6",
+    "is_uuid",
+    "json_array_append",
+    "json_array_insert",
+    "json_contains",
+    "json_contains_path",
+    "json_depth",
+    "json_insert",
+    "json_keys",
+    "json_merge_patch",
+    "json_merge_preserve",
+    "json_overlaps",
+    "json_pretty",
+    "json_quote",
+    "json_remove",
+    "json_replace",
+    "json_schema_valid",
+    "json_search",
+    "json_set",
+    "json_storage_size",
+    "json_table",
+    "json_type",
+    "makedate",
+    "maketime",
+    "mid",
+    "period_add",
+    "period_diff",
+    "quote",
+    "row_count",
+    "schema",
+    "sec_to_time",
+    "std",
+    "strcmp",
+    "subdate",
+    "substring_index",
+    "subtime",
+    "tidb_decode_key",
+    "tidb_decode_plan",
+    "tidb_is_ddl_owner",
+    "tidb_parse_tso",
+    "tidb_version",
+    "time",
+    "time_to_sec",
+    "timestamp",
+    "to_base64",
+    "to_days",
+    "to_seconds",
+    "uuid_to_bin",
+    "version",
+    "weekofyear",
+    "yearweek",
+];
+
+/// Extra PostgreSQL-family pure built-ins (including common catalog/introspection helpers and
+/// set-returning functions used in `FROM`) for the strict check.
+const POSTGRES_STRICT_SAFE_FUNCTIONS: &[&str] = &[
+    "array_append",
+    "array_cat",
+    "array_dims",
+    "array_fill",
+    "array_lower",
+    "array_ndims",
+    "array_position",
+    "array_positions",
+    "array_prepend",
+    "array_remove",
+    "array_replace",
+    "array_to_json",
+    "array_to_string",
+    "array_upper",
+    "bool_and",
+    "bool_or",
+    "cbrt",
+    "clock_timestamp",
+    "col_description",
+    "convert_from",
+    "convert_to",
+    "corr",
+    "covar_pop",
+    "covar_samp",
+    "current_database",
+    "date_add",
+    "date_bin",
+    "date_subtract",
+    "factorial",
+    "format_type",
+    "gcd",
+    "generate_series",
+    "generate_subscripts",
+    "has_column_privilege",
+    "has_database_privilege",
+    "has_function_privilege",
+    "has_schema_privilege",
+    "has_table_privilege",
+    "inet_client_addr",
+    "inet_server_addr",
+    "initcap",
+    "isfinite",
+    "json_agg",
+    "json_array_elements",
+    "json_array_elements_text",
+    "json_array_length",
+    "json_build_array",
+    "json_build_object",
+    "json_each",
+    "json_each_text",
+    "json_extract_path",
+    "json_extract_path_text",
+    "json_object_agg",
+    "json_object_keys",
+    "json_populate_record",
+    "json_populate_recordset",
+    "json_strip_nulls",
+    "json_to_record",
+    "json_to_recordset",
+    "json_typeof",
+    "jsonb_agg",
+    "jsonb_array_elements",
+    "jsonb_array_elements_text",
+    "jsonb_array_length",
+    "jsonb_build_array",
+    "jsonb_build_object",
+    "jsonb_each",
+    "jsonb_each_text",
+    "jsonb_extract_path",
+    "jsonb_extract_path_text",
+    "jsonb_insert",
+    "jsonb_object_agg",
+    "jsonb_object_keys",
+    "jsonb_path_exists",
+    "jsonb_path_match",
+    "jsonb_path_query",
+    "jsonb_path_query_array",
+    "jsonb_path_query_first",
+    "jsonb_populate_record",
+    "jsonb_populate_recordset",
+    "jsonb_pretty",
+    "jsonb_set",
+    "jsonb_strip_nulls",
+    "jsonb_to_record",
+    "jsonb_to_recordset",
+    "jsonb_typeof",
+    "justify_days",
+    "justify_hours",
+    "justify_interval",
+    "lcm",
+    "ln",
+    "log10",
+    "make_date",
+    "make_interval",
+    "make_time",
+    "make_timestamp",
+    "make_timestamptz",
+    "mode",
+    "obj_description",
+    "overlay",
+    "percentile_cont",
+    "percentile_disc",
+    "pg_backend_pid",
+    "pg_database_size",
+    "pg_get_constraintdef",
+    "pg_get_expr",
+    "pg_get_functiondef",
+    "pg_get_indexdef",
+    "pg_get_serial_sequence",
+    "pg_get_triggerdef",
+    "pg_get_userbyid",
+    "pg_get_viewdef",
+    "pg_indexes_size",
+    "pg_is_in_recovery",
+    "pg_postmaster_start_time",
+    "pg_relation_size",
+    "pg_size_pretty",
+    "pg_table_is_visible",
+    "pg_table_size",
+    "pg_total_relation_size",
+    "pg_typeof",
+    "quote_ident",
+    "quote_literal",
+    "quote_nullable",
+    "regexp_count",
+    "regexp_match",
+    "regexp_matches",
+    "regexp_split_to_array",
+    "regexp_split_to_table",
+    "regr_slope",
+    "row_to_json",
+    "scale",
+    "statement_timestamp",
+    "string_to_array",
+    "timeofday",
+    "to_ascii",
+    "to_json",
+    "to_jsonb",
+    "to_regclass",
+    "to_regtype",
+    "transaction_timestamp",
+    "translate",
+    "trim_scale",
+    "width_bucket",
+];
+
+const MYSQL_STRICT_ALLOWLISTS: &[&[&str]] =
+    &[MYSQL_PROOF_SAFE_FUNCTIONS, MYSQL_STRICT_SAFE_FUNCTIONS, COMMON_STRICT_SAFE_FUNCTIONS];
+const POSTGRES_STRICT_ALLOWLISTS: &[&[&str]] =
+    &[POSTGRES_PROOF_SAFE_FUNCTIONS, POSTGRES_STRICT_SAFE_FUNCTIONS, COMMON_STRICT_SAFE_FUNCTIONS];
+
+/// Words that may precede `(` without being a function call (clauses, operators, type names in
+/// casts). Only consulted by the token-level fallback for SQL the parser rejects.
+const NON_FUNCTION_WORDS_BEFORE_PAREN: &[&str] = &[
+    "all",
+    "and",
+    "any",
+    "array",
+    "as",
+    "between",
+    "bigint",
+    "binary",
+    "bit",
+    "by",
+    "case",
+    "char",
+    "character",
+    "cube",
+    "date",
+    "datetime",
+    "dec",
+    "decimal",
+    "distinct",
+    "double",
+    "else",
+    "enum",
+    "except",
+    "exists",
+    "filter",
+    "float",
+    "from",
+    "group",
+    "grouping",
+    "groups",
+    "having",
+    "in",
+    "int",
+    "integer",
+    "intersect",
+    "interval",
+    "into",
+    "is",
+    "join",
+    "json",
+    "lateral",
+    "like",
+    "limit",
+    "mediumint",
+    "nchar",
+    "not",
+    "numeric",
+    "nvarchar",
+    "offset",
+    "on",
+    "or",
+    "order",
+    "over",
+    "partition",
+    "precision",
+    "range",
+    "real",
+    "rollup",
+    "row",
+    "rows",
+    "select",
+    "set",
+    "sets",
+    "signed",
+    "smallint",
+    "some",
+    "table",
+    "then",
+    "time",
+    "timestamp",
+    "tinyint",
+    "union",
+    "unsigned",
+    "using",
+    "values",
+    "varbinary",
+    "varchar",
+    "when",
+    "where",
+    "window",
+    "with",
+    "within",
+    "year",
+];
+
+fn strict_function_allowlists(database_type: DatabaseType) -> Option<&'static [&'static [&'static str]]> {
+    match database_type {
+        DatabaseType::Mysql | DatabaseType::Goldendb => Some(MYSQL_STRICT_ALLOWLISTS),
+        DatabaseType::Postgres
+        | DatabaseType::Gaussdb
+        | DatabaseType::OpenGauss
+        | DatabaseType::Kingbase
+        | DatabaseType::Highgo
+        | DatabaseType::Uxdb
+        | DatabaseType::Vastbase
+        | DatabaseType::Kwdb => Some(POSTGRES_STRICT_ALLOWLISTS),
+        _ => None,
+    }
+}
+
+/// Engines whose query text is not SQL; the function scan does not apply to them.
+fn is_non_sql_query_database(database_type: DatabaseType) -> bool {
+    matches!(
+        database_type,
+        DatabaseType::Redis
+            | DatabaseType::MongoDb
+            | DatabaseType::DynamoDb
+            | DatabaseType::Elasticsearch
+            | DatabaseType::Easysearch
+            | DatabaseType::Solr
+            | DatabaseType::Meilisearch
+            | DatabaseType::VictoriaMetrics
+            | DatabaseType::Qdrant
+            | DatabaseType::Milvus
+            | DatabaseType::Weaviate
+            | DatabaseType::ChromaDb
+            | DatabaseType::Etcd
+            | DatabaseType::Consul
+            | DatabaseType::ZooKeeper
+            | DatabaseType::Nacos
+            | DatabaseType::Mqtt
+            | DatabaseType::MessageQueue
+            | DatabaseType::Neo4j
+    )
+}
+
+fn strict_function_violation(name_parts: &[String], allowlists: Option<&[&[&str]]>) -> Option<String> {
+    let display = name_parts.join(".");
+    if is_side_effect_table_function(name_parts) {
+        return Some(format!(
+            "It calls {display}(), which can change database or server state or reach outside the database."
+        ));
+    }
+    let allowlists = allowlists?;
+    let name = name_parts.last()?.to_ascii_lowercase();
+    let qualifier_allowed = match name_parts {
+        [_] => true,
+        [schema, _] => schema.eq_ignore_ascii_case("pg_catalog"),
+        _ => false,
+    };
+    let allowed = qualifier_allowed && allowlists.iter().any(|list| list.contains(&name.as_str()));
+    (!allowed).then(|| {
+        format!(
+            "It calls {display}(), which is not on DBX's list of known read-only built-in functions, \
+             so DBX cannot prove the statement has no side effects."
+        )
+    })
+}
+
+struct StrictFunctionVisitor {
+    allowlists: Option<&'static [&'static [&'static str]]>,
+    violation: Option<String>,
+}
+
+impl Visitor for StrictFunctionVisitor {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+        if let Expr::Function(function) = expr {
+            self.violation = strict_function_violation(&object_name_parts(&function.name), self.allowlists);
+            if self.violation.is_some() {
+                return ControlFlow::Break(());
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, table_factor: &TableFactor) -> ControlFlow<()> {
+        if let Some(name) = table_factor_function_name(table_factor) {
+            self.violation = strict_function_violation(&object_name_parts(name), self.allowlists);
+            if self.violation.is_some() {
+                return ControlFlow::Break(());
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Strict read-only function check for security-sensitive contexts: MCP read-only execution,
+/// connections with read-only protection, and AI-agent SQL that runs without a user
+/// confirmation. Returns the reason when a statement that is otherwise classified as a read
+/// cannot be proven free of side effects:
+///
+/// * any call of a known side-effecting function (all SQL engines, also when the statement
+///   does not parse);
+/// * on MySQL- and PostgreSQL-family engines, any function outside the reviewed allowlist of pure
+///   built-ins (user-defined functions can write there), and MySQL session-variable assignment
+///   (`:=`, `INTO @var`).
+///
+/// Callers must still reject writes separately (`classify_sql_risk_for_database`,
+/// `is_write_sql_for_database`); this only narrows what counts as a read.
+pub fn strict_read_only_violation_for_database(sql: &str, database_type: DatabaseType) -> Option<String> {
+    if is_non_sql_query_database(database_type)
+        || crate::query_execution_sql::classify_search_engine_query_risk(sql, database_type).is_some()
+    {
+        return None;
+    }
+    let allowlists = strict_function_allowlists(database_type);
+    let database_type_name = format!("{database_type:?}");
+    let parser_dialect = resolve_dialect(normalize_dialect(&database_type_name));
+
+    if matches!(database_type, DatabaseType::Mysql | DatabaseType::Goldendb) {
+        let cleaned = crate::query_execution_sql::strip_sql_comments_and_literals(sql);
+        if cleaned.contains(":=")
+            || crate::query_execution_sql::contains_unquoted_keyword(&cleaned, parser_dialect.as_ref(), "INTO")
+        {
+            return Some("It assigns MySQL session variables (`:=` or `INTO`).".to_string());
+        }
+    }
+
+    match Parser::parse_sql(parser_dialect.as_ref(), sql) {
+        Ok(statements) => {
+            let mut visitor = StrictFunctionVisitor { allowlists, violation: None };
+            for statement in &statements {
+                let _ = statement.visit(&mut visitor);
+                if visitor.violation.is_some() {
+                    break;
+                }
+            }
+            visitor.violation
+        }
+        Err(_) => {
+            let Some(calls) = function_calls_in_tokens(sql, parser_dialect.as_ref()) else {
+                return allowlists
+                    .map(|_| "DBX could not analyse the statement, so it cannot prove it is read-only.".to_string());
+            };
+            calls.iter().find_map(|call| {
+                let is_structural_word = call.parts.len() == 1
+                    && !call.quoted
+                    && NON_FUNCTION_WORDS_BEFORE_PAREN.contains(&call.parts[0].to_ascii_lowercase().as_str());
+                if is_structural_word {
+                    None
+                } else {
+                    strict_function_violation(&call.parts, allowlists)
+                }
+            })
+        }
     }
 }
 
@@ -1860,5 +2647,107 @@ mod tests {
             assert_eq!(classify_sql_risk_for_database("DELETE /products", database_type).unwrap(), SqlRisk::Ddl);
             assert!(is_dangerous_sql_for_database("DELETE /products", database_type));
         }
+    }
+
+    #[test]
+    fn side_effect_selects_are_not_read_only() {
+        for (sql, database_type) in [
+            ("SELECT pg_terminate_backend(123)", DatabaseType::Postgres),
+            ("SELECT pg_catalog.pg_cancel_backend(123)", DatabaseType::Postgres),
+            ("SELECT * FROM (SELECT pg_terminate_backend(1)) AS x", DatabaseType::Postgres),
+            ("SELECT * FROM dblink('host=x', 'DELETE FROM t RETURNING 1') AS t(x int)", DatabaseType::Postgres),
+            ("SELECT dblink_exec('host=x', 'DROP TABLE t')", DatabaseType::Postgres),
+            ("SELECT lo_export(16384, '/tmp/x')", DatabaseType::Postgres),
+            ("SELECT pg_read_file('/etc/passwd')", DatabaseType::Postgres),
+            ("SELECT pg_ls_dir('.')", DatabaseType::Postgres),
+            ("SELECT set_config('search_path', 'evil', false)", DatabaseType::Postgres),
+            ("SELECT pg_advisory_lock(1)", DatabaseType::Postgres),
+            ("SELECT pg_notify('channel', 'payload')", DatabaseType::Postgres),
+            ("SELECT pg_create_logical_replication_slot('s', 'pgoutput')", DatabaseType::Postgres),
+            ("SELECT pg_switch_wal()", DatabaseType::Postgres),
+            ("SELECT sys_terminate_backend(123)", DatabaseType::Kingbase),
+            ("SELECT SLEEP(5)", DatabaseType::Mysql),
+            ("SELECT BENCHMARK(1000000, MD5('x'))", DatabaseType::Mysql),
+            ("SELECT GET_LOCK('x', 10)", DatabaseType::Mysql),
+            ("SELECT LOAD_FILE('/etc/passwd')", DatabaseType::Mysql),
+            ("SELECT sys_exec('id')", DatabaseType::Mysql),
+            ("SELECT * FROM OPENROWSET('SQLNCLI', 'Server=x;', 'SELECT 1')", DatabaseType::SqlServer),
+            ("SELECT UTL_HTTP.REQUEST('http://attacker/') FROM dual", DatabaseType::Oracle),
+            ("SELECT DBMS_PIPE.RECEIVE_MESSAGE('x', 10) FROM dual", DatabaseType::Oracle),
+            ("SELECT load_extension('/tmp/evil')", DatabaseType::Sqlite),
+            ("SELECT * FROM url('http://internal/', CSV)", DatabaseType::ClickHouse),
+        ] {
+            assert_ne!(
+                classify_sql_risk_for_database(sql, database_type).unwrap(),
+                SqlRisk::ReadOnly,
+                "expected side-effect SELECT to be write-capable: {sql}"
+            );
+        }
+        // Read-only Oracle package helpers stay reads.
+        assert_eq!(
+            classify_sql_risk_for_database("SELECT DBMS_METADATA.GET_DDL('TABLE', 'T') FROM dual", DatabaseType::Oracle)
+                .unwrap(),
+            SqlRisk::ReadOnly
+        );
+        assert_eq!(
+            classify_sql_risk_for_database("SELECT lower(name), count(*) FROM users GROUP BY 1", DatabaseType::Postgres)
+                .unwrap(),
+            SqlRisk::ReadOnly
+        );
+    }
+
+    #[test]
+    fn keyword_fallback_still_sees_side_effect_functions() {
+        // Unparseable text used to fall back to the keyword classifier, which answered ReadOnly.
+        let sql = "SELECT pg_terminate_backend(1) FROM FROM pg_stat_activity";
+        assert!(Parser::parse_sql(&PostgreSqlDialect {}, sql).is_err());
+        assert_eq!(classify_sql_risk_for_database(sql, DatabaseType::Postgres).unwrap(), SqlRisk::Write);
+        assert!(is_dangerous_sql_for_database(sql, DatabaseType::Postgres));
+        assert_eq!(classify_sql_risk("SELECT sleep(10) FROM FROM t", "mysql").unwrap(), SqlRisk::Write);
+    }
+
+    #[test]
+    fn strict_check_requires_allowlisted_functions_on_mysql_and_postgres() {
+        for (sql, database_type) in [
+            ("SELECT * FROM users", DatabaseType::Mysql),
+            ("SELECT COUNT(*), SUM(total), MAX(created_at) FROM orders", DatabaseType::Mysql),
+            ("SELECT CONCAT(first_name, ' ', last_name), IFNULL(nick, '-') FROM users", DatabaseType::Mysql),
+            ("SELECT lower(email), now(), coalesce(a, b) FROM users", DatabaseType::Postgres),
+            ("SELECT pg_catalog.lower('A')", DatabaseType::Postgres),
+            ("SELECT * FROM generate_series(1, 3)", DatabaseType::Postgres),
+            ("SELECT id, row_number() OVER (ORDER BY id) FROM t", DatabaseType::Postgres),
+            ("SELECT my_udf(1)", DatabaseType::Sqlite),
+            ("SELECT dbo.fn_total(1)", DatabaseType::SqlServer),
+            ("GET key", DatabaseType::Redis),
+        ] {
+            assert_eq!(strict_read_only_violation_for_database(sql, database_type), None, "expected proven: {sql}");
+        }
+        for (sql, database_type) in [
+            ("SELECT my_udf(1)", DatabaseType::Mysql),
+            ("SELECT app.audit_touch(id) FROM users", DatabaseType::Mysql),
+            ("SELECT @a := 1", DatabaseType::Mysql),
+            ("SELECT id FROM users LIMIT 1 INTO @id", DatabaseType::Mysql),
+            ("SELECT SLEEP(1)", DatabaseType::Mysql),
+            ("SELECT my_udf()", DatabaseType::Postgres),
+            ("SELECT public.lower('A')", DatabaseType::Postgres),
+            ("SELECT * FROM my_set_returning_fn()", DatabaseType::Postgres),
+            ("SELECT * FROM t WHERE id IN (SELECT writer_fn(1))", DatabaseType::Postgres),
+            ("SELECT nextval('seq')", DatabaseType::Postgres),
+            ("SELECT load_extension('/tmp/evil')", DatabaseType::Sqlite),
+            ("SELECT * FROM OPENQUERY(remote, 'SELECT 1')", DatabaseType::SqlServer),
+            ("SELECT UTL_HTTP.REQUEST('http://attacker/') FROM dual", DatabaseType::Oracle),
+            // Parse failure: the token-level fallback still applies the allowlist.
+            ("SELECT my_udf(1) FROM FROM t", DatabaseType::Mysql),
+        ] {
+            assert!(strict_read_only_violation_for_database(sql, database_type).is_some(), "expected unproven: {sql}");
+        }
+        // The token fallback ignores clause keywords and cast type names before `(`.
+        assert_eq!(
+            strict_read_only_violation_for_database(
+                "SELECT COUNT(*) FROM t WHERE id IN (1, 2) AND CAST(x AS DECIMAL(10, 2)) > 0 FROM",
+                DatabaseType::Mysql
+            ),
+            None
+        );
     }
 }

@@ -1304,8 +1304,10 @@ fn sequential_tool_permissions(
 }
 
 /// Returns a deterministic confirmation proposal when the current turn contains
-/// an unconfirmed write/DDL tool call. The caller must stop before dispatching
-/// any tools so the database never sees the attempted SQL.
+/// an unconfirmed write/DDL tool call, or a read that DBX cannot prove free of
+/// side effects (UDFs, `pg_terminate_backend`, `SLEEP`, ...; see
+/// `agent_tools::write_requires_confirmation`). The caller must stop before
+/// dispatching any tools so the database never sees the attempted SQL.
 fn unconfirmed_write_sql<'a>(
     tool_calls: &'a [ToolCall],
     db_type: DatabaseType,
@@ -1661,6 +1663,27 @@ mod tests {
         assert!(unconfirmed_write_sql(&[create], DatabaseType::Postgres, &confirmed).is_none());
         assert!(unconfirmed_write_sql(&[select], DatabaseType::Postgres, &agent_tools::AgentSqlPermissions::default())
             .is_none());
+    }
+
+    #[test]
+    fn side_effect_reads_become_confirmation_proposals() {
+        for sql in ["SELECT pg_terminate_backend(42)", "SELECT audit_touch(id) FROM users"] {
+            let call = ToolCall {
+                id: "side-effect-read".to_string(),
+                name: "execute_query".to_string(),
+                arguments: json!({ "sql": sql }),
+                provider_payload: None,
+            };
+            assert_eq!(
+                unconfirmed_write_sql(
+                    std::slice::from_ref(&call),
+                    DatabaseType::Postgres,
+                    &agent_tools::AgentSqlPermissions::default()
+                ),
+                Some(sql),
+                "{sql}"
+            );
+        }
     }
 
     #[test]

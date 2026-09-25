@@ -532,7 +532,7 @@ pub(super) fn build_create_index_statements(
         && capabilities.index_comment
         && matches!(dialect, StructureDialect::Mysql | StructureDialect::GaussdbM)
     {
-        format!(" COMMENT {}", quote_string(&comment))
+        format!(" COMMENT {}", quote_string(dialect, &comment))
     } else {
         String::new()
     };
@@ -564,7 +564,11 @@ pub(super) fn build_create_index_statements(
     let mut statements = vec![create_sql];
 
     if !comment.is_empty() && capabilities.index_comment && dialect == StructureDialect::Postgres {
-        statements.push(format!("COMMENT ON INDEX {} IS {};", quote_ident(dialect, &name), quote_string(&comment)));
+        statements.push(format!(
+            "COMMENT ON INDEX {} IS {};",
+            quote_ident(dialect, &name),
+            quote_string(dialect, &comment)
+        ));
     } else if !comment.is_empty() && capabilities.index_comment && dialect == StructureDialect::SqlServer {
         statements.extend(build_sqlserver_index_comment_sql_for_profile(
             table,

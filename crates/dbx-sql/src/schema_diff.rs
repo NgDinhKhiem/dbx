@@ -21,6 +21,7 @@ use crate::types::{
     ColumnInfo, ForeignKeyInfo, FunctionInfo, IndexInfo, OwnerInfo, RuleInfo, SequenceInfo, TableInfo, TriggerInfo,
 };
 
+mod literals;
 mod sqlserver_dependencies;
 
 use sqlserver_dependencies::build_dependency_aware_alter_column_batch;
@@ -3749,7 +3750,8 @@ fn column_def(col: &ColumnInfo, db_type: DatabaseType, source_dialect: Option<Di
                 default,
                 &col.data_type,
                 effective_source_dialect(source_dialect, db_type),
-                col.extra.as_deref()
+                col.extra.as_deref(),
+                db_type
             )
         ));
     }
@@ -3763,7 +3765,7 @@ fn column_def(col: &ColumnInfo, db_type: DatabaseType, source_dialect: Option<Di
     }
     if profile.inline_column_comment {
         if let Some(comment) = &col.comment {
-            definition.push_str(&format!(" COMMENT {}", comment_literal(comment)));
+            definition.push_str(&format!(" COMMENT {}", comment_literal(comment, db_type)));
         }
     }
     definition
@@ -4129,7 +4131,7 @@ pub fn create_index_sql(table_name: &str, index: &IndexInfo, db_type: DatabaseTy
     let filter_clause = if filter.is_empty() { String::new() } else { format!(" WHERE {filter}") };
     let comment = index.comment.as_deref().unwrap_or("");
     let comment_clause = if !comment.trim().is_empty() && profile.index_supports_comment {
-        format!(" COMMENT {}", comment_literal(comment))
+        format!(" COMMENT {}", comment_literal(comment, db_type))
     } else {
         String::new()
     };
@@ -4230,8 +4232,9 @@ fn drop_object_sql(diff: &TableDiff, db_type: DatabaseType, schema: Option<&str>
     format!("DROP {object_type} IF EXISTS {name}{cascade};")
 }
 
-fn comment_literal(comment: &str) -> String {
-    format!("'{}'", comment.replace('\'', "''"))
+/// Quote a source comment for DDL run on the target database `db_type`.
+fn comment_literal(comment: &str, db_type: DatabaseType) -> String {
+    literals::target_string_literal(comment, db_type)
 }
 
 /// Bare temporal keywords that are defaults in their own right and must not be quoted.
@@ -4266,7 +4269,13 @@ fn effective_source_dialect(source_dialect: Option<DialectKind>, db_type: Databa
 /// `table_structure_sql::util::format_default_for_sql` and
 /// `transfer::format_mysql_default_literal` do the same job on their own paths;
 /// both are private to their modules.
-fn default_literal(default: &str, data_type: &str, source: DialectKind, extra: Option<&str>) -> String {
+fn default_literal(
+    default: &str,
+    data_type: &str,
+    source: DialectKind,
+    extra: Option<&str>,
+    target: DatabaseType,
+) -> String {
     let normalized = default.trim();
 
     // Every dialect except MySQL returns a string default already quoted, cast
@@ -4274,7 +4283,10 @@ fn default_literal(default: &str, data_type: &str, source: DialectKind, extra: O
     // change its meaning: Postgres `text DEFAULT CURRENT_USER`, Oracle
     // `varchar2 DEFAULT USER`, SQL Server `('x')`.
     if source != DialectKind::Mysql {
-        return normalized.to_string();
+        // The expression is replayed as-is, but its string literals are re-encoded when the
+        // target treats backslashes as escapes and the source did not.
+        return literals::retarget_standard_expression_literals(normalized, target)
+            .unwrap_or_else(|| literals::target_string_literal(normalized, target));
     }
 
     // MySQL 8.0.13 and later flag an expression default in `EXTRA`. That marker
@@ -4290,14 +4302,18 @@ fn default_literal(default: &str, data_type: &str, source: DialectKind, extra: O
     // whether the value *is* parenthesised, not whether it merely contains a
     // parenthesis: the string default `a(b)` is not wrapped and is still
     // quoted.
-    if normalized.starts_with('(') && normalized.ends_with(')') {
+    // The expression must also be self-contained (no `;`/comment outside quotes) so a string
+    // default shaped like `(1); DROP TABLE t; (1)` is quoted rather than replayed.
+    if literals::is_self_contained_parenthesized_expression(normalized) {
         return normalized.to_string();
     }
 
-    // Already a literal: `'x'` or a prefixed form like `x'1f'`.
+    // Already a literal: `'x'` or a prefixed form like `x'1f'`. It is decoded and re-encoded for
+    // the target instead of being passed through, so a value that only looks like one closed
+    // literal cannot terminate it early.
     let lowered = normalized.to_ascii_lowercase();
     if normalized.starts_with('\'') || QUOTED_LITERAL_PREFIXES.iter().any(|prefix| lowered.starts_with(prefix)) {
-        return normalized.to_string();
+        return literals::reencode_mysql_quoted_default(normalized, target);
     }
 
     let base_type = data_type.split('(').next().unwrap_or(data_type).trim().to_ascii_lowercase();
@@ -4320,7 +4336,7 @@ fn default_literal(default: &str, data_type: &str, source: DialectKind, extra: O
         // Deliberately no parenthesis check. MySQL reports the string default
         // `'a(b)'` as the bare value `a(b)`, and treating a parenthesis as proof
         // of a function call is what produced invalid `DEFAULT a(b)`.
-        return format!("'{}'", default.replace('\'', "''"));
+        return literals::target_string_literal(default, target);
     }
     normalized.to_string()
 }
@@ -4752,7 +4768,7 @@ fn sqlserver_default_literal_for_schema(
     target_schema: Option<&str>,
 ) -> String {
     let source = effective_source_dialect(source_dialect, DatabaseType::SqlServer);
-    let mut value = default_literal(default, mapped_type, source, extra);
+    let mut value = default_literal(default, mapped_type, source, extra, DatabaseType::SqlServer);
     if source == DialectKind::SqlServer {
         return value;
     }
@@ -5021,7 +5037,11 @@ fn column_comment_sql(
     if profile.column_comment_via_modify_only {
         return vec![format!("-- Column comment for {column_name}: use ALTER TABLE ... MODIFY COLUMN to set comment")];
     }
-    vec![format!("COMMENT ON COLUMN {table}.{} IS {};", quote_id(column_name, db_type), comment_literal(comment))]
+    vec![format!(
+        "COMMENT ON COLUMN {table}.{} IS {};",
+        quote_id(column_name, db_type),
+        comment_literal(comment, db_type)
+    )]
 }
 
 fn table_comment_sql(table_name: &str, comment: &str, db_type: DatabaseType, schema: Option<&str>) -> Vec<String> {
@@ -5031,9 +5051,9 @@ fn table_comment_sql(table_name: &str, comment: &str, db_type: DatabaseType, sch
         return build_sqlserver_table_comment_sql(&table, schema, table_name, comment);
     }
     if profile.table_comment_via_alter {
-        vec![format!("ALTER TABLE {table} COMMENT = {};", comment_literal(comment))]
+        vec![format!("ALTER TABLE {table} COMMENT = {};", comment_literal(comment, db_type))]
     } else {
-        vec![format!("COMMENT ON TABLE {table} IS {};", comment_literal(comment))]
+        vec![format!("COMMENT ON TABLE {table} IS {};", comment_literal(comment, db_type))]
     }
 }
 
@@ -5168,14 +5188,15 @@ fn generate_create_table_sql(
                                 default,
                                 &mapped_type,
                                 effective_source_dialect(source_dialect, db_type),
-                                col.extra.as_deref()
+                                col.extra.as_deref(),
+                                db_type
                             )
                         ));
                     }
                 }
                 if profile.inline_column_comment {
                     if let Some(comment) = col.comment.as_deref().filter(|c| !c.is_empty()) {
-                        def.push_str(&format!(" COMMENT {}", comment_literal(comment)));
+                        def.push_str(&format!(" COMMENT {}", comment_literal(comment, db_type)));
                     }
                 }
                 if !suffix.is_empty() {
@@ -5209,14 +5230,15 @@ fn generate_create_table_sql(
                                 default,
                                 &mapped_type,
                                 effective_source_dialect(source_dialect, db_type),
-                                col.extra.as_deref()
+                                col.extra.as_deref(),
+                                db_type
                             )
                         ));
                     }
                 }
                 if profile.inline_column_comment {
                     if let Some(comment) = col.comment.as_deref().filter(|c| !c.is_empty()) {
-                        def.push_str(&format!(" COMMENT {}", comment_literal(comment)));
+                        def.push_str(&format!(" COMMENT {}", comment_literal(comment, db_type)));
                     }
                 }
                 col_defs.push(def);
@@ -5994,7 +6016,8 @@ fn generate_schema_sync_sql_inner(
                                                 default,
                                                 &mapped.data_type,
                                                 effective_source_dialect(source_dialect, db_type),
-                                                source.extra.as_deref()
+                                                source.extra.as_deref(),
+                                                db_type
                                             )
                                         )
                                     } else {
@@ -10840,17 +10863,17 @@ mod tests {
 
         // MySQL strips the quotes from a string default, which is the whole
         // reason this function exists.
-        assert_eq!(default_literal("THE_VALUE", "varchar(64)", Mysql, None), "'THE_VALUE'");
-        assert_eq!(default_literal("it's", "text", Mysql, None), "'it''s'");
-        assert_eq!(default_literal("2024-01-01", "date", Mysql, None), "'2024-01-01'");
+        assert_eq!(default_literal("THE_VALUE", "varchar(64)", Mysql, None, DatabaseType::Mysql), "'THE_VALUE'");
+        assert_eq!(default_literal("it's", "text", Mysql, None, DatabaseType::Mysql), "'it''s'");
+        assert_eq!(default_literal("2024-01-01", "date", Mysql, None, DatabaseType::Mysql), "'2024-01-01'");
         // `DEFAULT ''` previously emitted a bare `DEFAULT `.
-        assert_eq!(default_literal("", "varchar(20)", Mysql, None), "''");
+        assert_eq!(default_literal("", "varchar(20)", Mysql, None, DatabaseType::Mysql), "''");
         // Untouched on MySQL: already quoted and numeric values.
-        assert_eq!(default_literal("'guest'", "varchar(50)", Mysql, None), "'guest'");
-        assert_eq!(default_literal("0", "bigint", Mysql, None), "0");
-        assert_eq!(default_literal("NULL", "varchar(10)", Mysql, None), "'NULL'");
-        assert_eq!(default_literal("null", "text", Mysql, None), "'null'");
-        assert_eq!(default_literal("  spaced  ", "varchar(32)", Mysql, None), "'  spaced  '");
+        assert_eq!(default_literal("'guest'", "varchar(50)", Mysql, None, DatabaseType::Mysql), "'guest'");
+        assert_eq!(default_literal("0", "bigint", Mysql, None, DatabaseType::Mysql), "0");
+        assert_eq!(default_literal("NULL", "varchar(10)", Mysql, None, DatabaseType::Mysql), "'NULL'");
+        assert_eq!(default_literal("null", "text", Mysql, None, DatabaseType::Mysql), "'null'");
+        assert_eq!(default_literal("  spaced  ", "varchar(32)", Mysql, None, DatabaseType::Mysql), "'  spaced  '");
     }
 
     #[test]
@@ -10861,26 +10884,33 @@ mod tests {
         // it. Without the marker the value is a string, parentheses and all,
         // so a column declared `DEFAULT 'a(b)'` stops emitting invalid
         // `DEFAULT a(b)`.
-        assert_eq!(default_literal("a(b)", "varchar(32)", Mysql, None), "'a(b)'");
-        assert_eq!(default_literal("uuid()", "varchar(36)", Mysql, Some("DEFAULT_GENERATED")), "uuid()");
+        assert_eq!(default_literal("a(b)", "varchar(32)", Mysql, None, DatabaseType::Mysql), "'a(b)'");
+        assert_eq!(
+            default_literal("uuid()", "varchar(36)", Mysql, Some("DEFAULT_GENERATED"), DatabaseType::Mysql),
+            "uuid()"
+        );
         // MySQL wraps an expression default in parentheses and reports it that
         // way, so the wrapping identifies it even when EXTRA is missing. That is
         // a different question from whether the value contains a parenthesis,
         // which is what `a(b)` above turns on.
-        assert_eq!(default_literal("(uuid())", "varchar(36)", Mysql, None), "(uuid())");
-        assert_eq!(default_literal("(now())", "datetime", Mysql, None), "(now())");
+        assert_eq!(default_literal("(uuid())", "varchar(36)", Mysql, None, DatabaseType::Mysql), "(uuid())");
+        assert_eq!(default_literal("(now())", "datetime", Mysql, None, DatabaseType::Mysql), "(now())");
         assert_eq!(
             default_literal(
                 "CURRENT_TIMESTAMP",
                 "datetime",
                 Mysql,
-                Some("DEFAULT_GENERATED on update CURRENT_TIMESTAMP")
+                Some("DEFAULT_GENERATED on update CURRENT_TIMESTAMP"),
+                DatabaseType::Mysql
             ),
             "CURRENT_TIMESTAMP"
         );
         // Before 8.0.13 there is no marker, and a temporal column was the only
         // place an expression default could appear.
-        assert_eq!(default_literal("CURRENT_TIMESTAMP", "datetime", Mysql, None), "CURRENT_TIMESTAMP");
+        assert_eq!(
+            default_literal("CURRENT_TIMESTAMP", "datetime", Mysql, None, DatabaseType::Mysql),
+            "CURRENT_TIMESTAMP"
+        );
     }
 
     #[test]
@@ -10891,16 +10921,65 @@ mod tests {
         // older than 8.0.13 it arrives with no EXTRA marker, so the fallback has
         // to accept the precision argument or the column is deployed with a
         // quoted string where an expression belongs.
-        assert_eq!(default_literal("CURRENT_TIMESTAMP(6)", "timestamp(6)", Mysql, None), "CURRENT_TIMESTAMP(6)");
-        assert_eq!(default_literal("NOW()", "datetime", Mysql, None), "NOW()");
-        assert_eq!(default_literal("LOCALTIME(3)", "datetime(3)", Mysql, None), "LOCALTIME(3)");
-        assert_eq!(default_literal("LOCALTIMESTAMP(3)", "timestamp(3)", Mysql, None), "LOCALTIMESTAMP(3)");
-        assert_eq!(default_literal("current_timestamp(6)", "timestamp(6)", Mysql, None), "current_timestamp(6)");
+        assert_eq!(
+            default_literal("CURRENT_TIMESTAMP(6)", "timestamp(6)", Mysql, None, DatabaseType::Mysql),
+            "CURRENT_TIMESTAMP(6)"
+        );
+        assert_eq!(default_literal("NOW()", "datetime", Mysql, None, DatabaseType::Mysql), "NOW()");
+        assert_eq!(default_literal("LOCALTIME(3)", "datetime(3)", Mysql, None, DatabaseType::Mysql), "LOCALTIME(3)");
+        assert_eq!(
+            default_literal("LOCALTIMESTAMP(3)", "timestamp(3)", Mysql, None, DatabaseType::Mysql),
+            "LOCALTIMESTAMP(3)"
+        );
+        assert_eq!(
+            default_literal("current_timestamp(6)", "timestamp(6)", Mysql, None, DatabaseType::Mysql),
+            "current_timestamp(6)"
+        );
 
         // The precision form must not become a general "contains a parenthesis"
         // rule again: a string default keeps its quotes.
-        assert_eq!(default_literal("a(b)", "varchar(32)", Mysql, None), "'a(b)'");
-        assert_eq!(default_literal("CURRENT_TIMESTAMPX(6)", "varchar(64)", Mysql, None), "'CURRENT_TIMESTAMPX(6)'");
+        assert_eq!(default_literal("a(b)", "varchar(32)", Mysql, None, DatabaseType::Mysql), "'a(b)'");
+        assert_eq!(
+            default_literal("CURRENT_TIMESTAMPX(6)", "varchar(64)", Mysql, None, DatabaseType::Mysql),
+            "'CURRENT_TIMESTAMPX(6)'"
+        );
+    }
+
+    #[test]
+    fn comment_and_default_literals_are_injection_safe_on_backslash_targets() {
+        use crate::value_literals::mysql_literal_is_single_token;
+
+        let payload = "x\\'; DROP TABLE users; -- ";
+        let comment = comment_literal(payload, DatabaseType::Mysql);
+        assert_eq!(comment, "'x\\\\''; DROP TABLE users; -- '");
+        assert!(mysql_literal_is_single_token(&comment, true));
+        assert!(mysql_literal_is_single_token(&comment, false));
+        assert_eq!(comment_literal(payload, DatabaseType::Postgres), "'x\\''; DROP TABLE users; -- '");
+
+        let default = default_literal(payload, "varchar(64)", DialectKind::Mysql, None, DatabaseType::Mysql);
+        assert!(mysql_literal_is_single_token(&default, true));
+        assert!(mysql_literal_is_single_token(&default, false));
+        let crafted = "'\\''; DROP TABLE users; -- '";
+        let default = default_literal(crafted, "varchar(64)", DialectKind::Mysql, None, DatabaseType::Mysql);
+        assert!(mysql_literal_is_single_token(&default, true));
+        assert!(mysql_literal_is_single_token(&default, false));
+        let default = default_literal(
+            "(1); DROP TABLE users; SELECT (1)",
+            "varchar(64)",
+            DialectKind::Mysql,
+            None,
+            DatabaseType::Mysql,
+        );
+        assert!(mysql_literal_is_single_token(&default, true));
+        // A Postgres expression replayed on MySQL gets its literals re-encoded.
+        assert_eq!(
+            default_literal("('\\'::text || 'x'::text)", "text", DialectKind::Postgres, None, DatabaseType::Mysql),
+            "('\\\\'::text || 'x'::text)"
+        );
+
+        let column = column("c", "varchar(10)", Some(payload));
+        let definition = column_def(&column, DatabaseType::Mysql, Some(DialectKind::Mysql));
+        assert!(definition.ends_with(" COMMENT 'x\\\\''; DROP TABLE users; -- '"), "{definition}");
     }
 
     #[test]
@@ -10910,16 +10989,22 @@ mod tests {
         // These dialects return a string default already quoted, so a bare token
         // is an expression. Quoting it would silently turn a per-row value into
         // a fixed string.
-        assert_eq!(default_literal("CURRENT_USER", "text", Postgres, None), "CURRENT_USER");
-        assert_eq!(default_literal("USER", "varchar2(30)", Oracle, None), "USER");
-        assert_eq!(default_literal("'new'::text", "text", Postgres, None), "'new'::text");
-        assert_eq!(default_literal("nextval('s'::regclass)", "integer", Postgres, None), "nextval('s'::regclass)");
-        assert_eq!(default_literal("N'guest'", "nvarchar(50)", SqlServer, None), "N'guest'");
-        assert_eq!(default_literal("('x')", "varchar(10)", SqlServer, None), "('x')");
-        assert_eq!(default_literal("NULL", "text", Postgres, None), "NULL");
+        assert_eq!(default_literal("CURRENT_USER", "text", Postgres, None, DatabaseType::Mysql), "CURRENT_USER");
+        assert_eq!(default_literal("USER", "varchar2(30)", Oracle, None, DatabaseType::Mysql), "USER");
+        assert_eq!(default_literal("'new'::text", "text", Postgres, None, DatabaseType::Mysql), "'new'::text");
+        assert_eq!(
+            default_literal("nextval('s'::regclass)", "integer", Postgres, None, DatabaseType::Mysql),
+            "nextval('s'::regclass)"
+        );
+        assert_eq!(default_literal("N'guest'", "nvarchar(50)", SqlServer, None, DatabaseType::Mysql), "N'guest'");
+        assert_eq!(default_literal("('x')", "varchar(10)", SqlServer, None, DatabaseType::Mysql), "('x')");
+        assert_eq!(default_literal("NULL", "text", Postgres, None, DatabaseType::Mysql), "NULL");
         // The same bare token on MySQL is a string, which is why the rule has to
         // follow the source dialect rather than the value.
-        assert_eq!(default_literal("CURRENT_USER", "text", DialectKind::Mysql, None), "'CURRENT_USER'");
+        assert_eq!(
+            default_literal("CURRENT_USER", "text", DialectKind::Mysql, None, DatabaseType::Mysql),
+            "'CURRENT_USER'"
+        );
     }
 
     #[test]
@@ -11076,15 +11161,15 @@ mod tests {
         use DialectKind::Mysql;
 
         // A SET default is a bare comma-separated string.
-        assert_eq!(default_literal("a,b", "set('a','b')", Mysql, None), "'a,b'");
-        assert_eq!(default_literal("", "set('a','b')", Mysql, None), "''");
+        assert_eq!(default_literal("a,b", "set('a','b')", Mysql, None, DatabaseType::Mysql), "'a,b'");
+        assert_eq!(default_literal("", "set('a','b')", Mysql, None, DatabaseType::Mysql), "''");
         // Binary defaults arrive as a hex literal, which is already valid
         // unquoted; a bare string on the same column still needs quoting.
-        assert_eq!(default_literal("0x61", "varbinary(16)", Mysql, None), "0x61");
-        assert_eq!(default_literal("abc", "binary(3)", Mysql, None), "'abc'");
-        assert_eq!(default_literal("x'1f'", "blob", Mysql, None), "x'1f'");
+        assert_eq!(default_literal("0x61", "varbinary(16)", Mysql, None, DatabaseType::Mysql), "0x61");
+        assert_eq!(default_literal("abc", "binary(3)", Mysql, None, DatabaseType::Mysql), "'abc'");
+        assert_eq!(default_literal("x'1f'", "blob", Mysql, None, DatabaseType::Mysql), "x'1f'");
         // Not hex, so not a hex literal.
-        assert_eq!(default_literal("0xzz", "varbinary(8)", Mysql, None), "'0xzz'");
+        assert_eq!(default_literal("0xzz", "varbinary(8)", Mysql, None, DatabaseType::Mysql), "'0xzz'");
     }
 
     // -- 35. Column order changes --

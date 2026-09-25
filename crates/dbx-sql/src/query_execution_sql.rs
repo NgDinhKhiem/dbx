@@ -829,11 +829,23 @@ pub fn mysql_statement_opens_explicit_transaction(sql: &str) -> bool {
 
 /// Check whether a SQL statement is allowed under read-only mode.
 /// Returns Err with a descriptive message if the statement is a write operation.
+///
+/// Reads are held to the strict standard of
+/// [`crate::sql_risk::strict_read_only_violation_for_database`]: a SELECT that calls a known
+/// side-effecting function (`pg_terminate_backend`, `SLEEP`, `dblink_exec`, ...) or, on MySQL-
+/// and PostgreSQL-family connections, a function outside the reviewed built-in allowlist is
+/// blocked as well, because the keyword classifier alone would pass it.
 pub fn check_read_only(sql: &str, connection_name: &str, database_type: DatabaseType) -> Result<(), String> {
     if is_write_sql_for_database(sql, database_type) {
         return Err(format!(
             "Read-only mode: connection '{}' has read-only protection enabled. Write operation (including stored procedure calls) blocked.",
             connection_name
+        ));
+    }
+    if let Some(reason) = crate::sql_risk::strict_read_only_violation_for_database(sql, database_type) {
+        return Err(format!(
+            "Read-only mode: connection '{connection_name}' has read-only protection enabled. {reason} \
+             Temporarily unlock writes for this connection to run it."
         ));
     }
     Ok(())
@@ -2191,6 +2203,31 @@ mod tests {
         for database_type in [DatabaseType::Postgres, DatabaseType::Sqlite] {
             assert_eq!(check_read_only(mysql_executable_comment, "readonly", database_type), Ok(()));
             assert_eq!(check_read_only(mariadb_executable_comment, "readonly", database_type), Ok(()));
+        }
+    }
+
+    #[test]
+    fn check_read_only_blocks_side_effect_selects() {
+        for (sql, database_type) in [
+            ("SELECT pg_terminate_backend(pid) FROM pg_stat_activity", DatabaseType::Postgres),
+            ("SELECT * FROM (SELECT dblink_exec('host=x', 'DROP TABLE t')) AS x", DatabaseType::Postgres),
+            ("SELECT nextval('orders_id_seq')", DatabaseType::Postgres),
+            ("SELECT audit_write(id) FROM users", DatabaseType::Postgres),
+            ("SELECT SLEEP(10)", DatabaseType::Mysql),
+            ("SELECT LOAD_FILE('/etc/passwd')", DatabaseType::Mysql),
+            ("SELECT my_udf(id) FROM users", DatabaseType::Mysql),
+            ("SELECT load_extension('/tmp/evil.so')", DatabaseType::Sqlite),
+        ] {
+            let error = check_read_only(sql, "readonly", database_type).expect_err(sql);
+            assert!(error.contains("read-only protection"), "{error}");
+        }
+        // Reads built from allowlisted built-ins stay available.
+        for (sql, database_type) in [
+            ("SELECT count(*), max(created_at) FROM orders", DatabaseType::Postgres),
+            ("SELECT CONCAT(first_name, ' ', last_name) FROM users", DatabaseType::Mysql),
+            ("SELECT my_udf(id) FROM users", DatabaseType::Sqlite),
+        ] {
+            assert_eq!(check_read_only(sql, "readonly", database_type), Ok(()), "{sql}");
         }
     }
 
