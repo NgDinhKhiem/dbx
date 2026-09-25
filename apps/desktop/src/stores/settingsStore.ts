@@ -1,6 +1,7 @@
 import { defineStore } from "pinia";
 import { computed, ref } from "vue";
 import { aiConfigToItem, generateId, getConfigKey } from "@/lib/ai/aiConfigList";
+import { hasAiApiKey, redactAiConfigSecrets } from "@/lib/ai/aiConfigSecrets";
 import { DEFAULT_DATA_GRID_FONT_FAMILY, DEFAULT_UI_FONT_FAMILY } from "@/lib/app/appFonts";
 import { emitAlwaysOnTopToolbarVisibilityChanged } from "@/lib/app/windowAlwaysOnTop";
 import { defaultBackgroundImageSettings, normalizeBackgroundImageSettings, type BackgroundImageSettings } from "@/lib/app/appBackgroundImage";
@@ -127,8 +128,12 @@ export const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   sidebar_table_page_size: DEFAULT_SIDEBAR_TABLE_PAGE_SIZE,
 };
 
+/**
+ * Effective policy of an install that never saved one: the backend enforces
+ * read-only MCP access until the user saves a policy (`configured === false`).
+ */
 export const DEFAULT_MCP_GLOBAL_POLICY: McpGlobalPolicy = {
-  readOnly: false,
+  readOnly: true,
   allowDangerousSql: false,
   allowedConnectionIds: null,
   allowedGroupIds: [],
@@ -196,7 +201,8 @@ export function normalizeMcpGlobalPolicy(policy: Partial<McpGlobalPolicy> | null
   // "inherit" <=> null.
   const queryTimeoutSecs = policy?.queryTimeoutSecs === null || policy?.queryTimeoutSecs === undefined ? null : typeof policy.queryTimeoutSecs === "number" && Number.isFinite(policy.queryTimeoutSecs) && policy.queryTimeoutSecs >= 0 ? Math.round(policy.queryTimeoutSecs) : null;
   return {
-    readOnly: policy?.readOnly === true,
+    // An unconfigured install is read-only by default; only a saved policy may lift it.
+    readOnly: typeof policy?.readOnly === "boolean" ? policy.readOnly : policy?.configured !== true,
     allowDangerousSql: policy?.allowDangerousSql === true,
     allowedConnectionIds,
     allowedGroupIds,
@@ -2170,6 +2176,8 @@ export const useSettingsStore = defineStore("settings", () => {
     if (oldActiveConfig) {
       const item = aiConfigToItem(normalizeAiConfig(oldActiveConfig), generateId(), oldActiveConfig.provider);
       item.isDefault = true;
+      // Legacy loads are redacted; the backend copies the secrets from this source into the new id.
+      item.legacySecretsFrom = "legacy";
       newConfigs.push(item);
       seenKeys.add(getConfigKey(oldActiveConfig));
     }
@@ -2180,6 +2188,7 @@ export const useSettingsStore = defineStore("settings", () => {
         if (!seenKeys.has(key)) {
           const item = aiConfigToItem(normalizeAiConfig(config), generateId(), provider);
           item.isDefault = false;
+          item.legacySecretsFrom = `provider:${provider}`;
           newConfigs.push(item);
           seenKeys.add(key);
         }
@@ -2188,14 +2197,16 @@ export const useSettingsStore = defineStore("settings", () => {
 
     if (newConfigs.length > 0) {
       await api.saveAiConfigs(newConfigs);
-      aiConfigs.value = newConfigs;
+      // savedSecrets are carried over from the legacy config; the migration hint is save-only.
+      aiConfigs.value = newConfigs.map(({ legacySecretsFrom: _legacySecretsFrom, ...config }) => redactAiConfigSecrets(config));
     }
   }
 
   async function createAiConfig(config: AiConfigItem): Promise<void> {
     const normalized = normalizeAiConfigItem(config);
     await api.saveAiConfigItem(normalized);
-    aiConfigs.value.push(normalized);
+    // Keep only the redacted view in memory; the backend now owns the typed secrets.
+    aiConfigs.value.push(redactAiConfigSecrets(normalized, []));
     if (aiConfigs.value.length === 1 && normalized.model.trim()) {
       activeModel.value = {
         configId: normalized.id,
@@ -2211,7 +2222,7 @@ export const useSettingsStore = defineStore("settings", () => {
       const previous = aiConfigs.value[index];
       const updated = normalizeAiConfigItem({ ...previous, ...config });
       await api.saveAiConfigItem(updated);
-      aiConfigs.value[index] = updated;
+      aiConfigs.value[index] = redactAiConfigSecrets(updated, previous.savedSecrets ?? []);
       if (previous.provider !== updated.provider) {
         effortPreferences.value = effortPreferences.value.filter((preference) => preference.configId !== id);
         if (activeModel.value?.configId === id) activeModel.value = null;
@@ -2385,7 +2396,7 @@ export const useSettingsStore = defineStore("settings", () => {
       config.provider === "qoder-cli"
     )
       return true;
-    return !!config.endpoint && !!activeModel.value!.modelId && (!preset.requiresApiKey || !!config.apiKey);
+    return !!config.endpoint && !!activeModel.value!.modelId && (!preset.requiresApiKey || hasAiApiKey(config));
   });
 
   function applyEditorSettingsPatch(partial: Partial<EditorSettings>) {

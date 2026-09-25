@@ -1,5 +1,7 @@
+pub mod ai_config_secrets;
 pub mod cloud_sync;
 pub mod config;
+pub mod connection_export;
 pub mod history;
 pub mod saved_sql;
 pub mod secret_codec;

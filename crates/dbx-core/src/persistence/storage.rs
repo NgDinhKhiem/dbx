@@ -21,7 +21,8 @@ use crate::ai::{
     AiRunStatus,
 };
 use crate::connection_secrets::{
-    plugin_connection_secret_key, CASSANDRA_KEYSTORE_PASSWORD_KEY, CASSANDRA_TLS_SECRET_PREFIX,
+    merge_stored_connection_secrets, plugin_connection_secret_key, storage_keys_for_cleared_secret,
+    ClientConnectionInput, CASSANDRA_KEYSTORE_PASSWORD_KEY, CASSANDRA_TLS_SECRET_PREFIX,
     CASSANDRA_TRUSTSTORE_PASSWORD_KEY, MQTT_AUTH_PASSWORD_KEY, MQTT_AUTH_SECRET_PREFIX, MQ_AUTH_API_KEY_VALUE_KEY,
     MQ_AUTH_CLIENT_SECRET_KEY, MQ_AUTH_PASSWORD_KEY, MQ_AUTH_SECRET_PREFIX, MQ_AUTH_TOKEN_KEY, MQ_TOKEN_SIGNING_KEY,
     MQ_TOKEN_SIGNING_SECRET_PREFIX, NACOS_AUTH_PASSWORD_KEY, NACOS_AUTH_SECRET_PREFIX,
@@ -297,6 +298,44 @@ pub(crate) struct SyncImportPlan {
     pub preserve_plugin_secrets: bool,
     pub sync_credentials: Option<Vec<SyncImportCredential>>,
     pub ai_configs: Option<Vec<AiConfigItem>>,
+    /// Connections whose endpoint changed in an import the user did not
+    /// explicitly trust: their locally saved secrets are deleted so they are
+    /// never sent to the new endpoint.
+    pub drop_secret_connection_ids: Vec<String>,
+    /// Tunnel profiles whose endpoint changed under the same rule.
+    pub drop_secret_tunnel_profile_ids: Vec<String>,
+}
+
+/// Editor settings that a sync import never overwrites: they reference local
+/// files or control automatic download/installation of executable updates.
+pub(crate) const SYNC_PROTECTED_EDITOR_SETTINGS: &[&str] = &[
+    "backgroundImage",
+    "updateDownloadSource",
+    "autoDownloadUpdates",
+    "autoUpdateApp",
+    "autoUpdateDrivers",
+    "autoUpdateJdbc",
+    "autoUpdateMcp",
+    "autoUpdatePlugins",
+];
+
+/// Removes protected keys from synced editor settings and, when local settings
+/// exist, keeps the local values of those keys.
+pub(crate) fn merge_synced_editor_settings(
+    incoming: &serde_json::Value,
+    local: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let Some(incoming_object) = incoming.as_object() else {
+        return local.cloned().unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+    };
+    let mut merged = incoming_object.clone();
+    for key in SYNC_PROTECTED_EDITOR_SETTINGS {
+        merged.remove(*key);
+        if let Some(value) = local.and_then(|local| local.get(*key)) {
+            merged.insert((*key).to_string(), value.clone());
+        }
+    }
+    serde_json::Value::Object(merged)
 }
 
 pub(crate) struct SyncImportSecret {
@@ -568,6 +607,14 @@ impl McpGlobalPolicyState {
 }
 
 impl McpGlobalPolicy {
+    /// Effective policy of an install that never saved an MCP policy: MCP
+    /// clients get read-only access (no DML, no connection add/remove) until
+    /// the user explicitly configures a policy. `Default` stays field-wise
+    /// default so explicitly saved settings deserialize unchanged.
+    pub fn unconfigured_default() -> Self {
+        Self { read_only: true, ..Self::default() }
+    }
+
     /// Produces the single fail-closed representation persisted by the MCP
     /// policy API. This protects the policy boundary even when a caller does
     /// not use the desktop settings form (for example, a Web API client).
@@ -1105,6 +1152,34 @@ const LEGACY_JSON_NAMES: &[&str] = &[
     "sidebar_layout.json",
 ];
 
+/// Codec handed to write transactions. `None` means no key is provisioned;
+/// such a codec can only be used for writes that store no secret, and every
+/// encrypt/decrypt attempt fails with `SECRET_KEY_UNAVAILABLE`.
+#[derive(Clone, Copy)]
+struct SecretWriteCodec(Option<SecretCodec>);
+
+impl SecretWriteCodec {
+    fn available(codec: SecretCodec) -> Self {
+        Self(Some(codec))
+    }
+
+    fn unavailable() -> Self {
+        Self(None)
+    }
+
+    fn require(&self) -> Result<&SecretCodec, String> {
+        self.0.as_ref().ok_or_else(|| "SECRET_KEY_UNAVAILABLE".to_string())
+    }
+
+    fn encrypt(&self, namespace: &str, key: &str, plaintext: &str) -> Result<String, String> {
+        self.require()?.encrypt(namespace, key, plaintext)
+    }
+
+    fn decrypt(&self, namespace: &str, key: &str, envelope: &str) -> Result<String, String> {
+        self.require()?.decrypt(namespace, key, envelope)
+    }
+}
+
 fn file_digest(path: &Path) -> Result<String, String> {
     use sha2::{Digest, Sha256};
     let bytes = std::fs::read(path).map_err(|_| "Cannot read migration source file".to_string())?;
@@ -1177,9 +1252,13 @@ impl Storage {
         self.resolve_secret_key(allow_create).map(|resolved| resolved.codec)
     }
 
-    async fn secret_codec_for_write(&self, needs_key: bool) -> Result<SecretCodec, String> {
+    /// Resolves the codec for a write. When no key is provisioned and the
+    /// write carries no new secret, the result is an *unavailable* codec: any
+    /// attempt to encrypt or decrypt through it fails instead of silently
+    /// using a fixed key.
+    async fn secret_codec_for_write(&self, needs_key: bool) -> Result<SecretWriteCodec, String> {
         match self.secret_codec(false) {
-            Ok(codec) => Ok(codec),
+            Ok(codec) => Ok(SecretWriteCodec::available(codec)),
             Err(error)
                 if matches!(
                     error.as_str(),
@@ -1187,7 +1266,7 @@ impl Storage {
                 ) =>
             {
                 if !needs_key {
-                    return Ok(SecretCodec::new([0u8; 32]));
+                    return Ok(SecretWriteCodec::unavailable());
                 }
                 if !self.secret_key_creation_allowed {
                     return Err(error);
@@ -1205,7 +1284,7 @@ impl Storage {
                 if has_ciphertext {
                     return Err("ENCRYPTED_DATA_KEY_MISSING".to_string());
                 }
-                self.secret_codec(true)
+                self.secret_codec(true).map(SecretWriteCodec::available)
             }
             Err(error) => Err(error),
         }
@@ -1238,7 +1317,8 @@ impl Storage {
                     return;
                 }
                 Err(_) if attempt < ATTEMPTS => {
-                    std::thread::sleep(std::time::Duration::from_millis(100 * attempt as u64));
+                    // Async sleep: a thread sleep here would park a runtime worker during startup.
+                    tokio::time::sleep(std::time::Duration::from_millis(100 * attempt as u64)).await;
                 }
                 Err(error) => {
                     warn!("dbx.db could not switch journal_mode to WAL after {ATTEMPTS} attempts: {error}; concurrent multi-process access may hit 'database is locked' more often");
@@ -2153,7 +2233,7 @@ fn migrate_legacy_connection_config_json_sync(conn: &mut Connection, codec: &Sec
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|error| error.to_string())?;
     for config in legacy {
         tx.execute("DELETE FROM connections WHERE id = ?1", [&config.id]).map_err(|error| error.to_string())?;
-        persist_connection_in_tx(&tx, codec, &config)?;
+        persist_connection_in_tx(&tx, &SecretWriteCodec::available(*codec), &config)?;
     }
     for (connection_id, key, secret, secret_enc) in stored_secrets {
         if key == "password" && !keep_password.contains(&connection_id) {
@@ -2617,6 +2697,16 @@ fn ensure_history_columns_sync(conn: &Connection) -> Result<(), String> {
         }
         conn.execute(&format!("ALTER TABLE history ADD COLUMN {name} {definition}"), []).map_err(|e| e.to_string())?;
     }
+    // Created after the columns exist (legacy tables gain `activity_kind` above).
+    // History lists, search pages and the retention trim all read newest-first;
+    // without these, every history insert and page sorted the whole table.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_history_executed_at ON history(executed_at DESC, id DESC)", [])
+        .map_err(|e| e.to_string())?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_history_activity_kind_executed_at ON history(activity_kind, executed_at DESC, id DESC)",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -3079,13 +3169,57 @@ fn load_history_retention_limit_from_conn(conn: &Connection) -> Result<u32, Stri
     Ok(history_retention_limit_from_settings(&settings))
 }
 
+/// Retention limit for the history write path. Reads just the one key with
+/// SQLite's JSON functions (a primary-key lookup) instead of deserializing the
+/// whole app settings document into a map on every history insert. Malformed
+/// JSON, or a SQLite build without JSON functions, falls back to the full parse
+/// so errors and defaults stay identical to `load_history_retention_limit`.
+fn load_history_retention_limit_for_write(conn: &Connection) -> Result<u32, String> {
+    let default_limit = MAX_HISTORY as u32;
+    let fast = conn
+        .query_row(
+            "SELECT json_type(settings_json, '$.history_retention_limit'), \
+                    json_extract(settings_json, '$.history_retention_limit') \
+             FROM app_settings WHERE id = 1",
+            [],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Value>(1)?)),
+        )
+        .optional();
+    match fast {
+        Ok(None) => Ok(default_limit),
+        Ok(Some((Some(kind), Value::Integer(value)))) if kind == "integer" => Ok(u32::try_from(value)
+            .ok()
+            .filter(|limit| crate::history::validate_history_retention_limit(*limit).is_ok())
+            .unwrap_or(default_limit)),
+        Ok(Some(_)) => Ok(default_limit),
+        Err(_) => load_history_retention_limit_from_conn(conn),
+    }
+}
+
+/// Deletes everything past the newest `limit` rows. The ordered subquery walks
+/// `idx_history_executed_at` and skips `limit` entries, so the cost is bounded
+/// by the retention limit plus the rows removed (normally zero or one) instead
+/// of sorting the whole table. Ties on `executed_at` keep the same `id DESC`
+/// order used by the history list.
+fn trim_history_to_limit(conn: &Connection, limit: u32) -> Result<usize, String> {
+    if limit == 0 {
+        return Ok(0);
+    }
+    conn.execute(
+        "DELETE FROM history WHERE rowid IN \
+         (SELECT rowid FROM history ORDER BY executed_at DESC, id DESC LIMIT -1 OFFSET ?1)",
+        [i64::from(limit)],
+    )
+    .map_err(|e| e.to_string())
+}
+
 impl Storage {
     pub async fn save_history_entry(&self, entry: &HistoryEntry) -> Result<(), String> {
         let entry = entry.clone();
         self.with_conn(move |conn| {
             let tx =
                 conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
-            let limit = load_history_retention_limit_from_conn(&tx)?;
+            let limit = load_history_retention_limit_for_write(&tx)?;
             tx.execute(
                 "INSERT OR REPLACE INTO history \
                  (id, connection_name, database, sql_text, executed_at, execution_time_ms, success, error, \
@@ -3111,14 +3245,7 @@ impl Storage {
             )
             .map_err(|e| e.to_string())?;
 
-            if limit != 0 {
-                tx.execute(
-                    "DELETE FROM history WHERE id NOT IN \
-                     (SELECT id FROM history ORDER BY executed_at DESC, id DESC LIMIT ?1)",
-                    [i64::from(limit)],
-                )
-                .map_err(|e| e.to_string())?;
-            }
+            trim_history_to_limit(&tx, limit)?;
             tx.commit().map_err(|e| e.to_string())
         })
         .await
@@ -3944,7 +4071,7 @@ impl Storage {
                     .optional()
                     .map_err(|e| e.to_string())?;
                 let Some(json) = json else {
-                    let policy = McpGlobalPolicy::default();
+                    let policy = McpGlobalPolicy::unconfigured_default();
                     return Ok(McpGlobalPolicyState {
                         configured: false,
                         read_only: policy.read_only,
@@ -3960,7 +4087,7 @@ impl Storage {
                 let settings = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&json)
                     .map_err(|e| format!("invalid app settings JSON: {e}"))?;
                 let Some(value) = settings.get(MCP_GLOBAL_POLICY_KEY) else {
-                    let policy = McpGlobalPolicy::default();
+                    let policy = McpGlobalPolicy::unconfigured_default();
                     return Ok(McpGlobalPolicyState {
                         configured: false,
                         read_only: policy.read_only,
@@ -5128,10 +5255,10 @@ fn load_mcp_global_policy_in_tx(tx: &rusqlite::Transaction<'_>) -> Result<McpGlo
                 Some(value) => serde_json::from_value::<McpGlobalPolicy>(value.clone())
                     .map_err(|e| format!("MCP_POLICY_UNAVAILABLE: invalid MCP policy: {e}"))?
                     .normalized(),
-                None => McpGlobalPolicy::default(),
+                None => McpGlobalPolicy::unconfigured_default(),
             }
         }
-        None => McpGlobalPolicy::default(),
+        None => McpGlobalPolicy::unconfigured_default(),
     })
 }
 
@@ -5191,7 +5318,7 @@ fn sanitized_connection_config(config: &ConnectionConfig) -> ConnectionConfig {
 
 fn persist_connection_in_tx(
     tx: &rusqlite::Transaction<'_>,
-    codec: &SecretCodec,
+    codec: &SecretWriteCodec,
     config: &ConnectionConfig,
 ) -> Result<(), String> {
     let config = config.clone().canonicalized();
@@ -5458,8 +5585,19 @@ impl Storage {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
 
             apply_sync_connections_in_tx(&tx, &codec, &plan.connections)?;
+            for connection_id in &plan.drop_secret_connection_ids {
+                tx.execute("DELETE FROM connection_secrets WHERE connection_id = ?1", [connection_id])
+                    .map_err(|e| e.to_string())?;
+            }
             if let Some(profiles) = &plan.tunnel_profiles {
                 apply_sync_tunnel_profiles_in_tx(&tx, &codec, profiles, plan.tunnel_secret_profiles.as_deref())?;
+            }
+            for profile_id in &plan.drop_secret_tunnel_profile_ids {
+                tx.execute(
+                    "DELETE FROM connection_secrets WHERE connection_id = ?1",
+                    [format!("{TUNNEL_SECRET_NAMESPACE_PREFIX}{profile_id}")],
+                )
+                .map_err(|e| e.to_string())?;
             }
             if let Some(layout) = &plan.sidebar_layout {
                 let json = serde_json::to_string(layout).map_err(|e| e.to_string())?;
@@ -5475,7 +5613,17 @@ impl Storage {
             apply_saved_sql_in_tx(&tx, &plan.saved_sql)?;
             apply_desktop_settings_in_tx(&tx, &plan.desktop_settings)?;
             if let Some(editor_settings) = &plan.editor_settings {
-                let value = serde_json::to_string(editor_settings).map_err(|e| e.to_string())?;
+                let local = tx
+                    .query_row(
+                        "SELECT value_json FROM app_state WHERE key = ?1",
+                        [APP_STATE_EDITOR_SETTINGS_KEY],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|e| e.to_string())?
+                    .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok());
+                let editor_settings = merge_synced_editor_settings(editor_settings, local.as_ref());
+                let value = serde_json::to_string(&editor_settings).map_err(|e| e.to_string())?;
                 tx.execute(
                     "INSERT OR REPLACE INTO app_state (key, value_json) VALUES (?1, ?2)",
                     params![APP_STATE_EDITOR_SETTINGS_KEY, value],
@@ -5568,6 +5716,63 @@ impl Storage {
     }
 
     pub async fn save_connections(&self, configs: &[ConnectionConfig]) -> Result<(), String> {
+        self.save_connections_clearing_keys(configs, Vec::new()).await
+    }
+
+    /// Resolves one configuration received from a client (UI): blank secret
+    /// fields are filled from the stored configuration of the same id, or of
+    /// `secrets_from_connection_id` when the id is not saved yet (duplicates),
+    /// and explicitly cleared paths stay blank. The result is used for
+    /// connect/test calls; nothing is persisted.
+    pub async fn resolve_client_connection(&self, input: &ClientConnectionInput) -> Result<ConnectionConfig, String> {
+        let stored = match self.load_connection(&input.config.id).await? {
+            Some(stored) => Some(stored),
+            None => match input.secrets_from_connection_id.as_deref() {
+                Some(source_id) => self.load_connection(source_id).await?,
+                None => None,
+            },
+        };
+        merge_stored_connection_secrets(&input.config, stored.as_ref(), &input.cleared_secrets)
+            .map(|config| config.canonicalized())
+    }
+
+    /// Saves the connection list received from a client. Secrets the client
+    /// left blank keep their stored values; `cleared_secrets` deletes them.
+    /// Returns the resolved configurations (with secrets) for runtime caches.
+    pub async fn save_client_connections(
+        &self,
+        inputs: &[ClientConnectionInput],
+    ) -> Result<Vec<ConnectionConfig>, String> {
+        let stored = self
+            .load_connections()
+            .await?
+            .into_iter()
+            .map(|config| (config.id.clone(), config))
+            .collect::<HashMap<_, _>>();
+        let mut resolved = Vec::with_capacity(inputs.len());
+        let mut cleared_keys = Vec::new();
+        for input in inputs {
+            let stored_config = stored.get(&input.config.id).or_else(|| {
+                input.secrets_from_connection_id.as_deref().and_then(|source_id| stored.get(source_id))
+            });
+            let config = merge_stored_connection_secrets(&input.config, stored_config, &input.cleared_secrets)?
+                .canonicalized();
+            for path in &input.cleared_secrets {
+                for key in storage_keys_for_cleared_secret(&config, path) {
+                    cleared_keys.push((config.id.clone(), key.to_string()));
+                }
+            }
+            resolved.push(config);
+        }
+        self.save_connections_clearing_keys(&resolved, cleared_keys).await?;
+        Ok(resolved)
+    }
+
+    async fn save_connections_clearing_keys(
+        &self,
+        configs: &[ConnectionConfig],
+        cleared_keys: Vec<(String, String)>,
+    ) -> Result<(), String> {
         let configs = configs.to_vec();
         let needs_key = configs.iter().any(connection_config_has_inline_secrets);
         let codec = self.secret_codec_for_write(needs_key).await?;
@@ -5578,6 +5783,15 @@ impl Storage {
 
             for config in &configs {
                 persist_connection_in_tx(&tx, &codec, config)?;
+            }
+            // Some secret kinds keep the previously stored value when the
+            // incoming field is blank; an explicit clear must still win.
+            for (connection_id, key) in &cleared_keys {
+                tx.execute(
+                    "DELETE FROM connection_secrets WHERE connection_id = ?1 AND key = ?2",
+                    params![connection_id, key],
+                )
+                .map_err(|e| e.to_string())?;
             }
 
             retained_ids.extend(configs.iter().map(|config| config.id.clone()));
@@ -5868,11 +6082,39 @@ impl Storage {
 
         let mut configs = Vec::new();
         for (id, json) in rows {
-            let mut config: ConnectionConfig = match serde_json::from_str(&json) {
+            if let Some(config) = self.hydrate_saved_connection(id, &json).await? {
+                configs.push(config);
+            }
+        }
+        Ok(configs)
+    }
+
+    /// Loads one saved connection with its secrets hydrated. Returns `None`
+    /// when the id is not saved (for example a draft or a test probe).
+    pub async fn load_connection(&self, connection_id: &str) -> Result<Option<ConnectionConfig>, String> {
+        let id = connection_id.to_string();
+        let json = self
+            .with_conn(move |conn| {
+                conn.query_row("SELECT config_json FROM connections WHERE id = ?1", [&id], |row| {
+                    row.get::<_, String>(0)
+                })
+                .optional()
+                .map_err(|e| e.to_string())
+            })
+            .await?;
+        match json {
+            Some(json) => self.hydrate_saved_connection(connection_id.to_string(), &json).await,
+            None => Ok(None),
+        }
+    }
+
+    async fn hydrate_saved_connection(&self, id: String, json: &str) -> Result<Option<ConnectionConfig>, String> {
+        {
+            let mut config: ConnectionConfig = match serde_json::from_str(json) {
                 Ok(config) => config,
                 Err(error) => {
                     warn!("Skipping unreadable saved connection '{}': {}", id, error);
-                    continue;
+                    return Ok(None);
                 }
             };
             config.password = self.get_secret(&id, "password").await?.unwrap_or_default();
@@ -5978,9 +6220,8 @@ impl Storage {
                 })
                 .await?;
             }
-            configs.push(config.canonicalized());
+            Ok(Some(config.canonicalized()))
         }
-        Ok(configs)
     }
 
     async fn hydrate_mq_auth_secrets(
@@ -7383,7 +7624,7 @@ impl Storage {
 
 fn persist_secret_in_tx(
     tx: &rusqlite::Transaction<'_>,
-    codec: &SecretCodec,
+    codec: &SecretWriteCodec,
     connection_id: &str,
     key: &str,
     secret: &str,
@@ -7404,7 +7645,7 @@ fn persist_secret_in_tx(
 
 fn apply_sync_connections_in_tx(
     tx: &Transaction<'_>,
-    codec: &SecretCodec,
+    codec: &SecretWriteCodec,
     configs: &[ConnectionConfig],
 ) -> Result<(), String> {
     let replacement_ids = configs.iter().map(|config| config.id.clone()).collect::<HashSet<_>>();
@@ -7453,7 +7694,7 @@ fn clear_sync_connection_secrets_in_tx(
 
 fn apply_sync_tunnel_profiles_in_tx(
     tx: &Transaction<'_>,
-    codec: &SecretCodec,
+    codec: &SecretWriteCodec,
     profiles: &[TransportLayerConfig],
     secret_profiles: Option<&[TransportLayerConfig]>,
 ) -> Result<(), String> {
@@ -7516,7 +7757,7 @@ fn apply_sync_tunnel_profiles_in_tx(
     Ok(())
 }
 
-fn apply_ai_configs_in_tx(tx: &Transaction<'_>, codec: &SecretCodec, configs: &[AiConfigItem]) -> Result<(), String> {
+fn apply_ai_configs_in_tx(tx: &Transaction<'_>, codec: &SecretWriteCodec, configs: &[AiConfigItem]) -> Result<(), String> {
     tx.execute("DELETE FROM ai_configs", []).map_err(|e| e.to_string())?;
     tx.execute("DELETE FROM ai_config", []).map_err(|e| e.to_string())?;
     tx.execute("DELETE FROM ai_provider_configs", []).map_err(|e| e.to_string())?;
@@ -7570,7 +7811,10 @@ fn apply_desktop_settings_in_tx(tx: &Transaction<'_>, settings: &DesktopSettings
     values.insert("icon_theme".to_string(), serde_json::to_value(settings.icon_theme).map_err(|e| e.to_string())?);
     values.insert("quit_on_close".to_string(), serde_json::Value::Bool(settings.quit_on_close));
     values.insert("close_action_prompted".to_string(), serde_json::Value::Bool(settings.close_action_prompted));
-    values.insert("debug_logging_enabled".to_string(), serde_json::Value::Bool(settings.debug_logging_enabled));
+    // Path and executable related settings (store directories, saved SQL sync
+    // directory, custom AI skill root) and debug logging are device-local and
+    // never imported from a sync snapshot: the store directories are loaded
+    // as code at startup.
     values.insert(
         "metadata_cache_max_memory_mb".to_string(),
         serde_json::Value::Number(serde_json::Number::from(normalize_metadata_cache_max_memory_mb(
@@ -7591,19 +7835,6 @@ fn apply_desktop_settings_in_tx(tx: &Transaction<'_>, settings: &DesktopSettings
         "sidebar_table_page_size".to_string(),
         serde_json::Value::Number(serde_json::Number::from(settings.sidebar_table_page_size)),
     );
-    let optional_dirs = [
-        ("saved_sql_sync_dir", settings.saved_sql_sync_dir.as_ref()),
-        ("driver_store_dir", settings.driver_store_dir.as_ref()),
-        ("plugin_store_dir", settings.plugin_store_dir.as_ref()),
-        ("agent_store_dir", settings.agent_store_dir.as_ref()),
-    ];
-    for (key, value) in optional_dirs {
-        if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
-            values.insert(key.to_string(), serde_json::Value::String(value.clone()));
-        } else {
-            values.insert(key.to_string(), serde_json::Value::Null);
-        }
-    }
     let current: Option<String> = tx
         .query_row("SELECT settings_json FROM app_settings WHERE id = 1", [], |row| row.get(0))
         .optional()
@@ -7647,7 +7878,7 @@ fn apply_saved_sql_in_tx(tx: &Transaction<'_>, library: &SavedSqlLibrary) -> Res
 
 fn persist_mq_auth_secrets_in_tx(
     tx: &rusqlite::Transaction<'_>,
-    codec: &SecretCodec,
+    codec: &SecretWriteCodec,
     config: &ConnectionConfig,
 ) -> Result<(), String> {
     if config.db_type != DatabaseType::MessageQueue {
@@ -7678,7 +7909,7 @@ fn persist_mq_auth_secrets_in_tx(
 
 fn persist_mqtt_auth_secrets_in_tx(
     tx: &rusqlite::Transaction<'_>,
-    codec: &SecretCodec,
+    codec: &SecretWriteCodec,
     config: &ConnectionConfig,
 ) -> Result<(), String> {
     if config.db_type != DatabaseType::Mqtt {
@@ -7709,7 +7940,7 @@ fn persist_mqtt_auth_secrets_in_tx(
 
 fn replace_mq_auth_secret_in_tx(
     tx: &rusqlite::Transaction<'_>,
-    codec: &SecretCodec,
+    codec: &SecretWriteCodec,
     connection_id: &str,
     key: &str,
     auth: &serde_json::Map<String, serde_json::Value>,
@@ -7729,7 +7960,7 @@ fn replace_mq_auth_secret_in_tx(
 
 fn get_secret_in_tx(
     tx: &rusqlite::Transaction<'_>,
-    codec: &SecretCodec,
+    codec: &SecretWriteCodec,
     connection_id: &str,
     key: &str,
 ) -> Result<Option<String>, String> {
@@ -7752,7 +7983,7 @@ fn get_secret_in_tx(
 
 fn persist_mq_token_signing_secret_in_tx(
     tx: &rusqlite::Transaction<'_>,
-    codec: &SecretCodec,
+    codec: &SecretWriteCodec,
     config: &ConnectionConfig,
 ) -> Result<(), String> {
     if config.db_type != DatabaseType::MessageQueue {
@@ -7770,7 +8001,7 @@ fn persist_mq_token_signing_secret_in_tx(
 
 fn persist_nacos_auth_secrets_in_tx(
     tx: &rusqlite::Transaction<'_>,
-    codec: &SecretCodec,
+    codec: &SecretWriteCodec,
     config: &ConnectionConfig,
 ) -> Result<(), String> {
     if config.db_type != DatabaseType::Nacos || !config.save_password {
@@ -7811,7 +8042,7 @@ fn persist_nacos_auth_secrets_in_tx(
 
 fn persist_cassandra_tls_secrets_in_tx(
     tx: &rusqlite::Transaction<'_>,
-    codec: &SecretCodec,
+    codec: &SecretWriteCodec,
     config: &ConnectionConfig,
 ) -> Result<(), String> {
     if config.db_type != DatabaseType::Cassandra {
@@ -7840,7 +8071,7 @@ fn persist_cassandra_tls_secrets_in_tx(
 
 fn persist_json_secret_if_present_in_tx(
     tx: &rusqlite::Transaction<'_>,
-    codec: &SecretCodec,
+    codec: &SecretWriteCodec,
     connection_id: &str,
     key: &str,
     auth: &serde_json::Map<String, serde_json::Value>,
@@ -8939,6 +9170,100 @@ mod tests {
                 assert!(remaining.iter().all(|entry| entry.id == "newest" || entry.id.as_str() >= "00802"));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn history_retention_write_path_reads_limit_like_settings_parser() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("dbx.db")).await.unwrap();
+        for raw in [
+            r#"{"history_retention_limit":5000}"#,
+            r#"{"history_retention_limit":0}"#,
+            r#"{"history_retention_limit":"5000"}"#,
+            r#"{"history_retention_limit":true}"#,
+            r#"{"history_retention_limit":-1}"#,
+            r#"{"history_retention_limit":1e3}"#,
+            r#"{"history_retention_limit":18446744073709551615}"#,
+            r#"{"history_retention_limit":null}"#,
+            r#"{"other":1}"#,
+            "{}",
+            "not json",
+        ] {
+            let raw = raw.to_string();
+            let (fast, full) = storage
+                .with_conn(move |conn| {
+                    conn.execute("INSERT OR REPLACE INTO app_settings (id, settings_json) VALUES (1, ?1)", [&raw])
+                        .map_err(|error| error.to_string())?;
+                    Ok((load_history_retention_limit_for_write(conn), load_history_retention_limit_from_conn(conn)))
+                })
+                .await
+                .unwrap();
+            assert_eq!(fast, full);
+        }
+        let without_row = storage
+            .with_conn(|conn| {
+                conn.execute("DELETE FROM app_settings", []).map_err(|error| error.to_string())?;
+                load_history_retention_limit_for_write(conn)
+            })
+            .await
+            .unwrap();
+        assert_eq!(without_row, MAX_HISTORY as u32);
+    }
+
+    #[tokio::test]
+    async fn history_newest_first_queries_use_the_executed_at_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("dbx.db")).await.unwrap();
+        let plans = storage
+            .with_conn(|conn| {
+                let mut plans = Vec::new();
+                for sql in [
+                    "SELECT rowid FROM history ORDER BY executed_at DESC, id DESC LIMIT -1 OFFSET 1000",
+                    "SELECT id FROM history ORDER BY executed_at DESC LIMIT 50 OFFSET 0",
+                    "SELECT id FROM history WHERE activity_kind = 'query' ORDER BY executed_at DESC LIMIT 50 OFFSET 0",
+                ] {
+                    let mut stmt =
+                        conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).map_err(|error| error.to_string())?;
+                    let detail = stmt
+                        .query_map([], |row| row.get::<_, String>(3))
+                        .map_err(|error| error.to_string())?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|error| error.to_string())?
+                        .join("; ");
+                    plans.push(detail);
+                }
+                Ok(plans)
+            })
+            .await
+            .unwrap();
+        for plan in plans {
+            assert!(plan.contains("idx_history_"), "{plan}");
+            assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+        }
+    }
+
+    #[tokio::test]
+    async fn history_trim_keeps_newest_rows_and_zero_means_unlimited() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("dbx.db")).await.unwrap();
+        seed_history_backlog(&storage, 250).await;
+        let (unlimited, trimmed, remaining) = storage
+            .with_conn(|conn| {
+                let unlimited = trim_history_to_limit(conn, 0)?;
+                let trimmed = trim_history_to_limit(conn, 200)?;
+                let remaining = conn
+                    .query_row("SELECT COUNT(*), MIN(id) FROM history", [], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .map_err(|error| error.to_string())?;
+                Ok((unlimited, trimmed, remaining))
+            })
+            .await
+            .unwrap();
+        assert_eq!(unlimited, 0);
+        assert_eq!(trimmed, 50);
+        // Equal timestamps fall back to `id DESC`, so the highest ids survive.
+        assert_eq!(remaining, (200, "00050".to_string()));
     }
 
     #[tokio::test]
@@ -10386,7 +10711,7 @@ mod tests {
             storage.load_mcp_global_policy().await.unwrap(),
             McpGlobalPolicyState {
                 configured: false,
-                read_only: false,
+                read_only: true,
                 allow_dangerous_sql: false,
                 allowed_connection_ids: None,
                 allowed_group_ids: Vec::new(),
@@ -12550,6 +12875,8 @@ mod tests {
             preserve_plugin_secrets: false,
             sync_credentials: None,
             ai_configs: None,
+            drop_secret_connection_ids: Vec::new(),
+            drop_secret_tunnel_profile_ids: Vec::new(),
         };
         assert!(storage.apply_sync_import_transaction(plan).await.is_err());
         let connections = storage.load_connections().await.unwrap();

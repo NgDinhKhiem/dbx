@@ -91,14 +91,17 @@ describe("connectionStore save_password opt-out", () => {
     expect(saveConnections).toHaveBeenCalledWith(expect.arrayContaining([expect.objectContaining({ id: "no-save", password: "", save_password: false })]));
   });
 
-  it("addConnection keeps the password for legacy configs without save_password", async () => {
+  it("addConnection saves the password for legacy configs without save_password and scrubs it from memory", async () => {
     installApiMocks();
     const { useConnectionStore } = await import("@/stores/connectionStore");
     const store = useConnectionStore();
 
     await store.addConnection(postgresConnection({ id: "legacy", password: "s3cret" }));
 
-    expect(store.getConfig("legacy")?.password).toBe("s3cret");
+    const { saveConnections } = await import("@/lib/backend/api");
+    expect(saveConnections).toHaveBeenCalledWith(expect.arrayContaining([expect.objectContaining({ id: "legacy", password: "s3cret" })]));
+    expect(store.getConfig("legacy")?.password).toBe("");
+    expect(store.getConfig("legacy")?.saved_secrets).toEqual(["password"]);
   });
 
   it("updateConnection blanks the in-memory password when save_password is false", async () => {
@@ -294,7 +297,9 @@ describe("connectionStore save_password opt-out", () => {
     expect(connectDb).toHaveBeenNthCalledWith(2, expect.objectContaining({ password: "typed-pw" }), expect.any(Number));
     const { saveConnections } = await import("@/lib/backend/api");
     expect(saveConnections).toHaveBeenLastCalledWith(expect.arrayContaining([expect.objectContaining({ id: "mysql-1", password: "typed-pw", save_password: true })]));
-    expect(store.getConfig("mysql-1")?.password).toBe("typed-pw");
+    // The backend now holds the remembered password; memory keeps only the marker.
+    expect(store.getConfig("mysql-1")?.password).toBe("");
+    expect(store.getConfig("mysql-1")?.saved_secrets).toContain("password");
   });
 
   it("prompts and retries when an encrypted SQLite file is opened without a password", async () => {
@@ -323,7 +328,8 @@ describe("connectionStore save_password opt-out", () => {
     expect(connectDb).toHaveBeenCalledTimes(2);
     expect(connectDb).toHaveBeenNthCalledWith(1, expect.objectContaining({ password: "" }), expect.any(Number));
     expect(connectDb).toHaveBeenNthCalledWith(2, expect.objectContaining({ password: "123456" }), expect.any(Number));
-    expect(store.getConfig("sqlite-1")?.password).toBe("123456");
+    expect(store.getConfig("sqlite-1")?.password).toBe("");
+    expect(store.getConfig("sqlite-1")?.saved_secrets).toContain("password");
   });
 
   it("does not persist a recovered password after the connection config changes", async () => {

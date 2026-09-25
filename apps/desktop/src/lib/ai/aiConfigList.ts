@@ -1,6 +1,7 @@
 import type { AiConfig, AiConfigItem, AiConfiguredModel } from "@/types/ai";
 import type { AiModelInfo } from "@/lib/backend/tauri";
 import { uuid } from "@/lib/common/utils";
+import { hasAiApiKey } from "@/lib/ai/aiConfigSecrets";
 
 export type { AiConfigItem };
 
@@ -9,8 +10,17 @@ export function generateId(): string {
   return uuid();
 }
 
+/**
+ * Dedupe key for legacy configs. Keys arrive redacted from the backend, so a
+ * blank key only records whether one is stored instead of comparing values;
+ * configs that already carry an id are identified by it.
+ */
 export function getConfigKey(config: AiConfig): string {
-  return `${config.provider}|${config.apiKey}|${config.endpoint}|${config.model}`;
+  const id = (config as Partial<AiConfigItem>).id;
+  if (typeof id === "string" && id.trim()) return `id|${id}`;
+  const typedKey = config.apiKey?.trim() ?? "";
+  const credential = typedKey ? `key:${typedKey}` : hasAiApiKey(config) ? "saved" : "";
+  return `${config.provider}|${credential}|${config.endpoint}|${config.model}`;
 }
 
 export function aiConfigToItem(config: AiConfig, id: string, name: string): AiConfigItem {

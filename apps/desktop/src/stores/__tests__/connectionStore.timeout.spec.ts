@@ -496,7 +496,7 @@ describe("connectionStore timeout recovery", () => {
   });
 
   it("exports effective timeout snapshots for older DBX versions", async () => {
-    const encryptConfig = vi.fn().mockResolvedValue({ encrypted: true });
+    const exportConnectionsEncrypted = vi.fn().mockResolvedValue('{"format":"dbx-encrypted","version":2}');
     const click = vi.fn();
     const NativeUrl = globalThis.URL;
     class TestUrl extends NativeUrl {
@@ -506,9 +506,9 @@ describe("connectionStore timeout recovery", () => {
     vi.stubGlobal("document", { createElement: vi.fn(() => ({ click, href: "", download: "" })) });
     vi.stubGlobal("URL", TestUrl);
     vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
-    vi.doMock("@/lib/backend/configCrypto", () => ({ encryptConfig }));
     vi.doMock("@/lib/backend/api", () => ({
       deleteSchemaCachePrefix: vi.fn().mockResolvedValue(undefined),
+      exportConnectionsEncrypted,
       loadEditorSettings: vi.fn().mockResolvedValue(null),
       loadConnections: vi.fn().mockResolvedValue([postgresConnection({ id: "inherited", connect_timeout_secs: 99, connect_timeout_inherit: true, query_timeout_secs: 99, query_timeout_inherit: true })]),
       loadPinnedTreeNodeIds: vi.fn().mockResolvedValue([]),
@@ -528,7 +528,8 @@ describe("connectionStore timeout recovery", () => {
     await store.initFromDisk();
     await store.exportConnectionsToFile({ mode: "encrypted", passphrase: "test-passphrase" });
 
-    const exported = JSON.parse(encryptConfig.mock.calls[0]?.[0] as string);
+    expect(exportConnectionsEncrypted).toHaveBeenCalledWith(expect.objectContaining({ connections: expect.any(Array) }), "test-passphrase");
+    const exported = exportConnectionsEncrypted.mock.calls[0]?.[0] as { connections: unknown[] };
     expect(exported.connections[0]).toMatchObject({
       connect_timeout_secs: 7,
       connect_timeout_inherit: true,

@@ -1,4 +1,5 @@
 import type { ConnectionConfig, JdbcDriverInfo, JdbcMavenBundleInfo } from "@/types/database";
+import { hasSavedSecret } from "@/lib/connection/savedSecrets";
 
 export const JDBCX_DRIVER_PROFILE = "jdbcx";
 export const JDBCX_JDBC_DRIVER_CLASS = "io.github.jdbcx.WrappedDriver";
@@ -90,7 +91,8 @@ function selectRuntimeCandidate(candidates: JdbcxRuntimeCandidate[], configuredP
 export async function ensureJdbcxRuntimeDrivers(config: ConnectionConfig, api: JdbcxRuntimeDriverApi, onInstalling?: (coordinates: string[]) => void): Promise<JdbcxRuntimeDriverResult | undefined> {
   if (config.db_type !== "jdbc" || config.driver_profile !== JDBCX_DRIVER_PROFILE) return undefined;
 
-  config.connection_string = config.connection_string?.trim() || JDBCX_DEFAULT_URL;
+  // A blank URL with a stored (hidden) value keeps the stored one on the backend.
+  if (!hasSavedSecret(config, "connection_string")) config.connection_string = config.connection_string?.trim() || JDBCX_DEFAULT_URL;
   config.jdbc_driver_class = config.jdbc_driver_class?.trim() || JDBCX_JDBC_DRIVER_CLASS;
   const configuredPaths = (config.jdbc_driver_paths ?? []).map((path) => path.trim()).filter(Boolean);
   const pluginStatus = await api.jdbcPluginStatus();

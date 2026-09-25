@@ -84,6 +84,14 @@ export interface AiConfig {
   qoderCliPath?: string | null;
   qoderCliEnv?: Record<string, string>;
   runtimeEffort?: AiEffortSelection | null;
+  /**
+   * Secret paths the backend stores for this config ("apiKey", "proxyUrl",
+   * "customHeaders.<Name>", "<envField>.<VAR>"). Loaded configs carry these
+   * secrets blank; a blank value on save keeps the stored secret.
+   */
+  savedSecrets?: string[];
+  /** Secret paths (same format as `savedSecrets`) to delete from storage on save. */
+  clearedSecrets?: string[];
 }
 
 export interface AiTestConnectionResult {
@@ -98,6 +106,11 @@ export interface AiConfigItem extends AiConfig {
   id: string;
   name: string;
   isDefault?: boolean;
+  /**
+   * Save-only migration hint: when this id is not stored yet, the backend fills
+   * blank secrets from the legacy source ("legacy" or "provider:<providerKey>").
+   */
+  legacySecretsFrom?: string;
 }
 
 export interface AiActiveModelSelection {

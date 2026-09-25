@@ -150,7 +150,8 @@ export function useSidebarConnectionMutationRuntime(options: SidebarConnectionMu
     for (const target of targets) {
       const config = connectionStore.getConfig(target.connectionId);
       if (!config) continue;
-      const newConfig = { ...config, id: uuid(), name: `${config.name} (Copy)` };
+      // The copy has no stored secrets yet; the backend reuses the source's for blank fields.
+      const newConfig = { ...config, id: uuid(), name: `${config.name} (Copy)`, secrets_from_connection_id: config.id };
       await connectionStore.addConnection(newConfig, connectionStore.groupIdForConnection(target.connectionId));
       duplicatedCount += 1;
     }

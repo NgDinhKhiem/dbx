@@ -2,7 +2,6 @@ use aes_gcm::{
     aead::{rand_core::RngCore, Aead, OsRng},
     Aes256Gcm, KeyInit, Nonce,
 };
-use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{engine::general_purpose::STANDARD as BASE64, engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::Utc;
 use reqwest::{header, Client, Method, StatusCode, Url};
@@ -19,9 +18,11 @@ use crate::connection_secrets::{
     PLUGIN_CONNECTION_SECRET_PREFIX,
 };
 use crate::models::connection::{ConnectionConfig, DatabaseType, TransportLayerConfig};
+use crate::persistence::connection_export::{mac_equals, Argon2Params, HmacSha256};
 use crate::saved_sql::SavedSqlLibrary;
 use crate::storage::{
     DesktopSettings, SnippetPendingCleanup, Storage, SyncImportCredential, SyncImportPlan, SyncImportSecret,
+    SYNC_PROTECTED_EDITOR_SETTINGS,
 };
 
 /// Version 2 introduces an explicit, versioned secrets transport payload.  We
@@ -29,10 +30,22 @@ use crate::storage::{
 /// existing devices.
 const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 const LEGACY_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+/// Blob versions: 1 = legacy Argon2id parameters without associated data
+/// (still used for device-local credentials encrypted with the random device
+/// secret), 2 = legacy parameters with associated data, 3 = Argon2id
+/// parameters recorded in `kdfParams` with associated data.
 const SENSITIVE_PAYLOAD_VERSION: u32 = 2;
+const PASSPHRASE_BLOB_VERSION: u32 = 3;
 const SENSITIVE_PAYLOAD_TYPE: &str = "dbx-sync-secrets";
 const ENCRYPTED_SNIPPET_SNAPSHOT_FORMAT: &str = "dbx-encrypted-sync-snapshot";
+/// Snippet envelope versions: 1 = legacy blob, 2 = version-3 blob.
 const ENCRYPTED_SNIPPET_SNAPSHOT_VERSION: u32 = 1;
+const ENCRYPTED_SNIPPET_SNAPSHOT_VERSION_WITH_PARAMS: u32 = 2;
+const SNAPSHOT_INTEGRITY_VERSION: u32 = 1;
+const SNAPSHOT_INTEGRITY_ALGORITHM: &str = "hmac-sha256";
+const SNAPSHOT_INTEGRITY_CONTEXT: &[u8] = b"dbx-sync-snapshot-integrity-v1\n";
+/// Minimum length (in characters) of newly chosen sync and snippet passwords.
+pub const MIN_SYNC_PASSPHRASE_CHARS: usize = 12;
 const DEFAULT_REMOTE_PATH: &str = "DBX/sync/snapshot.json";
 const DEFAULT_SNIPPET_FILE_NAME: &str = "dbx-sync.json";
 const GITHUB_API_BASE: &str = "https://api.github.com";
@@ -144,6 +157,21 @@ pub struct SyncSnapshot {
     pub desktop_settings: DesktopSettings,
     pub editor_settings: Option<serde_json::Value>,
     pub encrypted_secrets: Option<EncryptedSecretsBlob>,
+    /// Tag authenticating the whole snapshot with a key derived from the sync
+    /// password. Absent on snapshots uploaded without a sync password and on
+    /// snapshots written by older versions; those import as unauthenticated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrity: Option<SnapshotIntegrity>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotIntegrity {
+    pub version: u32,
+    pub algorithm: String,
+    pub kdf: Argon2Params,
+    pub salt: String,
+    pub mac: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,6 +217,9 @@ pub struct EncryptedSecretsBlob {
     /// Context authenticated as AES-GCM additional authenticated data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aad: Option<String>,
+    /// Argon2id parameters used for this blob (version 3 and later).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kdf_params: Option<Argon2Params>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -250,6 +281,20 @@ pub struct ApplySnapshotOptions<'a> {
     /// secrets. Metadata is always applied, but callers can explicitly keep
     /// device-local credentials while restoring the rest of a snapshot.
     pub restore_secrets: bool,
+    /// What happens to locally saved secrets of connections whose endpoint
+    /// (host, port, user, tunnel endpoints, ...) the snapshot changes.
+    pub endpoint_change_policy: EndpointChangePolicy,
+}
+
+/// Handling of local secrets for connections whose endpoint an import
+/// changes. Only an explicit user confirmation keeps them: otherwise a
+/// tampered snapshot could redirect a saved connection to another server and
+/// capture its password on the next connect.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EndpointChangePolicy {
+    #[default]
+    DropLocalSecrets,
+    KeepLocalSecrets,
 }
 
 /// Controls which sensitive values are placed in a sync snapshot.  A
@@ -265,11 +310,15 @@ pub struct SyncExportOptions<'a> {
     pub include_plugin_secrets: bool,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApplySnapshotSummary {
     pub encrypted_secrets_present: bool,
     pub secrets_applied: bool,
+    /// Connections whose locally saved secrets were deleted because the
+    /// import changed their endpoint without an explicit confirmation.
+    #[serde(default)]
+    pub dropped_secret_connection_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -338,7 +387,8 @@ pub async fn build_sync_snapshot_with_options(
         let passphrase = normalized_passphrase(options.sync_passphrase)
             .ok_or_else(|| "A sync password is required when including synced secrets.".to_string())?;
         let payload = build_sensitive_payload_with_options(storage, &connections, &tunnel_profiles, options).await?;
-        Some(encrypt_sensitive_payload(&payload, passphrase)?)
+        let passphrase = passphrase.to_string();
+        Some(run_blocking(move || encrypt_sensitive_payload(&payload, &passphrase)).await?)
     } else {
         None
     };
@@ -350,7 +400,7 @@ pub async fn build_sync_snapshot_with_options(
         profile.scrub_secrets();
     }
 
-    Ok(SyncSnapshot {
+    let mut snapshot = SyncSnapshot {
         schema_version: SNAPSHOT_SCHEMA_VERSION,
         exported_at: Utc::now().to_rfc3339(),
         app_version: app_version.into(),
@@ -363,6 +413,414 @@ pub async fn build_sync_snapshot_with_options(
         desktop_settings: storage.load_desktop_settings().await?,
         editor_settings,
         encrypted_secrets,
+        integrity: None,
+    };
+    // With a sync password available, authenticate the whole snapshot (not
+    // only the secrets blob) so connection endpoints and settings cannot be
+    // modified on the sync storage without detection.
+    if let Some(passphrase) = normalized_passphrase(options.sync_passphrase) {
+        let document = snapshot_document(&snapshot)?;
+        let passphrase = passphrase.to_string();
+        snapshot.integrity = Some(run_blocking(move || compute_snapshot_integrity(&document, &passphrase)).await?);
+    }
+    Ok(snapshot)
+}
+
+async fn run_blocking<T, F>(task: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tokio::task::spawn_blocking(task).await.map_err(|error| error.to_string())?
+}
+
+/// JSON document of a snapshot as it is uploaded. Integrity tags are computed
+/// over this representation (without the `integrity` member).
+fn snapshot_document(snapshot: &SyncSnapshot) -> Result<serde_json::Value, String> {
+    serde_json::to_value(snapshot).map_err(|error| error.to_string())
+}
+
+fn snapshot_integrity_input(document: &serde_json::Value) -> Result<Vec<u8>, String> {
+    let object = document.as_object().ok_or_else(|| "Sync snapshot must be a JSON object".to_string())?;
+    let unsigned = object
+        .iter()
+        .filter(|(key, _)| key.as_str() != "integrity")
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<serde_json::Map<_, _>>();
+    serde_json::to_vec(&serde_json::Value::Object(unsigned)).map_err(|error| error.to_string())
+}
+
+fn compute_snapshot_integrity(document: &serde_json::Value, passphrase: &str) -> Result<SnapshotIntegrity, String> {
+    let input = snapshot_integrity_input(document)?;
+    let mut salt = [0u8; 16];
+    OsRng.fill_bytes(&mut salt);
+    let params = Argon2Params::for_new_data();
+    let key = params.derive_key(passphrase.as_bytes(), &salt)?;
+    let mac = HmacSha256::new(&key).mac(&[SNAPSHOT_INTEGRITY_CONTEXT, &input]);
+    Ok(SnapshotIntegrity {
+        version: SNAPSHOT_INTEGRITY_VERSION,
+        algorithm: SNAPSHOT_INTEGRITY_ALGORITHM.to_string(),
+        kdf: params,
+        salt: BASE64.encode(salt),
+        mac: BASE64.encode(mac),
+    })
+}
+
+fn verify_snapshot_integrity(
+    document: &serde_json::Value,
+    integrity: &SnapshotIntegrity,
+    passphrase: &str,
+) -> Result<(), String> {
+    const FAILED: &str = "SYNC_SNAPSHOT_INTEGRITY_FAILED: The sync snapshot does not match its integrity tag. It was modified after it was uploaded, or it was uploaded with a different sync password.";
+    if integrity.version != SNAPSHOT_INTEGRITY_VERSION || integrity.algorithm != SNAPSHOT_INTEGRITY_ALGORITHM {
+        return Err("Unsupported sync snapshot integrity format".to_string());
+    }
+    let params = integrity.kdf.validate()?;
+    let salt = BASE64.decode(&integrity.salt).map_err(|_| FAILED.to_string())?;
+    let expected = BASE64.decode(&integrity.mac).map_err(|_| FAILED.to_string())?;
+    let key = params.derive_key(passphrase.as_bytes(), &salt)?;
+    let actual = HmacSha256::new(&key).mac(&[SNAPSHOT_INTEGRITY_CONTEXT, &snapshot_integrity_input(document)?]);
+    if mac_equals(&actual, &expected) {
+        Ok(())
+    } else {
+        Err(FAILED.to_string())
+    }
+}
+
+/// A downloaded snapshot together with what could be verified about it.
+#[derive(Debug, Clone)]
+pub struct VerifiedSyncSnapshot {
+    pub snapshot: SyncSnapshot,
+    /// True when the snapshot was authenticated with a user secret: its
+    /// integrity tag verified with the sync password, or it came from an
+    /// encrypted (AEAD) snippet envelope.
+    pub authenticated: bool,
+    /// Hash of the downloaded bytes; a confirmation applies to this exact
+    /// content only.
+    pub token: String,
+}
+
+async fn verify_snapshot_document(
+    document: serde_json::Value,
+    token: String,
+    envelope_authenticated: bool,
+    passphrase: Option<&str>,
+) -> Result<VerifiedSyncSnapshot, String> {
+    let snapshot: SyncSnapshot = serde_json::from_value(document.clone()).map_err(|error| error.to_string())?;
+    let integrity_verified = match (snapshot.integrity.clone(), normalized_passphrase(passphrase)) {
+        (Some(integrity), Some(passphrase)) => {
+            let passphrase = passphrase.to_string();
+            run_blocking(move || verify_snapshot_integrity(&document, &integrity, &passphrase)).await?;
+            true
+        }
+        _ => false,
+    };
+    Ok(VerifiedSyncSnapshot { snapshot, authenticated: envelope_authenticated || integrity_verified, token })
+}
+
+/// Parses and verifies a WebDAV snapshot document.
+pub async fn verify_sync_snapshot_bytes(bytes: &[u8], passphrase: Option<&str>) -> Result<VerifiedSyncSnapshot, String> {
+    let document: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    verify_snapshot_document(document, bytes_token(bytes), false, passphrase).await
+}
+
+fn bytes_token(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+pub fn validate_new_sync_passphrase(passphrase: &str) -> Result<(), String> {
+    if passphrase.trim().chars().count() < MIN_SYNC_PASSPHRASE_CHARS {
+        return Err(format!(
+            "SYNC_PASSPHRASE_TOO_SHORT: the sync password must be at least {MIN_SYNC_PASSPHRASE_CHARS} characters"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncEndpointFieldChange {
+    pub field: String,
+    pub before: String,
+    pub after: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SyncEndpointChangeKind {
+    Connection,
+    TunnelProfile,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncEndpointChange {
+    pub kind: SyncEndpointChangeKind,
+    pub connection_id: String,
+    pub connection_name: String,
+    pub changes: Vec<SyncEndpointFieldChange>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncImportReview {
+    pub authenticated: bool,
+    pub token: String,
+    pub endpoint_changes: Vec<SyncEndpointChange>,
+}
+
+impl SyncImportReview {
+    /// Unauthenticated snapshots and endpoint changes of connections that keep
+    /// local secrets both need an explicit user decision.
+    pub fn requires_confirmation(&self) -> bool {
+        !self.authenticated || !self.endpoint_changes.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncImportConfirmation {
+    /// `SyncImportReview::token` the user reviewed.
+    pub token: String,
+    /// Keep local saved secrets of connections whose endpoint changes.
+    #[serde(default)]
+    pub keep_local_secrets: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SyncDownloadStatus {
+    Applied,
+    ConfirmationRequired,
+}
+
+/// Download result shared by the desktop and web transports.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncDownloadDetails {
+    pub status: SyncDownloadStatus,
+    pub review: Option<SyncImportReview>,
+    /// Synced editor settings without device-protected keys.
+    pub editor_settings: Option<serde_json::Value>,
+    /// Local desktop settings after the import (path settings stay local).
+    pub desktop_settings: Option<DesktopSettings>,
+    pub apply_summary: Option<ApplySnapshotSummary>,
+}
+
+fn strip_protected_editor_settings(value: &serde_json::Value) -> serde_json::Value {
+    let mut value = value.clone();
+    if let Some(object) = value.as_object_mut() {
+        for key in SYNC_PROTECTED_EDITOR_SETTINGS {
+            object.remove(*key);
+        }
+    }
+    value
+}
+
+fn endpoint_like_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    ["url", "host", "endpoint", "address", "server", "broker", "namesrv", "nodes", "bootstrap"]
+        .iter()
+        .any(|marker| key.contains(marker))
+}
+
+fn collect_external_endpoints(prefix: &str, value: &serde_json::Value, depth: usize, output: &mut Vec<(String, String)>) {
+    if depth > 6 {
+        return;
+    }
+    let Some(object) = value.as_object() else {
+        return;
+    };
+    for (key, child) in object {
+        let path = format!("{prefix}.{key}");
+        match child {
+            serde_json::Value::Object(_) => collect_external_endpoints(&path, child, depth + 1, output),
+            serde_json::Value::String(text) if endpoint_like_key(key) => output.push((path, text.clone())),
+            serde_json::Value::Number(number) if endpoint_like_key(key) => output.push((path, number.to_string())),
+            serde_json::Value::Array(items) if endpoint_like_key(key) => {
+                output.push((path, items.iter().map(|item| item.to_string()).collect::<Vec<_>>().join(",")))
+            }
+            _ => {}
+        }
+    }
+}
+
+fn layer_endpoint(layer: &TransportLayerConfig) -> String {
+    match layer {
+        TransportLayerConfig::Ssh(ssh) => format!("ssh {}@{}:{} {}", ssh.user, ssh.host, ssh.port, ssh.profile_id),
+        TransportLayerConfig::Proxy(proxy) => {
+            format!("proxy {}@{}:{} {}", proxy.username, proxy.host, proxy.port, proxy.profile_id)
+        }
+        TransportLayerConfig::HttpTunnel(http) => format!("http_tunnel {} {}", http.url, http.profile_id),
+    }
+    .trim()
+    .to_string()
+}
+
+fn connection_endpoint_fields(config: &ConnectionConfig) -> Vec<(String, String)> {
+    let config = config.canonicalized();
+    let db_type = serde_json::to_value(config.db_type)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_default();
+    let mut fields = vec![
+        ("db_type".to_string(), db_type),
+        ("host".to_string(), config.host.clone()),
+        ("port".to_string(), config.port.to_string()),
+        ("username".to_string(), config.username.clone()),
+        ("redis_sentinel_nodes".to_string(), config.redis_sentinel_nodes.clone()),
+        ("redis_cluster_nodes".to_string(), config.redis_cluster_nodes.clone()),
+        ("etcd_endpoints".to_string(), config.etcd_endpoints.clone()),
+        ("plugin_id".to_string(), config.plugin_id.clone().unwrap_or_default()),
+    ];
+    for (index, layer) in config.transport_layers.iter().enumerate() {
+        fields.push((format!("transport_layers[{index}]"), layer_endpoint(layer)));
+    }
+    if let Some(external) = &config.external_config {
+        collect_external_endpoints("external_config", external, 0, &mut fields);
+    }
+    fields
+}
+
+fn endpoint_field_changes(before: Vec<(String, String)>, after: Vec<(String, String)>) -> Vec<SyncEndpointFieldChange> {
+    let mut changes = Vec::new();
+    let mut names = before.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>();
+    for (name, _) in &after {
+        if !names.contains(name) {
+            names.push(name.clone());
+        }
+    }
+    for name in names {
+        let old = before.iter().find(|(field, _)| *field == name).map(|(_, value)| value.clone()).unwrap_or_default();
+        let new = after.iter().find(|(field, _)| *field == name).map(|(_, value)| value.clone()).unwrap_or_default();
+        if old != new {
+            changes.push(SyncEndpointFieldChange { field: name, before: old, after: new });
+        }
+    }
+    changes
+}
+
+fn tunnel_profile_has_secrets(profile: &TransportLayerConfig) -> bool {
+    let mut scrubbed = profile.clone();
+    scrubbed.scrub_secrets();
+    scrubbed != *profile
+}
+
+/// Endpoint changes of existing connections/tunnel profiles that keep local
+/// secrets after the import.
+fn sync_endpoint_changes(
+    local_connections: &[ConnectionConfig],
+    local_profiles: &[TransportLayerConfig],
+    snapshot: &SyncSnapshot,
+    options: &ApplySnapshotOptions<'_>,
+) -> Vec<SyncEndpointChange> {
+    // When the snapshot's own secrets are restored they replace local ones
+    // (plugin secrets may still be kept), so those connections do not keep
+    // local secrets that could leak to a new endpoint.
+    let payload_replaces_secrets = options.restore_secrets
+        && ((snapshot.encrypted_secrets.is_some() && normalized_passphrase(options.secrets_passphrase).is_some())
+            || snapshot.connections.iter().any(connection_has_inline_secrets));
+    let mut changes = Vec::new();
+    for incoming in &snapshot.connections {
+        let Some(local) = local_connections.iter().find(|local| local.id == incoming.id) else {
+            continue;
+        };
+        let keeps_local_secrets = if payload_replaces_secrets {
+            !local.connection_secrets.is_empty()
+        } else {
+            connection_has_inline_secrets(local) || !local.connection_secrets.is_empty()
+        };
+        if !keeps_local_secrets {
+            continue;
+        }
+        let fields = endpoint_field_changes(connection_endpoint_fields(local), connection_endpoint_fields(incoming));
+        if !fields.is_empty() {
+            changes.push(SyncEndpointChange {
+                kind: SyncEndpointChangeKind::Connection,
+                connection_id: local.id.clone(),
+                connection_name: local.name.clone(),
+                changes: fields,
+            });
+        }
+    }
+    if !payload_replaces_secrets {
+        for incoming in snapshot.tunnel_profiles.iter().flatten() {
+            let Some(local) = local_profiles.iter().find(|local| local.id() == incoming.id()) else {
+                continue;
+            };
+            if !tunnel_profile_has_secrets(local) {
+                continue;
+            }
+            let fields = endpoint_field_changes(
+                vec![("endpoint".to_string(), layer_endpoint(local))],
+                vec![("endpoint".to_string(), layer_endpoint(incoming))],
+            );
+            if !fields.is_empty() {
+                changes.push(SyncEndpointChange {
+                    kind: SyncEndpointChangeKind::TunnelProfile,
+                    connection_id: local.id().to_string(),
+                    connection_name: local.name().to_string(),
+                    changes: fields,
+                });
+            }
+        }
+    }
+    changes
+}
+
+pub async fn review_sync_import(
+    storage: &Storage,
+    verified: &VerifiedSyncSnapshot,
+    options: ApplySnapshotOptions<'_>,
+) -> Result<SyncImportReview, String> {
+    let local_connections = storage.load_connections().await?;
+    let local_profiles = storage.load_tunnel_profiles().await?;
+    Ok(SyncImportReview {
+        authenticated: verified.authenticated,
+        token: verified.token.clone(),
+        endpoint_changes: sync_endpoint_changes(&local_connections, &local_profiles, &verified.snapshot, &options),
+    })
+}
+
+/// Reviews a verified snapshot and applies it when no confirmation is needed
+/// or `confirmation` matches the reviewed content.
+pub async fn import_verified_sync_snapshot(
+    storage: &Storage,
+    verified: &VerifiedSyncSnapshot,
+    secrets_passphrase: Option<&str>,
+    restore_secrets: bool,
+    confirmation: Option<&SyncImportConfirmation>,
+) -> Result<SyncDownloadDetails, String> {
+    let options = ApplySnapshotOptions {
+        secrets_passphrase,
+        restore_secrets,
+        endpoint_change_policy: EndpointChangePolicy::DropLocalSecrets,
+    };
+    let review = review_sync_import(storage, verified, options).await?;
+    let confirmed = confirmation.filter(|confirmation| confirmation.token == review.token);
+    if review.requires_confirmation() && confirmed.is_none() {
+        return Ok(SyncDownloadDetails {
+            status: SyncDownloadStatus::ConfirmationRequired,
+            review: Some(review),
+            editor_settings: None,
+            desktop_settings: None,
+            apply_summary: None,
+        });
+    }
+    let endpoint_change_policy = if confirmed.is_some_and(|confirmation| confirmation.keep_local_secrets) {
+        EndpointChangePolicy::KeepLocalSecrets
+    } else {
+        EndpointChangePolicy::DropLocalSecrets
+    };
+    let apply_summary =
+        apply_sync_snapshot(storage, &verified.snapshot, ApplySnapshotOptions { endpoint_change_policy, ..options })
+            .await?;
+    Ok(SyncDownloadDetails {
+        status: SyncDownloadStatus::Applied,
+        review: Some(review),
+        editor_settings: verified.snapshot.editor_settings.as_ref().map(strip_protected_editor_settings),
+        desktop_settings: Some(storage.load_desktop_settings().await?),
+        apply_summary: Some(apply_summary),
     })
 }
 
@@ -421,7 +879,10 @@ pub async fn apply_sync_snapshot(
     let mut sensitive_payload =
         match (options.restore_secrets, &snapshot.encrypted_secrets, normalized_passphrase(options.secrets_passphrase))
         {
-            (true, Some(blob), Some(passphrase)) => Some(decrypt_sensitive_payload(blob, passphrase)?),
+            (true, Some(blob), Some(passphrase)) => {
+                let (blob, passphrase) = (blob.clone(), passphrase.to_string());
+                Some(run_blocking(move || decrypt_sensitive_payload(&blob, &passphrase)).await?)
+            }
             // Restore intent is explicit. Do not silently leave a user with a
             // partial restore when the remote snapshot contains secrets.
             (true, Some(_), None) => return Err("A sync password is required to restore synced secrets.".to_string()),
@@ -544,6 +1005,22 @@ pub async fn apply_sync_snapshot(
     } else {
         None
     };
+    let (drop_secret_connection_ids, drop_secret_tunnel_profile_ids) =
+        if options.endpoint_change_policy == EndpointChangePolicy::DropLocalSecrets {
+            let local_connections = storage.load_connections().await?;
+            let local_profiles = storage.load_tunnel_profiles().await?;
+            let changes = sync_endpoint_changes(&local_connections, &local_profiles, snapshot, &options);
+            let ids_of = |kind: SyncEndpointChangeKind| {
+                changes
+                    .iter()
+                    .filter(|change| change.kind == kind)
+                    .map(|change| change.connection_id.clone())
+                    .collect::<Vec<_>>()
+            };
+            (ids_of(SyncEndpointChangeKind::Connection), ids_of(SyncEndpointChangeKind::TunnelProfile))
+        } else {
+            (Vec::new(), Vec::new())
+        };
     let sync_tunnel_profiles = snapshot.tunnel_profiles.clone().or_else(|| {
         tunnel_secret_profiles.as_ref().map(|profiles| {
             profiles
@@ -570,9 +1047,15 @@ pub async fn apply_sync_snapshot(
             preserve_plugin_secrets,
             sync_credentials,
             ai_configs,
+            drop_secret_connection_ids: drop_secret_connection_ids.clone(),
+            drop_secret_tunnel_profile_ids,
         })
         .await?;
-    Ok(ApplySnapshotSummary { encrypted_secrets_present, secrets_applied: sensitive_payload.is_some() })
+    Ok(ApplySnapshotSummary {
+        encrypted_secrets_present,
+        secrets_applied: sensitive_payload.is_some(),
+        dropped_secret_connection_ids: drop_secret_connection_ids,
+    })
 }
 
 fn validate_sensitive_payload_targets(
@@ -795,6 +1278,9 @@ pub async fn save_webdav_sync_secrets_preference(
     passphrase: Option<&str>,
 ) -> Result<(), String> {
     let normalized = normalized_passphrase(passphrase);
+    if let Some(passphrase) = normalized {
+        validate_new_sync_passphrase(passphrase)?;
+    }
     let blob = match normalized {
         Some(passphrase) => {
             let secret = storage.load_or_create_local_device_secret().await?;
@@ -849,7 +1335,7 @@ impl WebDavClient {
     pub async fn put_snapshot(&self, snapshot: &SyncSnapshot) -> Result<WebDavSyncSummary, String> {
         let remote_path = self.remote_path();
         self.ensure_parent_collections(&remote_path).await?;
-        let bytes = serde_json::to_vec_pretty(snapshot).map_err(|e| e.to_string())?;
+        let bytes = serde_json::to_vec_pretty(&snapshot_document(snapshot)?).map_err(|e| e.to_string())?;
         let response = self
             .request(Method::PUT, &remote_path)?
             .header(header::CONTENT_TYPE, "application/json")
@@ -887,6 +1373,29 @@ impl WebDavClient {
         Ok((snapshot, summary))
     }
 
+    /// Downloads the snapshot and verifies its integrity tag with the sync
+    /// password when one is available.
+    pub async fn get_verified_snapshot(
+        &self,
+        passphrase: Option<&str>,
+    ) -> Result<(VerifiedSyncSnapshot, WebDavSyncSummary), String> {
+        let remote_path = self.remote_path();
+        let response = self.request(Method::GET, &remote_path)?.send().await.map_err(|e| e.to_string())?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!("WebDAV download failed with HTTP {status}"));
+        }
+        let bytes = response.bytes().await.map_err(|e| e.to_string())?;
+        let verified = verify_sync_snapshot_bytes(&bytes, passphrase).await?;
+        let summary = WebDavSyncSummary {
+            remote_path,
+            bytes: bytes.len(),
+            exported_at: Some(verified.snapshot.exported_at.clone()),
+            app_version: Some(verified.snapshot.app_version.clone()),
+        };
+        Ok((verified, summary))
+    }
+
     async fn ensure_parent_collections(&self, remote_path: &str) -> Result<(), String> {
         let method = Method::from_bytes(b"MKCOL").map_err(|e| e.to_string())?;
         for parent in parent_collection_paths(remote_path) {
@@ -917,6 +1426,8 @@ impl WebDavClient {
         }
         let base = if endpoint.ends_with('/') { endpoint.to_string() } else { format!("{endpoint}/") };
         let base = Url::parse(&base).map_err(|e| e.to_string())?;
+        // Basic credentials and the snapshot must not travel in cleartext.
+        ensure_https_or_loopback(&base, "The WebDAV endpoint")?;
         base.join(remote_path.trim_start_matches('/')).map_err(|e| e.to_string())
     }
 }
@@ -966,7 +1477,7 @@ impl SnippetSyncClient {
             (_, Some(id)) => self.snippet_url(Some(id))?,
             (_, None) => format!("{}/user", self.api_base),
         };
-        let response = self.request(Method::GET, &url)?.send().await.map_err(|e| e.to_string())?;
+        let response = self.request(Method::GET, &url)?.send().await.map_err(snippet_transport_error)?;
         ensure_snippet_success(response.status(), "test")
     }
 
@@ -979,6 +1490,13 @@ impl SnippetSyncClient {
         self.require_token()?;
         let passphrase = required_snippet_passphrase(snippet_passphrase)?;
         let existing_id = normalized_snippet_id(self.config.snippet_id.as_deref());
+        // A new snippet sets its encryption password; existing snippets must
+        // keep accepting the password other devices already use.
+        if existing_id.is_none() && passphrase.chars().count() < MIN_SYNC_PASSPHRASE_CHARS {
+            return Err(format!(
+                "SNIPPET_PASSPHRASE_TOO_SHORT: the snippet encryption password must be at least {MIN_SYNC_PASSPHRASE_CHARS} characters"
+            ));
+        }
         let legacy_snapshot = if let Some(id) = existing_id {
             let existing_content = self.load_snippet_content(id).await?;
             if !is_encrypted_snippet_snapshot(&existing_content) {
@@ -1055,7 +1573,7 @@ impl SnippetSyncClient {
                 self.request(method, &url)?.json(&payload).send().await
             }
         }
-        .map_err(|e| e.to_string())?;
+        .map_err(snippet_transport_error)?;
         let status = response.status();
         let response_body = response.text().await.map_err(|e| e.to_string())?;
         ensure_snippet_response_success(status, "upload", &response_body)?;
@@ -1102,9 +1620,53 @@ impl SnippetSyncClient {
         Ok((snapshot, summary))
     }
 
+    /// Downloads the snippet snapshot. Encrypted envelopes are authenticated
+    /// by the snippet password; an inner integrity tag is verified with the
+    /// sync password when one is supplied.
+    pub async fn get_verified_snapshot(
+        &self,
+        snippet_passphrase: Option<&str>,
+        secrets_passphrase: Option<&str>,
+    ) -> Result<(VerifiedSyncSnapshot, SnippetSyncSummary), String> {
+        self.require_token()?;
+        let snippet_id = normalized_snippet_id(self.config.snippet_id.as_deref())
+            .ok_or_else(|| "Snippet id is required for download".to_string())?;
+        let content = self.load_snippet_content(snippet_id).await?;
+        let (document, envelope_authenticated) = parse_snippet_document(&content, snippet_passphrase)?;
+        let verified =
+            verify_snapshot_document(document, bytes_token(content.as_bytes()), envelope_authenticated, secrets_passphrase)
+                .await?;
+        let summary = SnippetSyncSummary {
+            provider: self.config.provider,
+            snippet_id: snippet_id.to_string(),
+            bytes: content.len(),
+            exported_at: Some(verified.snapshot.exported_at.clone()),
+            app_version: Some(verified.snapshot.app_version.clone()),
+            legacy_cleanup_required_id: None,
+            legacy_cleanup_expected_content_hash: None,
+        };
+        Ok((verified, summary))
+    }
+
+    /// Request for a raw file URL returned by the provider API. The access
+    /// token is attached only when the URL has the API's origin; any other
+    /// host (for example GitHub's raw content host) is fetched anonymously.
+    fn raw_request(&self, url: &str) -> Result<reqwest::RequestBuilder, String> {
+        let target = Url::parse(url).map_err(|_| "Snippet raw URL is invalid".to_string())?;
+        if !matches!(target.scheme(), "https" | "http") {
+            return Err("Snippet raw URL must use HTTP(S)".to_string());
+        }
+        let api = Url::parse(&self.api_base).map_err(|e| e.to_string())?;
+        if same_origin(&target, &api) {
+            return self.request(Method::GET, url);
+        }
+        ensure_https_or_loopback(&target, "The snippet raw URL")?;
+        Ok(self.http.request(Method::GET, target).header(header::USER_AGENT, "DBX"))
+    }
+
     async fn load_snippet_content(&self, snippet_id: &str) -> Result<String, String> {
         let url = self.snippet_url(Some(snippet_id))?;
-        let response = self.request(Method::GET, &url)?.send().await.map_err(|e| e.to_string())?;
+        let response = self.request(Method::GET, &url)?.send().await.map_err(snippet_transport_error)?;
         let status = response.status();
         let response_body = response.text().await.map_err(|e| e.to_string())?;
         ensure_snippet_response_success(status, "download", &response_body)?;
@@ -1128,10 +1690,10 @@ impl SnippetSyncClient {
                 .filter(|value| !value.is_empty())
                 .map(str::to_string)
                 .unwrap_or_else(|| constructed_main.clone());
-            let response = self.request(Method::GET, &raw_url)?.send().await.map_err(|e| e.to_string())?;
+            let response = self.raw_request(&raw_url)?.send().await.map_err(snippet_transport_error)?;
             if response.status() == StatusCode::NOT_FOUND && raw_url == constructed_main {
                 let master_url = format!("{url}/files/master/{DEFAULT_SNIPPET_FILE_NAME}/raw");
-                let response = self.request(Method::GET, &master_url)?.send().await.map_err(|e| e.to_string())?;
+                let response = self.request(Method::GET, &master_url)?.send().await.map_err(snippet_transport_error)?;
                 ensure_snippet_success(response.status(), "raw download")?;
                 return response.text().await.map_err(|e| e.to_string());
             }
@@ -1144,7 +1706,7 @@ impl SnippetSyncClient {
             Some(content) => content,
             None => {
                 let raw_url = raw_url.ok_or_else(|| "Snippet file content is unavailable".to_string())?;
-                let response = self.request(Method::GET, &raw_url)?.send().await.map_err(|e| e.to_string())?;
+                let response = self.raw_request(&raw_url)?.send().await.map_err(snippet_transport_error)?;
                 ensure_snippet_success(response.status(), "raw download")?;
                 response.text().await.map_err(|e| e.to_string())?
             }
@@ -1165,7 +1727,7 @@ impl SnippetSyncClient {
             return Ok(false);
         }
         let url = self.snippet_url(Some(&pending_cleanup.snippet_id))?;
-        let response = self.request(Method::DELETE, &url)?.send().await.map_err(|e| e.to_string())?;
+        let response = self.request(Method::DELETE, &url)?.send().await.map_err(snippet_transport_error)?;
         // If the provider reports that the old snippet is already absent, the
         // cleanup goal is satisfied and the newly created encrypted snippet is
         // still safe to use.
@@ -1194,7 +1756,9 @@ impl SnippetSyncClient {
                 .header(header::USER_AGENT, "DBX")
                 .header("X-GitHub-Api-Version", "2022-11-28")
                 .bearer_auth(token),
-            // Gitee API v5 documents access_token as a request parameter rather than an Authorization header.
+            // Gitee API v5 documents access_token only as a request parameter
+            // (no Authorization header). Keep it out of error messages: see
+            // `snippet_transport_error`, which strips the request URL.
             SnippetProvider::Gitee => request.query(&[("access_token", token)]),
             SnippetProvider::GitLab => request.header("PRIVATE-TOKEN", token),
         })
@@ -1837,28 +2401,40 @@ fn decrypt_sensitive_payload(blob: &EncryptedSecretsBlob, passphrase: &str) -> R
 }
 
 fn encrypt_snippet_snapshot(snapshot: &SyncSnapshot, passphrase: &str) -> Result<EncryptedSnippetSnapshot, String> {
-    let plaintext = serde_json::to_vec(snapshot).map_err(|e| e.to_string())?;
+    let plaintext = serde_json::to_vec(&snapshot_document(snapshot)?).map_err(|e| e.to_string())?;
     Ok(EncryptedSnippetSnapshot {
         format: ENCRYPTED_SNIPPET_SNAPSHOT_FORMAT.to_string(),
-        version: ENCRYPTED_SNIPPET_SNAPSHOT_VERSION,
-        payload: encrypt_bytes_with_secret(&plaintext, passphrase)?,
+        version: ENCRYPTED_SNIPPET_SNAPSHOT_VERSION_WITH_PARAMS,
+        payload: encrypt_bytes_with_passphrase(&plaintext, passphrase, ENCRYPTED_SNIPPET_SNAPSHOT_FORMAT)?,
     })
 }
 
-fn parse_snippet_snapshot(content: &str, secrets_passphrase: Option<&str>) -> Result<SyncSnapshot, String> {
+/// Returns the snapshot JSON document of snippet content and whether it was
+/// inside an authenticated (AES-GCM) envelope.
+fn parse_snippet_document(content: &str, snippet_passphrase: Option<&str>) -> Result<(serde_json::Value, bool), String> {
     if is_encrypted_snippet_snapshot(content) {
         let envelope: EncryptedSnippetSnapshot = serde_json::from_str(content).map_err(|e| e.to_string())?;
-        if envelope.format != ENCRYPTED_SNIPPET_SNAPSHOT_FORMAT
-            || envelope.version != ENCRYPTED_SNIPPET_SNAPSHOT_VERSION
-        {
+        if envelope.format != ENCRYPTED_SNIPPET_SNAPSHOT_FORMAT {
             return Err("Unsupported encrypted sync snapshot format".to_string());
         }
-        let passphrase = required_snippet_passphrase(secrets_passphrase)?;
-        let plaintext = decrypt_bytes_with_secret(&envelope.payload, passphrase)
-            .map_err(|_| "Failed to decrypt the synced snapshot. Check the snippet encryption password.".to_string())?;
-        return serde_json::from_slice(&plaintext).map_err(|e| e.to_string());
+        let passphrase = required_snippet_passphrase(snippet_passphrase)?;
+        let plaintext = match envelope.version {
+            ENCRYPTED_SNIPPET_SNAPSHOT_VERSION => decrypt_bytes_with_secret(&envelope.payload, passphrase),
+            ENCRYPTED_SNIPPET_SNAPSHOT_VERSION_WITH_PARAMS => {
+                decrypt_passphrase_blob(&envelope.payload, passphrase, ENCRYPTED_SNIPPET_SNAPSHOT_FORMAT)
+            }
+            _ => return Err("Unsupported encrypted sync snapshot format".to_string()),
+        }
+        .map_err(|_| "Failed to decrypt the synced snapshot. Check the snippet encryption password.".to_string())?;
+        let document = serde_json::from_slice(&plaintext).map_err(|e| e.to_string())?;
+        return Ok((document, true));
     }
-    serde_json::from_str(content).map_err(|e| e.to_string())
+    Ok((serde_json::from_str(content).map_err(|e| e.to_string())?, false))
+}
+
+fn parse_snippet_snapshot(content: &str, secrets_passphrase: Option<&str>) -> Result<SyncSnapshot, String> {
+    let (document, _) = parse_snippet_document(content, secrets_passphrase)?;
+    serde_json::from_value(document).map_err(|e| e.to_string())
 }
 
 fn is_encrypted_snippet_snapshot(content: &str) -> bool {
@@ -1942,6 +2518,7 @@ fn encrypt_bytes_with_secret(plaintext: &[u8], secret: &str) -> Result<Encrypted
         ciphertext: BASE64.encode(ciphertext),
         payload_type: None,
         aad: None,
+        kdf_params: None,
     })
 }
 
@@ -1950,17 +2527,28 @@ fn encrypt_bytes_with_secret_context(
     secret: &str,
     context: &str,
 ) -> Result<EncryptedSecretsBlob, String> {
+    encrypt_bytes_with_passphrase(plaintext, secret, context)
+}
+
+/// Encrypts data under a user-chosen passphrase with strong Argon2id
+/// parameters recorded in the blob (version 3).
+fn encrypt_bytes_with_passphrase(
+    plaintext: &[u8],
+    passphrase: &str,
+    context: &str,
+) -> Result<EncryptedSecretsBlob, String> {
+    let params = Argon2Params::for_new_data();
     let mut salt = [0u8; 16];
     let mut nonce = [0u8; 12];
     OsRng.fill_bytes(&mut salt);
     OsRng.fill_bytes(&mut nonce);
-    let key = derive_secret_key(secret, &salt)?;
+    let key = params.derive_key(passphrase.as_bytes(), &salt)?;
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| e.to_string())?;
     let ciphertext = cipher
         .encrypt(Nonce::from_slice(&nonce), aes_gcm::aead::Payload { msg: plaintext, aad: context.as_bytes() })
         .map_err(|e| e.to_string())?;
     Ok(EncryptedSecretsBlob {
-        version: SENSITIVE_PAYLOAD_VERSION,
+        version: PASSPHRASE_BLOB_VERSION,
         kdf: "argon2id".to_string(),
         cipher: "aes-256-gcm".to_string(),
         salt: BASE64.encode(salt),
@@ -1968,12 +2556,39 @@ fn encrypt_bytes_with_secret_context(
         ciphertext: BASE64.encode(ciphertext),
         payload_type: Some(context.to_string()),
         aad: Some(context.to_string()),
+        kdf_params: Some(params),
     })
+}
+
+fn decrypt_passphrase_blob(blob: &EncryptedSecretsBlob, passphrase: &str, context: &str) -> Result<Vec<u8>, String> {
+    if blob.version != PASSPHRASE_BLOB_VERSION
+        || blob.kdf != "argon2id"
+        || blob.cipher != "aes-256-gcm"
+        || blob.payload_type.as_deref() != Some(context)
+        || blob.aad.as_deref() != Some(context)
+    {
+        return Err("Unsupported encrypted secrets format".to_string());
+    }
+    let params = blob.kdf_params.ok_or_else(|| "Unsupported encrypted secrets format".to_string())?.validate()?;
+    let salt = BASE64.decode(&blob.salt).map_err(|e| e.to_string())?;
+    let nonce = BASE64.decode(&blob.nonce).map_err(|e| e.to_string())?;
+    let ciphertext = BASE64.decode(&blob.ciphertext).map_err(|e| e.to_string())?;
+    if nonce.len() != 12 {
+        return Err("Invalid encrypted secrets nonce".to_string());
+    }
+    let key = params.derive_key(passphrase.as_bytes(), &salt)?;
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| e.to_string())?;
+    cipher
+        .decrypt(Nonce::from_slice(&nonce), aes_gcm::aead::Payload { msg: ciphertext.as_ref(), aad: context.as_bytes() })
+        .map_err(|_| "Failed to decrypt synced secrets.".to_string())
 }
 
 fn decrypt_sensitive_bytes(blob: &EncryptedSecretsBlob, secret: &str) -> Result<Vec<u8>, String> {
     if blob.version == 1 {
         return decrypt_bytes_with_secret(blob, secret);
+    }
+    if blob.version == PASSPHRASE_BLOB_VERSION {
+        return decrypt_passphrase_blob(blob, secret, SENSITIVE_PAYLOAD_TYPE);
     }
     if blob.version != SENSITIVE_PAYLOAD_VERSION
         || blob.kdf != "argon2id"
@@ -2016,12 +2631,11 @@ fn decrypt_bytes_with_secret(blob: &EncryptedSecretsBlob, secret: &str) -> Resul
         .map_err(|_| "Failed to decrypt saved secret.".to_string())
 }
 
+/// Legacy derivation for version 1/2 blobs. New passphrase-protected data
+/// uses [`Argon2Params::STRONG`]; this remains for reading old data and for
+/// device-local credentials encrypted with the random device secret.
 fn derive_secret_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32], String> {
-    let params = Params::new(19 * 1024, 2, 1, Some(32)).map_err(|e| e.to_string())?;
-    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut key = [0u8; 32];
-    argon2.hash_password_into(passphrase.as_bytes(), salt, &mut key).map_err(|e| e.to_string())?;
-    Ok(key)
+    Argon2Params::LEGACY.derive_key(passphrase.as_bytes(), salt)
 }
 
 fn normalized_passphrase(passphrase: Option<&str>) -> Option<&str> {
@@ -2061,6 +2675,7 @@ fn required_sync_passphrase(passphrase: Option<&str>) -> Result<&str, String> {
 fn gitlab_instance_url(value: Option<&str>) -> Result<String, String> {
     let value = value.unwrap_or(GITLAB_DEFAULT_INSTANCE).trim();
     let url = Url::parse(value).map_err(|_| "Enter a valid GitLab HTTPS instance URL".to_string())?;
+    ensure_https_or_loopback(&url, "The GitLab instance")?;
     if !matches!(url.scheme(), "https" | "http")
         || url.host_str().is_none()
         || !url.username().is_empty()
@@ -2068,9 +2683,47 @@ fn gitlab_instance_url(value: Option<&str>) -> Result<String, String> {
         || url.query().is_some()
         || url.fragment().is_some()
     {
-        return Err("GitLab instance must be an HTTP or HTTPS URL without credentials, query, or fragment".to_string());
+        return Err("GitLab instance must be an HTTPS URL without credentials, query, or fragment".to_string());
     }
     Ok(url.as_str().trim_end_matches('/').to_string())
+}
+
+fn url_host_is_loopback(url: &Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.strip_prefix('[').and_then(|host| host.strip_suffix(']')).unwrap_or(host).to_ascii_lowercase();
+    if host == "localhost" || host.ends_with(".localhost") {
+        return true;
+    }
+    host.parse::<IpAddr>().is_ok_and(|address| match address {
+        IpAddr::V4(address) => address.is_loopback(),
+        IpAddr::V6(address) => {
+            address.is_loopback() || address.to_ipv4_mapped().is_some_and(|mapped| mapped.is_loopback())
+        }
+    })
+}
+
+/// Sync services receive credentials and configuration snapshots, so plain
+/// HTTP is accepted only for services on this machine.
+fn ensure_https_or_loopback(url: &Url, service: &str) -> Result<(), String> {
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if url_host_is_loopback(url) => Ok(()),
+        _ => Err(format!("HTTPS_REQUIRED: {service} must use https:// (http:// is only allowed for localhost).")),
+    }
+}
+
+fn same_origin(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str().map(str::to_ascii_lowercase) == right.host_str().map(str::to_ascii_lowercase)
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
+/// Transport errors of snippet requests. `without_url` keeps request URLs
+/// (which carry the Gitee `access_token` query parameter) out of messages.
+fn snippet_transport_error(error: reqwest::Error) -> String {
+    error.without_url().to_string()
 }
 
 fn snippet_provider_storage_key(provider: SnippetProvider, instance_url: Option<&str>) -> Result<String, String> {
@@ -3031,7 +3684,7 @@ mod tests {
         let summary = apply_sync_snapshot(
             &target,
             &restored,
-            ApplySnapshotOptions { secrets_passphrase: None, restore_secrets: false },
+            ApplySnapshotOptions { secrets_passphrase: None, restore_secrets: false, endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets },
         )
         .await
         .unwrap();
@@ -3056,7 +3709,7 @@ mod tests {
         let summary = apply_sync_snapshot(
             &target,
             &restored,
-            ApplySnapshotOptions { secrets_passphrase: None, restore_secrets: false },
+            ApplySnapshotOptions { secrets_passphrase: None, restore_secrets: false, endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets },
         )
         .await
         .unwrap();
@@ -3680,7 +4333,7 @@ mod tests {
         apply_sync_snapshot(
             &target,
             &snapshot,
-            ApplySnapshotOptions { secrets_passphrase: Some("transport-pass"), restore_secrets: true },
+            ApplySnapshotOptions { secrets_passphrase: Some("transport-pass"), restore_secrets: true, endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets },
         )
         .await
         .unwrap();
@@ -3697,7 +4350,7 @@ mod tests {
             apply_sync_snapshot(
                 &target,
                 &snapshot,
-                ApplySnapshotOptions { secrets_passphrase: Some("transport-pass"), restore_secrets },
+                ApplySnapshotOptions { secrets_passphrase: Some("transport-pass"), restore_secrets, endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets },
             )
             .await
             .unwrap();
@@ -3753,7 +4406,7 @@ mod tests {
         apply_sync_snapshot(
             &target,
             &snapshot,
-            ApplySnapshotOptions { secrets_passphrase: None, restore_secrets: false },
+            ApplySnapshotOptions { secrets_passphrase: None, restore_secrets: false, endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets },
         )
         .await
         .unwrap();
@@ -3791,7 +4444,7 @@ mod tests {
             apply_sync_snapshot(
                 &locked_target,
                 &snapshot,
-                ApplySnapshotOptions { secrets_passphrase: None, restore_secrets: false },
+                ApplySnapshotOptions { secrets_passphrase: None, restore_secrets: false, endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets },
             )
             .await
             .unwrap_err(),
@@ -3807,7 +4460,7 @@ mod tests {
         apply_sync_snapshot(
             &locked_target,
             &without_url_params,
-            ApplySnapshotOptions { secrets_passphrase: None, restore_secrets: false },
+            ApplySnapshotOptions { secrets_passphrase: None, restore_secrets: false, endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets },
         )
         .await
         .unwrap();
@@ -3818,7 +4471,7 @@ mod tests {
         apply_sync_snapshot(
             &unlocked_target,
             &snapshot,
-            ApplySnapshotOptions { secrets_passphrase: None, restore_secrets: false },
+            ApplySnapshotOptions { secrets_passphrase: None, restore_secrets: false, endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets },
         )
         .await
         .unwrap();
@@ -3864,7 +4517,7 @@ mod tests {
         apply_sync_snapshot(
             &target,
             &snapshot,
-            ApplySnapshotOptions { secrets_passphrase: Some("transport-pass"), restore_secrets: true },
+            ApplySnapshotOptions { secrets_passphrase: Some("transport-pass"), restore_secrets: true, endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets },
         )
         .await
         .unwrap();
@@ -3896,7 +4549,7 @@ mod tests {
         apply_sync_snapshot(
             &target,
             &empty_snapshot,
-            ApplySnapshotOptions { secrets_passphrase: Some("transport-pass"), restore_secrets: true },
+            ApplySnapshotOptions { secrets_passphrase: Some("transport-pass"), restore_secrets: true, endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets },
         )
         .await
         .unwrap();
@@ -3995,7 +4648,7 @@ mod tests {
         apply_sync_snapshot(
             &target,
             &snapshot,
-            ApplySnapshotOptions { secrets_passphrase: Some("sync-pass"), restore_secrets: true },
+            ApplySnapshotOptions { secrets_passphrase: Some("sync-pass"), restore_secrets: true, endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets },
         )
         .await
         .unwrap();
@@ -4016,7 +4669,7 @@ mod tests {
         apply_sync_snapshot(
             &target,
             &snapshot,
-            ApplySnapshotOptions { secrets_passphrase: Some("sync-pass"), restore_secrets: true },
+            ApplySnapshotOptions { secrets_passphrase: Some("sync-pass"), restore_secrets: true, endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets },
         )
         .await
         .unwrap();
@@ -4037,7 +4690,7 @@ mod tests {
         assert!(apply_sync_snapshot(
             &target,
             &snapshot,
-            ApplySnapshotOptions { secrets_passphrase: Some("wrong-pass"), restore_secrets: true },
+            ApplySnapshotOptions { secrets_passphrase: Some("wrong-pass"), restore_secrets: true, endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets },
         )
         .await
         .is_err());
@@ -4059,7 +4712,7 @@ mod tests {
         apply_sync_snapshot(
             &target,
             &snapshot,
-            ApplySnapshotOptions { secrets_passphrase: None, restore_secrets: true },
+            ApplySnapshotOptions { secrets_passphrase: None, restore_secrets: true, endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets },
         )
         .await
         .unwrap();
@@ -4070,7 +4723,7 @@ mod tests {
         apply_sync_snapshot(
             &metadata_only_target,
             &snapshot,
-            ApplySnapshotOptions { secrets_passphrase: None, restore_secrets: false },
+            ApplySnapshotOptions { secrets_passphrase: None, restore_secrets: false, endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets },
         )
         .await
         .unwrap();
@@ -4183,7 +4836,7 @@ mod tests {
         apply_sync_snapshot(
             &target,
             &snapshot,
-            ApplySnapshotOptions { secrets_passphrase: Some("sync-pass"), restore_secrets: true },
+            ApplySnapshotOptions { secrets_passphrase: Some("sync-pass"), restore_secrets: true, endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets },
         )
         .await
         .unwrap();

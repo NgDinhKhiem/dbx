@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { addConfiguredAiModel, aiModelOptions, generateId } from "@/lib/ai/aiConfigList";
+import { addConfiguredAiModel, aiModelOptions, generateId, getConfigKey } from "@/lib/ai/aiConfigList";
+import type { AiConfig } from "@/types/ai";
 
 describe("generateId", () => {
   afterEach(() => {
@@ -60,5 +61,20 @@ describe("AI model options", () => {
     expect(aiModelOptions({ model: "", models: [{ name: "a-model" }] }, [])).toEqual([{ id: "a-model", displayName: undefined, supportedEffortLevels: undefined, effortCapability: undefined }]);
     expect(addConfiguredAiModel(undefined, "new-model")).toEqual([{ name: "new-model" }]);
     expect(addConfiguredAiModel([{ name: "existing" }], "   ")).toEqual([{ name: "existing" }]);
+  });
+});
+
+describe("getConfigKey", () => {
+  const base: AiConfig = { provider: "openai", apiKey: "", authMethod: "bearer", endpoint: "https://api.example.com/v1", model: "gpt", apiStyle: "completions" };
+
+  it("deduplicates legacy configs without comparing redacted key values", () => {
+    expect(getConfigKey({ ...base, savedSecrets: ["apiKey"] })).toBe(getConfigKey({ ...base, savedSecrets: ["apiKey"] }));
+    expect(getConfigKey({ ...base, savedSecrets: ["apiKey"] })).not.toBe(getConfigKey(base));
+    expect(getConfigKey({ ...base, endpoint: "https://other.example.com/v1", savedSecrets: ["apiKey"] })).not.toBe(getConfigKey({ ...base, savedSecrets: ["apiKey"] }));
+  });
+
+  it("still distinguishes typed keys and prefers a config id when present", () => {
+    expect(getConfigKey({ ...base, apiKey: "a" })).not.toBe(getConfigKey({ ...base, apiKey: "b" }));
+    expect(getConfigKey({ ...base, id: "c1" } as AiConfig)).not.toBe(getConfigKey({ ...base, id: "c2" } as AiConfig));
   });
 });

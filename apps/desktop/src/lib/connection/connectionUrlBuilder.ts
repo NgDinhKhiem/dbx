@@ -1,6 +1,7 @@
 import type { ConnectionConfig, DatabaseType } from "@/types/database";
 import { GAUSSDB_M_JDBC_DRIVER_PROFILE } from "@/lib/database/jdbcDialect";
 import { effectiveRedisDatabaseIndex } from "@/lib/redis/redisDatabaseIndex";
+import { withoutBlankSensitiveUrlParams } from "@/lib/connection/savedSecrets";
 
 /**
  * Builds copy-ready connection strings (standard URL / JDBC URL / libpq DSN /
@@ -447,9 +448,19 @@ function hasCopyableSecret(config: ConnectionUrlCopyConfig): boolean {
  * are only offered when a secret is actually available, so the plain items
  * are always safe to paste.
  */
+/**
+ * Stored secrets are never available in the frontend: the password arrives
+ * blank and sensitive URL params arrive as `password=`. Drop those blank
+ * params so copies do not contain empty credential artifacts.
+ */
+function copyCandidate(config: ConnectionUrlCopyConfig): ConnectionUrlCopyConfig {
+  const urlParams = withoutBlankSensitiveUrlParams(config.url_params);
+  return urlParams === config.url_params ? config : { ...config, url_params: urlParams };
+}
+
 export function connectionUrlCopyFormats(config: ConnectionUrlCopyConfig | undefined): ConnectionUrlCopyFormat[] {
   if (!connectionSupportsUrlCopy(config)) return [];
-  const candidate = config as ConnectionUrlCopyConfig;
+  const candidate = copyCandidate(config as ConnectionUrlCopyConfig);
   const formats: ConnectionUrlCopyFormat[] = [];
   const hasSecret = hasCopyableSecret(candidate);
   const url = buildStandardUrl(candidate, { includePassword: false });
@@ -475,7 +486,7 @@ export function connectionUrlCopyFormats(config: ConnectionUrlCopyConfig | undef
 
 export function buildConnectionUrlCopy(config: ConnectionUrlCopyConfig | undefined, format: ConnectionUrlCopyFormat, options?: ConnectionUrlCopyOptions): string | null {
   if (!connectionSupportsUrlCopy(config)) return null;
-  const candidate = config as ConnectionUrlCopyConfig;
+  const candidate = copyCandidate(config as ConnectionUrlCopyConfig);
   switch (format) {
     case "url":
       return buildStandardUrl(candidate, { ...options, includePassword: false });

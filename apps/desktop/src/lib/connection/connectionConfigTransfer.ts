@@ -1,5 +1,6 @@
 import type { ConnectionConfig, SidebarLayout, TunnelProfile } from "@/types/database";
 import { filterSidebarLayoutByConnectionIds as filterLayoutByConnectionIds, remapSidebarLayoutConnectionIds } from "@/lib/sidebar/sidebarLayout";
+import { stripSecretMetadata } from "@/lib/connection/savedSecrets";
 
 export type ConnectionExportProtection = { mode: "encrypted"; passphrase: string } | { mode: "plaintext" };
 
@@ -62,7 +63,7 @@ export function snapshotConnectionsForExport(connections: ConnectionConfig[], op
 
 /** Remove every credential-bearing field before creating a plaintext bundle. */
 export function scrubConnectionForPlaintextExport(connection: ConnectionConfig): ConnectionConfig {
-  const scrubbed: ConnectionConfig = JSON.parse(JSON.stringify(connection)) as ConnectionConfig;
+  const scrubbed: ConnectionConfig = JSON.parse(JSON.stringify(stripSecretMetadata(connection))) as ConnectionConfig;
   scrubbed.password = "";
   scrubbed.url_params = scrubUrlParams(scrubbed.url_params);
   scrubbed.init_script = undefined;
@@ -129,7 +130,7 @@ function scrubUrlParams(value: string | undefined): string | undefined {
 }
 
 export function buildConnectionConfigBundle(connections: ConnectionConfig[], layout: SidebarLayout | null | undefined, tunnelProfiles: TunnelProfile[], selectedIds?: Iterable<string>): ConnectionConfigBundle {
-  const selectedConnections = filterConnectionsByIds(connections, selectedIds);
+  const selectedConnections = filterConnectionsByIds(connections, selectedIds).map(stripSecretMetadata);
   const selectedConnectionIds = selectedConnections.map((connection) => connection.id);
   return {
     connections: selectedConnections,
@@ -190,7 +191,8 @@ export function prepareConnectionConfigImport(bundle: ConnectionConfigBundle, ex
   }
 
   const sourceConnections = bundle.connections.map((connection, index) => ({
-    ...connection,
+    // Secret bookkeeping describes another installation's secret store.
+    ...stripSecretMetadata(connection),
     // Anonymous legacy entries need a stable key for layout/reference remapping.
     id: connection.id?.trim() || `__dbx_import_${index}`,
   }));

@@ -1,4 +1,5 @@
 import type { ConnectionConfig, DatabaseType, JdbcMavenBundleInfo } from "@/types/database";
+import { hasSavedSecret } from "@/lib/connection/savedSecrets";
 import type { ManagedJdbcDriverDefinition } from "@/lib/database/managedJdbcDriver";
 
 export type JdbcProductConnectionFields = {
@@ -190,7 +191,8 @@ export async function ensureJdbcProductRuntimeDrivers(profile: JdbcProductProfil
   const modeId = profile.detectMode(config);
   const mode = jdbcProductMode(profile, modeId);
   const defaults = jdbcProductConnectionDefaults(profile, modeId);
-  config.connection_string = config.connection_string?.trim() || defaults.connectionString;
+  // A blank URL with a stored (hidden) value keeps the stored one on the backend.
+  if (!hasSavedSecret(config, "connection_string")) config.connection_string = config.connection_string?.trim() || defaults.connectionString;
   config.jdbc_driver_class = config.jdbc_driver_class?.trim() || defaults.driverClass;
   const configuredPaths = (config.jdbc_driver_paths ?? []).map((path) => path.trim()).filter(Boolean);
 
