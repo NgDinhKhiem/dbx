@@ -13,6 +13,25 @@ assert_same(0, next_worker_idle_poll_count(120, true), 'activity resets the idle
 assert_same(10000, worker_poll_timeout_us(next_worker_idle_poll_count(120, true)), 'activity resets polling to 10ms');
 assert_same(120, next_worker_idle_poll_count(120, false), 'the idle counter remains capped');
 
+// Target policy helpers.
+assert_same(true, is_restricted_ip('127.0.0.1'), 'loopback is restricted');
+assert_same(true, is_restricted_ip('169.254.169.254'), 'metadata is restricted');
+assert_same(true, is_restricted_ip('::ffff:127.0.0.1'), 'IPv4-mapped loopback is restricted');
+assert_same(true, is_restricted_ip('fe80::1'), 'IPv6 link-local is restricted');
+assert_same(true, is_restricted_ip('::1'), 'IPv6 loopback is restricted');
+assert_same(false, is_restricted_ip('10.0.0.12'), 'private LAN addresses are not restricted');
+assert_same(false, is_restricted_ip('2001:db8::1'), 'global IPv6 is not restricted');
+$DBX_TUNNEL_ALLOWED_HOSTS = ['mysql.internal:3306', 'pg.internal', '[2001:db8::5]:5432', 'redis.internal:*', '*.db.example.com:5432'];
+assert_same(true, match_allow_list('mysql.internal', 3306) !== null, 'host:port entry matches');
+assert_same(null, match_allow_list('mysql.internal', 22), 'host:port entry does not match other ports');
+assert_same(true, match_allow_list('pg.internal', 5432) !== null, 'host-only entry matches default DB ports');
+assert_same(null, match_allow_list('pg.internal', 22), 'host-only entry rejects non-DB ports');
+assert_same(true, match_allow_list('2001:db8::5', 5432) !== null, 'bracketed IPv6 entry matches');
+assert_same(true, match_allow_list('redis.internal', 16379) !== null, 'host:* entry matches any port');
+assert_same(true, match_allow_list('a.db.example.com', 5432) !== null, 'wildcard entry matches subdomain');
+assert_same(null, match_allow_list('db.example.com.evil', 5432), 'wildcard entry does not match suffix tricks');
+assert_same(null, match_allow_list('other.internal', 3306), 'unlisted host is refused');
+
 $baseDir = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'dbx-tunnel-test-' . bin2hex(random_bytes(6));
 $sessionDir = $baseDir . DIRECTORY_SEPARATOR . 'session123';
 $worker = null;

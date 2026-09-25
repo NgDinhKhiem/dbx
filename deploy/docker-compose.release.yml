@@ -5,11 +5,18 @@ services:
     # image: docker.cnb.cool/dbxio.com/dbx:latest
     pull_policy: always
     ports:
-      - "4224:4224"
+      # Published on loopback only by default. To expose DBX to other machines,
+      # prefer a TLS reverse proxy; or set DBX_BIND=0.0.0.0 (all interfaces) or a
+      # specific interface IP, e.g. `DBX_BIND=0.0.0.0 docker compose up -d`.
+      - "${DBX_BIND:-127.0.0.1}:4224:4224"
     volumes:
       - dbx-data:/app/data
       - dbx-backups:/app/backups
     environment:
+      # Required: the web UI password. Set it in the shell or in a .env file next
+      # to this compose file (DBX_PASSWORD=<long random value>); compose refuses
+      # to start without it.
+      DBX_PASSWORD: ${DBX_PASSWORD:?Set DBX_PASSWORD}
       DBX_BACKUP_ROOT: /app/backups
       # DBX_SECRET_KEY_FILE: /run/secrets/dbx_secret_key
     # secrets:

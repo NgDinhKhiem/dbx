@@ -4,9 +4,13 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
     ports:
-      - "4224:4224"
+      # Published on loopback only by default. To expose DBX to other machines,
+      # prefer a TLS reverse proxy; or set DBX_BIND=0.0.0.0 (all interfaces) or a
+      # specific interface IP.
+      - "${DBX_BIND:-127.0.0.1}:4224:4224"
     environment:
-      - DBX_PASSWORD=changeme
+      # Required: set DBX_PASSWORD in the shell or a .env file next to this file.
+      - DBX_PASSWORD=${DBX_PASSWORD:?Set DBX_PASSWORD}
       - DBX_BACKUP_ROOT=/app/backups
       # Native Streamable HTTP MCP is served by this same Web listener at /mcp.
       # Set the host authority clients use (including its externally mapped port).
