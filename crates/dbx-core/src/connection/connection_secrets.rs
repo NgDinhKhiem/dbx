@@ -886,7 +886,12 @@ impl SecretSlot {
     }
 
     fn optional(field: &str) -> Self {
-        Self { path: field.to_string(), parent: String::new(), field: field.to_string(), kind: SecretSlotKind::Optional }
+        Self {
+            path: field.to_string(),
+            parent: String::new(),
+            field: field.to_string(),
+            kind: SecretSlotKind::Optional,
+        }
     }
 }
 
@@ -912,7 +917,7 @@ fn external_object<'a>(
     config.external_config.as_ref()?.get(key)?.as_object()
 }
 
-fn external_kind<'a>(object: &'a serde_json::Map<String, serde_json::Value>) -> Option<&'a str> {
+fn external_kind(object: &serde_json::Map<String, serde_json::Value>) -> Option<&str> {
     object.get("kind").and_then(serde_json::Value::as_str)
 }
 
@@ -979,11 +984,9 @@ fn connection_secret_slots(config: &ConnectionConfig) -> Vec<SecretSlot> {
                 slots.push(external_slot("rnacosConsoleAuth", "password"));
             }
         }
-        DatabaseType::Cassandra => {
-            if external_object(config, "tls").is_some() {
-                slots.push(external_slot("tls", "truststore_password"));
-                slots.push(external_slot("tls", "keystore_password"));
-            }
+        DatabaseType::Cassandra if external_object(config, "tls").is_some() => {
+            slots.push(external_slot("tls", "truststore_password"));
+            slots.push(external_slot("tls", "keystore_password"));
         }
         _ => {}
     }
@@ -1201,11 +1204,11 @@ pub fn merge_stored_connection_secrets(
     }
 
     let mut plugin_secrets = incoming.connection_secrets.clone();
-    plugin_secrets.retain(|key, secret| {
-        !(secret.is_empty() && cleared.contains(format!("connection_secrets.{key}").as_str()))
-    });
+    plugin_secrets
+        .retain(|key, secret| !(secret.is_empty() && cleared.contains(format!("connection_secrets.{key}").as_str())));
     if let Some(stored) = stored.filter(|stored| {
-        stored.plugin_id == incoming.plugin_id && stored.plugin_connection_provider == incoming.plugin_connection_provider
+        stored.plugin_id == incoming.plugin_id
+            && stored.plugin_connection_provider == incoming.plugin_connection_provider
     }) {
         for (key, secret) in &stored.connection_secrets {
             if secret.is_empty() || cleared.contains(format!("connection_secrets.{key}").as_str()) {
@@ -2050,13 +2053,16 @@ mod tests {
 
         let redacted = super::redact_connection_for_client(&config).unwrap();
         let text = redacted.to_string();
-        for secret in ["db-secret", "url-secret", "ssh-secret", "pp-value", "tunnel-token", "plugin-secret", "Password=cs"] {
+        for secret in
+            ["db-secret", "url-secret", "ssh-secret", "pp-value", "tunnel-token", "plugin-secret", "Password=cs"]
+        {
             assert!(!text.contains(secret), "{secret} leaked: {text}");
         }
         assert_eq!(redacted["url_params"], "sslmode=require&password=;apiKey=");
         assert!(redacted["connection_string"].is_null());
         assert!(redacted.get("connection_secrets").is_none());
-        let saved = redacted["saved_secrets"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect::<Vec<_>>();
+        let saved =
+            redacted["saved_secrets"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect::<Vec<_>>();
         assert_eq!(
             saved,
             vec![

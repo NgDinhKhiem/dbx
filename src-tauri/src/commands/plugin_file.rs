@@ -251,17 +251,16 @@ pub fn close_plugin_file(state: &PluginFileState, plugin_id: &str, handle_id: &s
     })
 }
 
-async fn run_blocking<T: Send + 'static>(job: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
+async fn run_blocking<T: Send + 'static>(
+    job: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
     tauri::async_runtime::spawn_blocking(job).await.map_err(|error| format!("plugin file task failed: {error}"))?
 }
 
 /// The caller must be an installed plugin with a workbench UI: only its
 /// workbench bridge can reach these file operations.
 fn plugin_display_name(app_state: &AppState, plugin_id: &str) -> Result<String, String> {
-    let plugin = app_state
-        .plugins
-        .find_plugin(plugin_id)?
-        .ok_or_else(|| "plugin is not installed".to_string())?;
+    let plugin = app_state.plugins.find_plugin(plugin_id)?.ok_or_else(|| "plugin is not installed".to_string())?;
     if plugin.manifest.entrypoints.ui.is_none() {
         return Err("plugin has no workbench UI and cannot open local files".to_string());
     }

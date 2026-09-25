@@ -612,7 +612,9 @@ async fn fetch_registry_candidate(
         let signature_resp =
             open_download_response(client, std::slice::from_ref(&signature_url), "dbx-agent-manager", cancellations)
                 .await
-                .map_err(|err| cancel_or(err, |err| format!("agent registry signature is required but missing: {err}")))?;
+                .map_err(|err| {
+                    cancel_or(err, |err| format!("agent registry signature is required but missing: {err}"))
+                })?;
         let signature = read_limited_response_body(
             signature_resp,
             crate::agent_registry_signature::MAX_AGENT_REGISTRY_SIGNATURE_BYTES,
@@ -3442,7 +3444,11 @@ fn jre_archive_download_path(am: &AgentManager, jre_key: &str, format: Option<Ar
     am.base_dir().join(format!("jre-{jre_key}-download{}", jre_archive_suffix(format)))
 }
 
-async fn extract_jre_archive_blocking(archive: &Path, dest: &Path, format: Option<ArtifactFormat>) -> Result<(), String> {
+async fn extract_jre_archive_blocking(
+    archive: &Path,
+    dest: &Path,
+    format: Option<ArtifactFormat>,
+) -> Result<(), String> {
     let (archive, dest) = (archive.to_path_buf(), dest.to_path_buf());
     run_blocking(move || extract_jre_archive(&archive, &dest, format)).await
 }
@@ -4724,14 +4730,8 @@ mod agent_registry_install_tests {
         let jre_version = "21.0.12";
         let jre_url = "https://example.com/dbx-jre.tar.gz";
         let jre_archive = build_jre_archive(&manager, DEFAULT_JRE_KEY);
-        let registry = mongodb_registry_with_jre(
-            driver_version,
-            driver_url,
-            &driver_bytes,
-            jre_version,
-            jre_url,
-            &jre_archive,
-        );
+        let registry =
+            mongodb_registry_with_jre(driver_version, driver_url, &driver_bytes, jre_version, jre_url, &jre_archive);
         write_cached_driver_download(
             &manager,
             "mongodb",
@@ -4833,14 +4833,8 @@ mod agent_registry_install_tests {
         let jre_version = "21.0.12";
         let jre_url = "https://example.com/dbx-jre.tar.gz";
         let jre_archive = build_jre_archive(&manager, DEFAULT_JRE_KEY);
-        let registry = mongodb_registry_with_jre(
-            driver_version,
-            driver_url,
-            &driver_bytes,
-            jre_version,
-            jre_url,
-            &jre_archive,
-        );
+        let registry =
+            mongodb_registry_with_jre(driver_version, driver_url, &driver_bytes, jre_version, jre_url, &jre_archive);
         let driver_cache_path = write_cached_driver_download(
             &manager,
             "mongodb",
@@ -4875,7 +4869,7 @@ mod agent_registry_install_tests {
         let driver_version = "0.1.47";
         let driver_url = "https://example.com/dbx-agent-mongodb.jar";
         let corrupt_driver = b"not-a-jar";
-        let registry = registry_with_jar("mongodb", driver_version, driver_url, &corrupt_driver);
+        let registry = registry_with_jar("mongodb", driver_version, driver_url, corrupt_driver);
         write_cached_driver_download(
             &manager,
             "mongodb",
@@ -4939,7 +4933,7 @@ mod agent_registry_install_tests {
         let version = "0.1.31";
         let native_url = "https://example.com/dbx-agent-hive";
         let native_bytes = b"native-agent";
-        let registry = registry_with_native_and_legacy_jar(db_type, version, native_url, &native_bytes);
+        let registry = registry_with_native_and_legacy_jar(db_type, version, native_url, native_bytes);
         let native_path = manager.driver_native_path(db_type);
         std::fs::create_dir_all(manager.driver_dir(db_type)).unwrap();
         write_test_agent_jar(&manager.driver_jar_path(db_type));
@@ -5110,8 +5104,7 @@ mod agent_registry_install_tests {
         let package_url = "https://example.com/dbx-agent-duckdb.tar.zst";
         let native_bytes = current_platform_native_binary();
         let package_bytes = build_tar_zstd_driver_package(db_type, version, DriverArtifactKind::Native, &native_bytes);
-        let mut registry =
-            registry_with_native_and_legacy_jar(db_type, version, package_url, &package_bytes);
+        let mut registry = registry_with_native_and_legacy_jar(db_type, version, package_url, &package_bytes);
         registry.drivers.get_mut(db_type).unwrap().native.get_mut(AgentManager::current_platform()).unwrap().format =
             Some(ArtifactFormat::TarZstd);
         let native_path = manager.driver_native_path(db_type);
@@ -5189,12 +5182,11 @@ mod agent_registry_install_tests {
         let dameng_bytes = b"dameng-native-agent";
         let corrupt_jar = b"not-a-jar";
 
-        let mut registry =
-            registry_with_native_and_legacy_jar("oracle", "2.0.0", oracle_url, &oracle_bytes);
-        registry.drivers.extend(
-            registry_with_native_and_legacy_jar("dameng", "2.0.0", dameng_url, &dameng_bytes).drivers,
-        );
-        registry.drivers.extend(registry_with_jar("kingbase", "2.0.0", kingbase_url, &corrupt_jar).drivers);
+        let mut registry = registry_with_native_and_legacy_jar("oracle", "2.0.0", oracle_url, oracle_bytes);
+        registry
+            .drivers
+            .extend(registry_with_native_and_legacy_jar("dameng", "2.0.0", dameng_url, dameng_bytes).drivers);
+        registry.drivers.extend(registry_with_jar("kingbase", "2.0.0", kingbase_url, corrupt_jar).drivers);
 
         let mut state = manager.load_state();
         state.java_runtime = JavaRuntimeConfig { mode: JavaRuntimeMode::System, custom_java_path: None };
@@ -5556,7 +5548,7 @@ mod agent_registry_install_tests {
         let version = "0.1.31";
         let native_url = "https://example.com/dbx-agent-oracle";
         let native_bytes = b"native-agent";
-        let registry = registry_with_native_and_legacy_jar(db_type, version, native_url, &native_bytes);
+        let registry = registry_with_native_and_legacy_jar(db_type, version, native_url, native_bytes);
         write_cached_driver_download(
             &manager,
             db_type,
@@ -6159,7 +6151,7 @@ mod agent_registry_install_tests {
         let version = "0.1.31";
         let native_url = "https://example.com/dbx-agent-oracle";
         let native_bytes = b"native-agent";
-        let registry = registry_with_native_and_legacy_jar(db_type, version, native_url, &native_bytes);
+        let registry = registry_with_native_and_legacy_jar(db_type, version, native_url, native_bytes);
         write_cached_driver_download(
             &manager,
             db_type,
@@ -6224,7 +6216,7 @@ mod agent_registry_install_tests {
         let version = "0.2.0";
         let jar_url = "https://example.com/dbx-agent-h2.jar";
         let jar_bytes = b"jar";
-        let registry = registry_with_jar(db_type, version, jar_url, &jar_bytes);
+        let registry = registry_with_jar(db_type, version, jar_url, jar_bytes);
         let jar_path = manager.driver_jar_path(db_type);
         let cache_path = write_cached_driver_download(&manager, db_type, version, jar_url, &jar_path, jar_bytes);
         manager

@@ -210,10 +210,8 @@ pub(crate) fn mysql_literal_is_single_token(sql: &str, backslash_escapes: bool) 
                     return false;
                 }
             }
-            '\'' => {
-                if chars.next() != Some('\'') {
-                    return false;
-                }
+            '\'' if chars.next() != Some('\'') => {
+                return false;
             }
             _ => {}
         }
@@ -245,9 +243,6 @@ mod tests {
         assert_eq!(quote_string_literal_for_database(Some(DatabaseType::Postgres), "a\\b'c"), "'a\\b''c'");
         assert_eq!(quote_string_literal_for_database(Some(DatabaseType::Oracle), "a\\b'c"), "'a\\b''c'");
         assert_eq!(quote_string_literal_for_database(None, "it's"), "'it''s'");
-        assert_eq!(
-            quote_string_literal_for_database(Some(DatabaseType::ManticoreSearch), "a\\b'c"),
-            "'a\\\\b\\'c'"
-        );
+        assert_eq!(quote_string_literal_for_database(Some(DatabaseType::ManticoreSearch), "a\\b'c"), "'a\\\\b\\'c'");
     }
 }

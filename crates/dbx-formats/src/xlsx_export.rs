@@ -1210,7 +1210,13 @@ pub fn write_xlsx_workbook_multi_with_auto_filter<W: Write + Seek>(
     date_time_format: Option<&str>,
 ) -> Result<W, String> {
     let max_data_rows = XLSX_MAX_DATA_ROWS;
-    write_xlsx_workbook_multi_with_max_rows_and_auto_filter(writer, sheets, max_data_rows, auto_filter, date_time_format)
+    write_xlsx_workbook_multi_with_max_rows_and_auto_filter(
+        writer,
+        sheets,
+        max_data_rows,
+        auto_filter,
+        date_time_format,
+    )
 }
 
 pub fn build_xlsx_workbook_multi_with_auto_filter(

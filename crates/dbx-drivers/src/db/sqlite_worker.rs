@@ -943,8 +943,7 @@ mod tests {
     #[tokio::test]
     async fn abandoned_roundtrip_closes_the_session_instead_of_desyncing_later_calls() {
         let (client, mut worker) = simulated_worker_client();
-        let timed_out =
-            tokio::time::timeout(Duration::from_millis(50), client.query("SELECT slow()", None)).await;
+        let timed_out = tokio::time::timeout(Duration::from_millis(50), client.query("SELECT slow()", None)).await;
         assert!(timed_out.is_err(), "the simulated worker never answered, so the call must time out");
 
         // The late answer to the abandoned request must never be handed to the next call.

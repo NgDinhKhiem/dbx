@@ -34,10 +34,9 @@ struct SqlFileSummary {
 const SQL_FILE_PACKAGE_EXTENSIONS: &[&str] = &["sql", "gz", "zip"];
 
 fn ensure_sql_file_execution_extension(path: &std::path::Path) -> Result<(), String> {
-    let package = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| SQL_FILE_PACKAGE_EXTENSIONS.iter().any(|allowed| extension.eq_ignore_ascii_case(allowed)));
+    let package = path.extension().and_then(|extension| extension.to_str()).is_some_and(|extension| {
+        SQL_FILE_PACKAGE_EXTENSIONS.iter().any(|allowed| extension.eq_ignore_ascii_case(allowed))
+    });
     if package {
         Ok(())
     } else {

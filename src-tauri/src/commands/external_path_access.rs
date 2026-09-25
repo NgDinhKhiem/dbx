@@ -44,11 +44,70 @@ pub const NOT_AUTHORIZED_ERROR_PREFIX: &str = "EXTERNAL_PATH_NOT_AUTHORIZED";
 /// broader than `.sql`, but it excludes extension-less files (`.ssh/id_rsa`,
 /// `.zshrc`, `authorized_keys`), key material, databases and binaries.
 pub const EXTERNAL_TEXT_FILE_EXTENSIONS: &[&str] = &[
-    "sql", "psql", "pgsql", "mysql", "plsql", "pls", "pks", "pkb", "tsql", "ddl", "dml", "hql", "cql", "prql", "ksql",
-    "flux", "promql", "kql", "sparql", "cypher", "cyp", "gql", "graphql", "txt", "text", "md", "markdown", "log", "csv",
-    "tsv", "json", "jsonl", "ndjson", "json5", "yaml", "yml", "toml", "ini", "cfg", "conf", "xml", "properties", "sh",
-    "bash", "zsh", "fish", "ps1", "bat", "cmd", "py", "js", "mjs", "cjs", "ts", "rb", "go", "rs", "java", "kt", "scala",
-    "lua", "r", "redis", "mongo",
+    "sql",
+    "psql",
+    "pgsql",
+    "mysql",
+    "plsql",
+    "pls",
+    "pks",
+    "pkb",
+    "tsql",
+    "ddl",
+    "dml",
+    "hql",
+    "cql",
+    "prql",
+    "ksql",
+    "flux",
+    "promql",
+    "kql",
+    "sparql",
+    "cypher",
+    "cyp",
+    "gql",
+    "graphql",
+    "txt",
+    "text",
+    "md",
+    "markdown",
+    "log",
+    "csv",
+    "tsv",
+    "json",
+    "jsonl",
+    "ndjson",
+    "json5",
+    "yaml",
+    "yml",
+    "toml",
+    "ini",
+    "cfg",
+    "conf",
+    "xml",
+    "properties",
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "ps1",
+    "bat",
+    "cmd",
+    "py",
+    "js",
+    "mjs",
+    "cjs",
+    "ts",
+    "rb",
+    "go",
+    "rs",
+    "java",
+    "kt",
+    "scala",
+    "lua",
+    "r",
+    "redis",
+    "mongo",
 ];
 
 pub fn has_external_text_file_extension(path: &Path) -> bool {
@@ -62,10 +121,7 @@ pub fn ensure_external_text_file_extension(path: &Path) -> Result<(), String> {
     if has_external_text_file_extension(path) {
         Ok(())
     } else {
-        Err(format!(
-            "{NOT_AUTHORIZED_ERROR_PREFIX}: unsupported file type for the external editor: {}",
-            path.display()
-        ))
+        Err(format!("{NOT_AUTHORIZED_ERROR_PREFIX}: unsupported file type for the external editor: {}", path.display()))
     }
 }
 
@@ -158,7 +214,12 @@ impl ExternalPathAccess {
         let persisted: PersistedGrants = serde_json::from_slice(bytes).unwrap_or_default();
         Grants {
             files: persisted.files.into_iter().map(PathBuf::from).filter(|path| path.is_absolute()).collect(),
-            directories: persisted.directories.into_iter().map(PathBuf::from).filter(|path| path.is_absolute()).collect(),
+            directories: persisted
+                .directories
+                .into_iter()
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .collect(),
             session_files: HashSet::new(),
         }
     }
@@ -386,9 +447,15 @@ fn not_authorized(path: &Path) -> String {
     format!("{NOT_AUTHORIZED_ERROR_PREFIX}: DBX has not been given access to {}", path.display())
 }
 
-fn prompt_text(paths: &[PathBuf], directory: bool, kind: AccessKind, requester: Option<&str>) -> (String, String, String) {
+fn prompt_text(
+    paths: &[PathBuf],
+    directory: bool,
+    kind: AccessKind,
+    requester: Option<&str>,
+) -> (String, String, String) {
     let zh = sys_locale::get_locale().unwrap_or_default().to_ascii_lowercase().starts_with("zh");
-    let mut listed = paths.iter().take(MAX_PROMPT_LISTED_PATHS).map(|path| path.display().to_string()).collect::<Vec<_>>();
+    let mut listed =
+        paths.iter().take(MAX_PROMPT_LISTED_PATHS).map(|path| path.display().to_string()).collect::<Vec<_>>();
     if paths.len() > MAX_PROMPT_LISTED_PATHS {
         listed.push(if zh {
             format!("……以及另外 {} 项", paths.len() - MAX_PROMPT_LISTED_PATHS)
@@ -398,7 +465,10 @@ fn prompt_text(paths: &[PathBuf], directory: bool, kind: AccessKind, requester: 
     }
     let listed = listed.join("\n");
     let body = match (zh, directory, kind, requester) {
-        (true, _, _, Some(requester)) => format!("插件“{requester}”请求{}以下文件：\n\n{listed}\n\n仅在你刚刚选择了该文件时才允许。", if kind == AccessKind::Write { "写入" } else { "读取" }),
+        (true, _, _, Some(requester)) => format!(
+            "插件“{requester}”请求{}以下文件：\n\n{listed}\n\n仅在你刚刚选择了该文件时才允许。",
+            if kind == AccessKind::Write { "写入" } else { "读取" }
+        ),
         (true, true, _, None) => format!("是否允许 DBX 访问以下文件夹及其内容？\n\n{listed}"),
         (true, false, AccessKind::Write, None) => format!("是否允许 DBX 写入以下文件？\n\n{listed}"),
         (true, false, AccessKind::Read, None) => format!("是否允许 DBX 读取以下文件？\n\n{listed}"),
@@ -475,11 +545,7 @@ pub async fn ensure_directory_access<R: Runtime>(app: &AppHandle<R>, path: &Path
 /// remembers, e.g. SQL folders saved before access grants existed. Paths that
 /// are already granted do not prompt. Returns whether all paths are allowed.
 #[tauri::command]
-pub async fn request_external_path_access(
-    app: AppHandle,
-    paths: Vec<String>,
-    directory: bool,
-) -> Result<bool, String> {
+pub async fn request_external_path_access(app: AppHandle, paths: Vec<String>, directory: bool) -> Result<bool, String> {
     let access = access_state(&app)?;
     access.wait_for_legacy_migration().await;
     let _prompt = access.prompt_lock.lock().await;
@@ -502,11 +568,12 @@ pub async fn request_external_path_access(
     if !confirm_access(&app, &normalized, directory, AccessKind::Read, None).await {
         return Ok(false);
     }
-    let granted = normalized
+    // Grant every path (no short-circuit), then report whether all succeeded.
+    let results: Vec<bool> = normalized
         .iter()
         .map(|path| if directory { access.grant_directory(path) } else { access.grant_file(path) })
-        .fold(true, |all, granted| all && granted);
-    Ok(granted)
+        .collect();
+    Ok(results.into_iter().all(|granted| granted))
 }
 
 /// Native file picker whose selection is granted to the external file commands.

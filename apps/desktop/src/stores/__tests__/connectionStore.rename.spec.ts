@@ -73,7 +73,9 @@ describe("connectionStore quick rename", () => {
     await expect(store.renameConnection(connection.id, "  Reporting EU  ")).resolves.toBe(true);
 
     expect(saveConnections).toHaveBeenCalledWith([{ ...connection, name: "Reporting EU" }]);
-    expect(store.getConfig(connection.id)).toEqual({ ...connection, name: "Reporting EU" });
+    // After saving, the in-memory config keeps only a marker that the password
+    // is stored; the secret itself stays in the backend.
+    expect(store.getConfig(connection.id)).toEqual({ ...connection, name: "Reporting EU", password: "", saved_secrets: ["password"] });
     expect(store.connectedIds.has(connection.id)).toBe(true);
     expect(store.activeConnectionId).toBe(connection.id);
     expect(store.selectedTreeNodeId).toBe(connection.id);

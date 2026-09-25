@@ -290,8 +290,7 @@ impl crate::storage::Storage {
                 "legacy" => legacy_active.as_ref(),
                 source => source.strip_prefix("provider:").and_then(|provider| legacy_providers.get(provider)),
             });
-            let previous =
-                stored.iter().find(|item| item.id == input.item.id).map(|item| &item.config).or(legacy);
+            let previous = stored.iter().find(|item| item.id == input.item.id).map(|item| &item.config).or(legacy);
             let config =
                 merge_stored_ai_secrets(&input.item.config, previous, &input.cleared_secrets, AiSecretMergeMode::Save)?;
             merged.push(AiConfigItem { config, ..input.item.clone() });
@@ -404,8 +403,13 @@ mod tests {
     async fn saving_a_redacted_item_keeps_stored_secrets_and_requests_resolve_by_id() {
         let dir = tempfile::tempdir().unwrap();
         let storage = crate::storage::Storage::open(&dir.path().join("dbx.db")).await.unwrap();
-        let item = AiConfigItem { id: "cfg".to_string(), name: "Main".to_string(), is_default: true, config: config("sk-secret") };
-        storage.save_ai_configs(&[item.clone()]).await.unwrap();
+        let item = AiConfigItem {
+            id: "cfg".to_string(),
+            name: "Main".to_string(),
+            is_default: true,
+            config: config("sk-secret"),
+        };
+        storage.save_ai_configs(std::slice::from_ref(&item)).await.unwrap();
 
         let redacted = redact_ai_config_item_for_client(&storage.load_ai_configs().await.unwrap()[0]).unwrap();
         assert!(!redacted.to_string().contains("sk-secret"));

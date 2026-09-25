@@ -205,7 +205,7 @@ mod tests {
     fn materialized_view_catalog_sql_escapes_database_names() {
         assert_eq!(
             materialized_views_sql("tenant's analytics"),
-            "SELECT MVIEW_NAME FROM oceanbase.DBA_MVIEWS WHERE OWNER = 'tenant\\'s analytics'"
+            "SELECT MVIEW_NAME FROM oceanbase.DBA_MVIEWS WHERE OWNER = 'tenant''s analytics'"
         );
     }
 

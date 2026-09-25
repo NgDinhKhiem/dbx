@@ -5752,11 +5752,11 @@ impl Storage {
         let mut resolved = Vec::with_capacity(inputs.len());
         let mut cleared_keys = Vec::new();
         for input in inputs {
-            let stored_config = stored.get(&input.config.id).or_else(|| {
-                input.secrets_from_connection_id.as_deref().and_then(|source_id| stored.get(source_id))
-            });
-            let config = merge_stored_connection_secrets(&input.config, stored_config, &input.cleared_secrets)?
-                .canonicalized();
+            let stored_config = stored
+                .get(&input.config.id)
+                .or_else(|| input.secrets_from_connection_id.as_deref().and_then(|source_id| stored.get(source_id)));
+            let config =
+                merge_stored_connection_secrets(&input.config, stored_config, &input.cleared_secrets)?.canonicalized();
             for path in &input.cleared_secrets {
                 for key in storage_keys_for_cleared_secret(&config, path) {
                     cleared_keys.push((config.id.clone(), key.to_string()));
@@ -7757,7 +7757,11 @@ fn apply_sync_tunnel_profiles_in_tx(
     Ok(())
 }
 
-fn apply_ai_configs_in_tx(tx: &Transaction<'_>, codec: &SecretWriteCodec, configs: &[AiConfigItem]) -> Result<(), String> {
+fn apply_ai_configs_in_tx(
+    tx: &Transaction<'_>,
+    codec: &SecretWriteCodec,
+    configs: &[AiConfigItem],
+) -> Result<(), String> {
     tx.execute("DELETE FROM ai_configs", []).map_err(|e| e.to_string())?;
     tx.execute("DELETE FROM ai_config", []).map_err(|e| e.to_string())?;
     tx.execute("DELETE FROM ai_provider_configs", []).map_err(|e| e.to_string())?;
@@ -8190,6 +8194,8 @@ fn map_from_sql_err(err: serde_json::Error) -> rusqlite::Error {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use super::*;
     use super::{
         maybe_import_user_data_db, DataDbImportResult, DesktopIconTheme, DesktopSettings, McpGlobalPolicy,
         McpGlobalPolicyState, Storage, SyncImportPlan, KEEP_TERMINAL_AI_RUNS_PER_CONVERSATION, MCP_GLOBAL_POLICY_KEY,

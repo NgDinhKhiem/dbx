@@ -541,7 +541,11 @@ impl Drop for PoolCreationLeader {
     }
 }
 
-fn begin_pool_creation(creations: &PoolCreationMap, pool_key: &str, connection_attempt: Option<u64>) -> PoolCreationTurn {
+fn begin_pool_creation(
+    creations: &PoolCreationMap,
+    pool_key: &str,
+    connection_attempt: Option<u64>,
+) -> PoolCreationTurn {
     let key = (pool_key.to_string(), connection_attempt);
     let mut map = creations.lock().unwrap_or_else(|error| error.into_inner());
     if let Some(signal) = map.get(&key) {
@@ -1408,7 +1412,8 @@ impl AppState {
     /// cancelled here and a missing entry is never "current". The next snapshot
     /// starts a fresh entry, so the map only holds live connections.
     fn forget_connection_lifecycle(&self, connection_id: &str) {
-        let previous = self.connection_lifecycles.lock().unwrap_or_else(|error| error.into_inner()).remove(connection_id);
+        let previous =
+            self.connection_lifecycles.lock().unwrap_or_else(|error| error.into_inner()).remove(connection_id);
         if let Some(previous) = previous {
             previous.cancellation.cancel();
         }
@@ -6627,6 +6632,8 @@ async fn close_pool_kind(pool: PoolKind) -> Result<(), String> {
     Ok(())
 }
 
+// The pool is handed back on failure so the caller can keep using it.
+#[allow(clippy::result_large_err)]
 async fn close_reclaimed_agent_pool(pool: PoolKind) -> Result<(), (PoolKind, String)> {
     let client = match pool {
         PoolKind::Agent(client) => client,
@@ -6944,6 +6951,8 @@ async fn detect_ob_oracle_mode(config: &ConnectionConfig, pool: &db::mysql::MySq
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use super::*;
     use super::{
         agent_connect_timeout, connection_configs_pool_equivalent, connection_configs_session_credentials_compatible,
         connection_probe_endpoints, connection_remote_endpoint, connection_url_for_endpoint,

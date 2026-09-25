@@ -220,11 +220,11 @@ mod tests {
     fn materialized_view_queries_escape_database_and_name() {
         assert_eq!(
             materialized_views_sql("tenant's analytics"),
-            "SELECT TABLE_NAME FROM information_schema.materialized_views WHERE TABLE_SCHEMA = 'tenant\\'s analytics'"
+            "SELECT TABLE_NAME FROM information_schema.materialized_views WHERE TABLE_SCHEMA = 'tenant''s analytics'"
         );
         assert_eq!(
             materialized_view_definition_sql("tenant's analytics", "weird'name"),
-            "SELECT MATERIALIZED_VIEW_DEFINITION FROM information_schema.materialized_views WHERE TABLE_SCHEMA = 'tenant\\'s analytics' AND TABLE_NAME = 'weird\\'name' LIMIT 1"
+            "SELECT MATERIALIZED_VIEW_DEFINITION FROM information_schema.materialized_views WHERE TABLE_SCHEMA = 'tenant''s analytics' AND TABLE_NAME = 'weird''name' LIMIT 1"
         );
     }
 

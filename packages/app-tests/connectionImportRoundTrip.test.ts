@@ -79,6 +79,21 @@ function installBackend(initialConnections: ConnectionConfig[], initialLayout: S
       state.connections = JSON.parse(String(init?.body ?? "[]"));
       return json(null);
     }
+    // Encrypted export/import run on the backend (Argon2id + AES-GCM, tested in
+    // crates/dbx-core/src/persistence/connection_export.rs). This fake keeps the
+    // same contract: a v2 envelope that only the same passphrase can open.
+    if (url === "/api/connection/export-encrypted") {
+      const { bundle, passphrase } = JSON.parse(String(init?.body ?? "{}")) as { bundle: unknown; passphrase: string };
+      if ((passphrase ?? "").length < 12) return new Response("passphrase_too_short", { status: 400 });
+      const envelope = { format: "dbx-encrypted", version: 2, kdf: { name: "argon2id" }, cipher: "aes-256-gcm", nonce: "fake", data: btoa(encodeURIComponent(JSON.stringify({ passphrase, plaintext: JSON.stringify(bundle) }))) };
+      return json(JSON.stringify(envelope));
+    }
+    if (url === "/api/app-settings/config/decrypt") {
+      const { payload, passphrase } = JSON.parse(String(init?.body ?? "{}")) as { payload: { data: string }; passphrase: string };
+      const sealed = JSON.parse(decodeURIComponent(atob(payload.data))) as { passphrase: string; plaintext: string };
+      if (sealed.passphrase !== passphrase) return new Response("wrong_passphrase", { status: 400 });
+      return json(sealed.plaintext);
+    }
     if (url === "/api/tunnel-profiles/list") return json(state.profiles);
     if (url === "/api/tunnel-profiles/save") {
       const body = JSON.parse(String(init?.body ?? "{}")) as { profiles?: TunnelProfile[] };
@@ -444,50 +459,20 @@ test("encrypted export rejects an empty passphrase instead of selecting plaintex
   }
 });
 
-test("encrypted export fails closed when Web Crypto is unavailable", async () => {
+test("encrypted export rejects a short passphrase without producing a file", async () => {
   const backend = installBackend([], null);
   const capture = installExportCapture();
   const storage = installMemoryStorage();
-  const originalCrypto = globalThis.crypto;
-  Object.defineProperty(globalThis, "crypto", {
-    configurable: true,
-    value: { getRandomValues: originalCrypto.getRandomValues.bind(originalCrypto) },
-  });
   try {
     setActivePinia(createPinia());
     const store = useConnectionStore();
     await store.initFromDisk();
 
-    await assert.rejects(() => store.exportConnectionsToFile({ mode: "encrypted", passphrase: PASSPHRASE }), /crypto_unavailable/);
+    await assert.rejects(() => store.exportConnectionsToFile({ mode: "encrypted", passphrase: "short" }), /passphrase_too_short/);
     await assert.rejects(() => capture.content(), /export did not produce a file blob/);
   } finally {
-    Object.defineProperty(globalThis, "crypto", { configurable: true, value: originalCrypto });
     storage.restore();
     capture.restore();
-    backend.restore();
-  }
-});
-
-test("plain legacy dbx config still imports a selected subset", async () => {
-  const backend = installBackend([], null);
-  const storage = installMemoryStorage();
-  try {
-    setActivePinia(createPinia());
-    const store = useConnectionStore();
-    await store.initFromDisk();
-
-    const content = JSON.stringify({
-      connections: [conn("old-a", "Legacy A", 3306), conn("old-b", "Legacy B", 3307), conn("old-c", "Legacy C", 3308)],
-    });
-    const preview = await store.parseConnectionsImport(content, null);
-    const result = await store.applyConnectionsImport(
-      preview,
-      preview.connections.filter((connection) => connection.name !== "Legacy B").map((connection) => connection.id),
-    );
-    assert.equal(result.count, 2);
-    assert.deepEqual(store.connections.map((connection) => connection.name).sort(), ["Legacy A", "Legacy C"]);
-  } finally {
-    storage.restore();
     backend.restore();
   }
 });

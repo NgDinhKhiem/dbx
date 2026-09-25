@@ -212,7 +212,8 @@ fn decode_pg_numeric_bytes(raw: &[u8]) -> Option<String> {
         _ => return None,
     }
 
-    let digits = raw[8..].chunks_exact(2).map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]])).collect::<Vec<_>>();
+    let digits =
+        raw[8..].as_chunks::<2>().0.iter().map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]])).collect::<Vec<_>>();
     if digits.iter().any(|digit| *digit > 9999) {
         return None;
     }
@@ -674,8 +675,12 @@ fn decode_pgvector_bytes(raw: &[u8]) -> Option<Vec<f32>> {
     if raw.len() != expected_len {
         return None;
     }
-    let floats: Vec<f32> =
-        raw[4..].chunks_exact(4).map(|chunk| f32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])).collect();
+    let floats: Vec<f32> = raw[4..]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect();
     Some(floats)
 }
 
@@ -1341,7 +1346,9 @@ fn decode_pg_text_wkb(value: &str) -> Option<super::wkb::DecodedGeometry> {
     }
     let bytes = hex
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let text = std::str::from_utf8(pair).ok()?;
             u8::from_str_radix(text, 16).ok()
@@ -1939,7 +1946,9 @@ async fn execute_select_prepared(
             let (value, srid) = pg_value_to_json_with_srid(&row, i, col_type);
             if col_type == PgColType::Geometry {
                 spatial_columns.observe(i, srid);
-                row_srids[i] = srid;
+                if let Some(slot) = row_srids.get_mut(i) {
+                    *slot = srid;
+                }
             }
             values.push(value);
         }
@@ -10658,7 +10667,11 @@ mod tests {
         let notices = buffer.take();
         assert_eq!(notices.len(), MAX_POSTGRES_NOTICES_PER_STATEMENT + 1);
         assert_eq!(notices[0].message, "notice 0");
-        assert!(notices.last().unwrap().message.starts_with("25 notices dropped"), "{}", notices.last().unwrap().message);
+        assert!(
+            notices.last().unwrap().message.starts_with("25 notices dropped"),
+            "{}",
+            notices.last().unwrap().message
+        );
 
         // The next statement starts with an empty buffer and no dropped count.
         buffer.push(test_query_message("next"));

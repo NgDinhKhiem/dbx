@@ -812,9 +812,8 @@ pub(super) fn verify_installed_file_checksum(package_dir: &Path, file: &Path, re
     if checksums.algorithm != "sha256" {
         return Err(format!("Unsupported plugin checksum algorithm '{}'", checksums.algorithm));
     }
-    let relative = file
-        .strip_prefix(package_dir)
-        .map_err(|_| format!("'{}' is outside the plugin package", file.display()))?;
+    let relative =
+        file.strip_prefix(package_dir).map_err(|_| format!("'{}' is outside the plugin package", file.display()))?;
     let key = path_key(relative)?;
     let expected =
         checksums.files.get(&key).ok_or_else(|| format!("'{key}' is not covered by {PLUGIN_CHECKSUMS_FILE}"))?;

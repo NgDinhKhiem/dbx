@@ -561,7 +561,9 @@ mod tests {
         let columns = (0..10).map(|index| format!("zeroblob({MAX_BLOB_BYTES}) AS b{index}")).collect::<Vec<_>>();
         match query(&conn, &format!("SELECT {}", columns.join(", ")), 10) {
             WorkerBody::Err { error } => assert!(error.contains("response limit"), "{error}"),
-            other => panic!("expected the oversized first row to be rejected, got {} bytes", format!("{other:?}").len()),
+            other => {
+                panic!("expected the oversized first row to be rejected, got {} bytes", format!("{other:?}").len())
+            }
         }
     }
 

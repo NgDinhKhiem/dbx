@@ -1827,6 +1827,8 @@ pub fn run() {
             commands::app_settings::save_history_retention_limit,
             commands::app_settings::load_max_retries,
             commands::app_settings::save_max_retries,
+            commands::app_settings::decrypt_config,
+            commands::app_settings::export_connections_encrypted,
             commands::app_settings::set_app_locale,
             commands::app_settings::complete_app_close,
             commands::app_settings::mark_frontend_ready,

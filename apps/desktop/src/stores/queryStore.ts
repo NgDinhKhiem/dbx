@@ -2515,15 +2515,7 @@ export const useQueryStore = defineStore("query", () => {
 
   // Result-cache bookkeeping the serializer omits for some tab modes but a
   // detached-window handoff still depends on. Small scalars only.
-  const _persistResultTriggers = computed(() =>
-    tabs.value.map((t) => [
-      t.id,
-      t.resultEvicted,
-      t.resultCacheKey,
-      t.activeResultRunId,
-      t.resultRuns?.map((run) => [run.id, run.title, run.sequence, run.sql, run.createdAt, run.pinned, run.activeResultIndex, run.resultCacheKey, run.resultEvicted]),
-    ]),
-  );
+  const _persistResultTriggers = computed(() => tabs.value.map((t) => [t.id, t.resultEvicted, t.resultCacheKey, t.activeResultRunId, t.resultRuns?.map((run) => [run.id, run.title, run.sequence, run.sql, run.createdAt, run.pinned, run.activeResultIndex, run.resultCacheKey, run.resultEvicted])]));
 
   const storePersistGeneration = ++persistGeneration;
   watch(

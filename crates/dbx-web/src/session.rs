@@ -329,7 +329,9 @@ mod tests {
         let store = store(60, 3600, 10);
         let start = Instant::now();
         let (stale, _) = store.create_at(start);
-        let (fresh, _) = store.create_at(start + Duration::from_secs(100));
+        // Created before `stale` expires, so creation does not already evict it.
+        let (fresh, _) = store.create_at(start + Duration::from_secs(50));
+        assert!(matches!(store.validate_at(&fresh, start + Duration::from_secs(100)), SessionLookup::Valid(_)));
         assert_eq!(store.sweep_at(start + Duration::from_secs(120)), vec![stale]);
         let (other, _) = store.create_at(start + Duration::from_secs(120));
         let SessionLookup::Valid(other_revoked) = store.validate_at(&other, start + Duration::from_secs(121)) else {

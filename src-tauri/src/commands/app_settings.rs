@@ -114,6 +114,23 @@ pub async fn save_max_retries(state: State<'_, Arc<AppState>>, max_retries: u32)
     state.storage.save_max_retries(max_retries).await
 }
 
+/// Decrypts a version 1 (PBKDF2) or version 2 (Argon2id) config export file.
+#[tauri::command]
+pub async fn decrypt_config(payload: serde_json::Value, passphrase: String) -> Result<String, String> {
+    dbx_core::persistence::connection_export::decrypt_connection_export_blocking(payload, passphrase).await
+}
+
+/// Builds the encrypted (v2) connection export. The frontend sends redacted
+/// configs; stored secrets are filled in by id here and never reach the webview.
+#[tauri::command]
+pub async fn export_connections_encrypted(
+    state: State<'_, Arc<AppState>>,
+    bundle: serde_json::Value,
+    passphrase: String,
+) -> Result<String, String> {
+    state.storage.export_connections_encrypted(bundle, &passphrase).await
+}
+
 #[tauri::command]
 pub async fn complete_app_close(app: AppHandle, window: Window, action: String) -> Result<(), String> {
     match action.as_str() {

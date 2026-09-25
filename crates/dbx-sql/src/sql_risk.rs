@@ -730,7 +730,13 @@ fn oracle_package_call_is_read_only(package: &str, member: Option<&str>) -> bool
         "dbms_lob" => member.is_some_and(|member| {
             matches!(
                 member,
-                "compare" | "get_storage_limit" | "getchunksize" | "getlength" | "instr" | "isopen" | "istemporary"
+                "compare"
+                    | "get_storage_limit"
+                    | "getchunksize"
+                    | "getlength"
+                    | "instr"
+                    | "isopen"
+                    | "istemporary"
                     | "substr"
             )
         }),
@@ -2685,13 +2691,19 @@ mod tests {
         }
         // Read-only Oracle package helpers stay reads.
         assert_eq!(
-            classify_sql_risk_for_database("SELECT DBMS_METADATA.GET_DDL('TABLE', 'T') FROM dual", DatabaseType::Oracle)
-                .unwrap(),
+            classify_sql_risk_for_database(
+                "SELECT DBMS_METADATA.GET_DDL('TABLE', 'T') FROM dual",
+                DatabaseType::Oracle
+            )
+            .unwrap(),
             SqlRisk::ReadOnly
         );
         assert_eq!(
-            classify_sql_risk_for_database("SELECT lower(name), count(*) FROM users GROUP BY 1", DatabaseType::Postgres)
-                .unwrap(),
+            classify_sql_risk_for_database(
+                "SELECT lower(name), count(*) FROM users GROUP BY 1",
+                DatabaseType::Postgres
+            )
+            .unwrap(),
             SqlRisk::ReadOnly
         );
     }
@@ -2699,11 +2711,11 @@ mod tests {
     #[test]
     fn keyword_fallback_still_sees_side_effect_functions() {
         // Unparseable text used to fall back to the keyword classifier, which answered ReadOnly.
-        let sql = "SELECT pg_terminate_backend(1) FROM FROM pg_stat_activity";
+        let sql = "SELECT pg_terminate_backend(1) FROM pg_stat_activity WHERE )(";
         assert!(Parser::parse_sql(&PostgreSqlDialect {}, sql).is_err());
         assert_eq!(classify_sql_risk_for_database(sql, DatabaseType::Postgres).unwrap(), SqlRisk::Write);
         assert!(is_dangerous_sql_for_database(sql, DatabaseType::Postgres));
-        assert_eq!(classify_sql_risk("SELECT sleep(10) FROM FROM t", "mysql").unwrap(), SqlRisk::Write);
+        assert_eq!(classify_sql_risk("SELECT sleep(10) FROM t WHERE )(", "mysql").unwrap(), SqlRisk::Write);
     }
 
     #[test]

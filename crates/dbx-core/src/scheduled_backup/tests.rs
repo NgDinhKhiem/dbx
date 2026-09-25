@@ -644,9 +644,8 @@ fn live_postgres_worker_exports_selected_tables_across_schemas() {
 #[test]
 fn worker_runtime_names_worker_and_blocking_threads() {
     let runtime = super::worker_runtime().unwrap();
-    let worker_name = runtime.block_on(async {
-        tokio::spawn(async { std::thread::current().name().map(str::to_string) }).await.unwrap()
-    });
+    let worker_name = runtime
+        .block_on(async { tokio::spawn(async { std::thread::current().name().map(str::to_string) }).await.unwrap() });
     let blocking_name = runtime.block_on(async {
         tokio::task::spawn_blocking(|| std::thread::current().name().map(str::to_string)).await.unwrap()
     });

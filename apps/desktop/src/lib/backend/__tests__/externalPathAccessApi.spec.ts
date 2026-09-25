@@ -8,7 +8,8 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: mocks.invoke,
 }));
 
-import { pickExternalDirectory, pickExternalFiles, redisPubSubWebSocketUrl, requestExternalPathAccess } from "@/lib/backend/tauri";
+import { pickExternalDirectory, pickExternalFiles, requestExternalPathAccess } from "@/lib/backend/tauri";
+import { redisPubSubWebSocketUrl } from "@/lib/backend/redisPubSubUrl";
 
 describe("external path access API", () => {
   beforeEach(() => {

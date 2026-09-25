@@ -435,9 +435,8 @@ mod tests {
         .unwrap();
         assert!(Path::new(&created).is_file());
 
-        let renamed = rename_sql_file(root.to_string_lossy().into_owned(), created, "report.sql".to_string())
-            .await
-            .unwrap();
+        let renamed =
+            rename_sql_file(root.to_string_lossy().into_owned(), created, "report.sql".to_string()).await.unwrap();
         assert!(Path::new(&renamed).is_file());
 
         delete_sql_file(root.to_string_lossy().into_owned(), renamed.clone()).await.unwrap();
@@ -462,10 +461,9 @@ mod tests {
         .unwrap();
         assert_eq!(created, displayed_directory.join("draft.sql").to_string_lossy());
 
-        let renamed =
-            rename_sql_file(displayed_root.to_string_lossy().into_owned(), created, "report.sql".to_string())
-                .await
-                .unwrap();
+        let renamed = rename_sql_file(displayed_root.to_string_lossy().into_owned(), created, "report.sql".to_string())
+            .await
+            .unwrap();
         assert_eq!(renamed, displayed_directory.join("report.sql").to_string_lossy());
         std::fs::remove_dir_all(root).unwrap();
     }

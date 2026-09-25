@@ -101,14 +101,30 @@ describe("PluginWorkbenchTab contribution resolution", () => {
 
   /** Mount, reveal the sandbox iframe, and capture the bridge init payload. */
   async function mountLoadedTab(contributionId: string, context?: Record<string, unknown>) {
-    await mountTab(contributionId, context);
-    const frame = root.querySelector("iframe");
-    expect(frame).toBeInstanceOf(HTMLIFrameElement);
-    const target = frame!.contentWindow!;
-    const postMessage = vi.spyOn(target, "postMessage").mockImplementation(() => {});
-    frame!.dispatchEvent(new Event("load"));
-    await vi.waitFor(() => expect(postMessage).toHaveBeenCalled());
-    return postMessage;
+    // happy-dom fires the srcdoc load on its own, and a second load is treated
+    // as the plugin navigating away, so the init must be observed on the first
+    // load: spy on each iframe window as soon as the iframe is inserted.
+    const spies = new Map<HTMLIFrameElement, ReturnType<typeof vi.fn>>();
+    const observer = new MutationObserver(() => {
+      for (const frame of root.querySelectorAll("iframe")) {
+        if (spies.has(frame) || !frame.contentWindow) continue;
+        spies.set(frame, vi.spyOn(frame.contentWindow, "postMessage").mockImplementation(() => {}) as unknown as ReturnType<typeof vi.fn>);
+      }
+    });
+    observer.observe(root, { childList: true, subtree: true });
+    try {
+      await mountTab(contributionId, context);
+      const frame = root.querySelector("iframe");
+      expect(frame).toBeInstanceOf(HTMLIFrameElement);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const postMessage = spies.get(frame!);
+      expect(postMessage).toBeDefined();
+      if (!postMessage!.mock.calls.length) frame!.dispatchEvent(new Event("load"));
+      await vi.waitFor(() => expect(postMessage).toHaveBeenCalled());
+      return postMessage!;
+    } finally {
+      observer.disconnect();
+    }
   }
 
   function initPayload(postMessage: { mock: { calls: unknown[][] } }) {

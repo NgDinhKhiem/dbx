@@ -1,3 +1,6 @@
+// Tauri commands return the structured BackendError by value to the IPC layer.
+#![allow(clippy::result_large_err)]
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, State};

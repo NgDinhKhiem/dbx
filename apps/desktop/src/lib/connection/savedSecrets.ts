@@ -166,7 +166,15 @@ export function presentSecretPaths(config: ConnectionConfig): string[] {
   }
   if (urlParamsHaveSensitiveValue(config.url_params)) paths.push(URL_PARAMS_SECRET_PATH);
   (config.transport_layers ?? []).forEach((layer, index) => {
-    const values: [TransportLayerSecretField, unknown][] = layer.type === "ssh" ? [["password", layer.password], ["key_passphrase", layer.key_passphrase]] : layer.type === "proxy" ? [["password", layer.password]] : [["token", layer.token]];
+    const values: [TransportLayerSecretField, unknown][] =
+      layer.type === "ssh"
+        ? [
+            ["password", layer.password],
+            ["key_passphrase", layer.key_passphrase],
+          ]
+        : layer.type === "proxy"
+          ? [["password", layer.password]]
+          : [["token", layer.token]];
     for (const [field, value] of values) {
       if (isNonEmptyString(value)) paths.push(transportLayerSecretPath(layer, index, field));
     }

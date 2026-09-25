@@ -1,5 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
-import { clearPersistedResultCache, decodeTabResultSnapshot, encodeTabResultSnapshot, readResultCacheBackends, promoteFallbackResultCacheRead, resultCacheBackendOrder, resultCacheRuntimeConfig, selectResultCachePruneKeys, writeResultCacheBackends, type ResultCacheBackend } from "@/lib/tabs/tabResultCache";
+import {
+  clearPersistedResultCache,
+  decodeTabResultSnapshot,
+  encodeTabResultSnapshot,
+  readResultCacheBackends,
+  promoteFallbackResultCacheRead,
+  resultCacheBackendOrder,
+  resultCacheRuntimeConfig,
+  selectResultCachePruneKeys,
+  writeResultCacheBackends,
+  type ResultCacheBackend,
+} from "@/lib/tabs/tabResultCache";
 import { queryResultLifecycleSnapshot } from "@/lib/__tests__/fixtures/queryResultLifecycle";
 
 function backend(name: ResultCacheBackend["name"], overrides: Partial<ResultCacheBackend> = {}): ResultCacheBackend {
