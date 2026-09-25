@@ -29,6 +29,9 @@ const markedInstance = new Marked({
       const titleAttr = title ? ` title="${escapeHtml(title)}"` : "";
       return `<a href="${escapeHtml(safeHref)}"${titleAttr} target="_blank" rel="noopener noreferrer">${label}</a>`;
     },
+    image({ href, title, text }: Tokens.Image) {
+      return renderAiMarkdownImage(href, title, text);
+    },
     table({ header, rows, align }: Tokens.Table) {
       const renderCell = (cell: Tokens.TableCell, tag: "th" | "td", colIndex: number): string => {
         const content = this.parser.parseInline(cell.tokens);
@@ -47,6 +50,25 @@ const markedInstance = new Marked({
     },
   },
 });
+
+// Inline raster images only. Remote images are never auto-loaded: an `<img>`
+// pointing at an attacker URL is a zero-click exfiltration channel when a
+// prompt-injected answer smuggles data into the query string.
+const SAFE_INLINE_IMAGE_SOURCE = /^data:image\/(?:png|jpe?g|gif|webp|avif);base64,[a-z0-9+/=\s]+$/i;
+
+export function renderAiMarkdownImage(href: string, title: string | null | undefined, text: string): string {
+  const titleAttr = title ? ` title="${escapeHtml(title)}"` : "";
+  const source = (href ?? "").trim();
+  if (SAFE_INLINE_IMAGE_SOURCE.test(source)) {
+    return `<img src="${escapeHtml(source.replace(/\s+/g, ""))}" alt="${escapeHtml(text)}"${titleAttr} loading="lazy" referrerpolicy="no-referrer" />`;
+  }
+
+  const safeHref = normalizeAiMarkdownLink(source);
+  const label = escapeHtml(text || safeHref || "image");
+  if (!safeHref) return label;
+  // A plain link the user has to click: nothing is fetched on render.
+  return `<a href="${escapeHtml(safeHref)}"${titleAttr} target="_blank" rel="noopener noreferrer" data-ai-markdown-image="true">${label}</a>`;
+}
 
 export function formatAiInlineMarkdown(text: string): string {
   try {

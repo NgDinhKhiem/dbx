@@ -1364,3 +1364,52 @@ describe("plugin SDK source", () => {
     expect(messages.some((message) => message.type === "workbench/close")).toBe(true);
   });
 });
+
+describe("PluginHostBridge channel nonce", () => {
+  const api = () => ({ invoke: vi.fn(), notify: vi.fn(), sendBinary: vi.fn(), readAsset: vi.fn() });
+
+  it("ignores messages that do not echo the per-document nonce", async () => {
+    const messages: any[] = [];
+    const target = { postMessage: (message: unknown) => messages.push(message) } as unknown as Window;
+    const bridge = new PluginHostBridge(plugin(), workbench, {}, () => target, { ...api(), listConnections: () => [] });
+    bridge.channelNonce = "nonce-1";
+
+    const request = (nonce?: string) => bridge.handleWindowMessage({ source: target, data: { source: "dbx-plugin", version: 1, type: "request", id: "1", method: "host.listConnections", params: {}, ...(nonce === undefined ? {} : { nonce }) } } as MessageEvent);
+    expect(request()).toBe(false);
+    expect(request("other")).toBe(false);
+    expect(bridge.handleWindowMessage({ source: target, data: { source: "dbx-plugin", version: 1, type: "ready" } } as MessageEvent)).toBe(false);
+    expect(messages).toEqual([]);
+
+    expect(request("nonce-1")).toBe(true);
+    await vi.waitFor(() => expect(messages[0]).toMatchObject({ type: "response", id: "1" }));
+    // The nonce never travels back into the frame.
+    expect(JSON.stringify(messages)).not.toContain("nonce-1");
+  });
+
+  it("stops handling messages once disposed", () => {
+    const target = { postMessage: vi.fn() } as unknown as Window;
+    const closeTab = vi.fn();
+    const bridge = new PluginHostBridge(plugin(), workbench, {}, () => target, { ...api(), closeTab });
+    bridge.dispose();
+    expect(bridge.handleWindowMessage({ source: target, data: { source: "dbx-plugin", version: 1, type: "shortcut", shortcut: "closeTab" } } as MessageEvent)).toBe(false);
+    expect(closeTab).not.toHaveBeenCalled();
+  });
+
+  it("bakes the nonce into the sandbox SDK and attaches it to every outgoing message", () => {
+    const document = pluginSandboxDocument("<html><head></head><body></body></html>", [], undefined, { channelNonce: "abc_123" });
+    expect(document).toContain('const channelNonce = "abc_123";');
+
+    const posted: any[] = [];
+    const sandbox = {} as { dbxPlugin?: { request: (method: string, params?: unknown) => Promise<unknown> } };
+    const fakeDocument = { documentElement: { dataset: {}, style: { colorScheme: "", setProperty: vi.fn() } }, dispatchEvent: vi.fn() } as unknown as Document;
+    new Function("window", "parent", "addEventListener", "document", pluginSdkSource(undefined, "abc_123"))(sandbox, { postMessage: (message: unknown) => posted.push(message) }, () => {}, fakeDocument);
+    void sandbox.dbxPlugin!.request("host.getContext").catch(() => undefined);
+
+    expect(posted.map((message) => message.type)).toEqual(["ready", "request"]);
+    expect(posted.every((message) => message.nonce === "abc_123")).toBe(true);
+  });
+
+  it("refuses nonces that could break out of the SDK script", () => {
+    expect(pluginSdkSource(undefined, '"</script><script>alert(1)//')).toContain("const channelNonce = null;");
+  });
+});

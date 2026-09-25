@@ -1,9 +1,13 @@
 // @vitest-environment happy-dom
 
 import { createApp, defineComponent, h, nextTick, ref, type App } from "vue";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, afterEach, describe, expect, it, vi } from "vitest";
 import DataGridConditionEditor from "@/components/grid/DataGridConditionEditor.vue";
 import type { DataGridConditionHistoryKind } from "@/lib/dataGrid/dataGridConditionHistory";
+import { loadPinyin } from "@/lib/common/pinyin";
+
+// pinyin-pro is lazy-loaded in the app; load it up front so Han initials resolve synchronously.
+beforeAll(() => loadPinyin());
 
 const mountedApps: Array<{ app: App; host: HTMLElement }> = [];
 

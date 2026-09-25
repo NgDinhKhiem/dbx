@@ -83,6 +83,7 @@ export const resolveSshPrompt = forward("resolveSshPrompt");
 export const readKeychainPassword = forward("readKeychainPassword");
 export const readKeychainPasswords = forward("readKeychainPasswords");
 export const decryptConfig = forward("decryptConfig");
+export const exportConnectionsEncrypted = forward("exportConnectionsEncrypted");
 export const listPlugins = forward("listPlugins");
 export const listPluginTrustedKeys = forward("listPluginTrustedKeys");
 export const savePluginTrustedKey = forward("savePluginTrustedKey");
@@ -452,6 +453,10 @@ export const readExternalSqlFileSnapshot = forward("readExternalSqlFileSnapshot"
 export const inspectExternalSqlFile = forward("inspectExternalSqlFile");
 export const writeExternalSqlFile = forward("writeExternalSqlFile");
 export const saveExternalSqlFile = forward("saveExternalSqlFile");
+export const pickExternalFiles = forward("pickExternalFiles");
+export const pickExternalDirectory = forward("pickExternalDirectory");
+export const pickExternalSavePath = forward("pickExternalSavePath");
+export const requestExternalPathAccess = forward("requestExternalPathAccess");
 export const listSqlFilesInFolder = forward("listSqlFilesInFolder");
 export const globalSearch = forward("globalSearch");
 export const loadGlobalSearchSettings = forward("loadGlobalSearchSettings");
@@ -968,6 +973,11 @@ export type {
   WebDavPasswordStatus,
   WebDavSyncSummary,
   WebDavDownloadResult,
+  SyncImportApplySummary,
+  SyncImportConfirmation,
+  SyncImportEndpointChange,
+  SyncImportReview,
+  SyncImportStatus,
   SnippetProvider,
   SnippetSyncConfig,
   SnippetSyncSettings,

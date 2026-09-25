@@ -795,6 +795,36 @@ fn verify_package_checksums(destination: &Path, extracted: &HashSet<String>, raw
     Ok(())
 }
 
+/// Re-checks one installed file against the package's recorded `checksums.json`
+/// (the manifest verified, and for signed packages signature-checked, at install
+/// time). Used right before launching a sidecar so a binary swapped on disk
+/// after installation is refused. `required` demands the manifest exist; it is
+/// set for installs that recorded provenance, i.e. that came from a package.
+pub(super) fn verify_installed_file_checksum(package_dir: &Path, file: &Path, required: bool) -> Result<(), String> {
+    let checksums_path = package_dir.join(PLUGIN_CHECKSUMS_FILE);
+    let raw = match std::fs::read(&checksums_path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !required => return Ok(()),
+        Err(error) => return Err(format!("installed package {PLUGIN_CHECKSUMS_FILE} is unreadable: {error}")),
+    };
+    let checksums: PluginPackageChecksums =
+        serde_json::from_slice(&raw).map_err(|error| format!("Failed to parse {PLUGIN_CHECKSUMS_FILE}: {error}"))?;
+    if checksums.algorithm != "sha256" {
+        return Err(format!("Unsupported plugin checksum algorithm '{}'", checksums.algorithm));
+    }
+    let relative = file
+        .strip_prefix(package_dir)
+        .map_err(|_| format!("'{}' is outside the plugin package", file.display()))?;
+    let key = path_key(relative)?;
+    let expected =
+        checksums.files.get(&key).ok_or_else(|| format!("'{key}' is not covered by {PLUGIN_CHECKSUMS_FILE}"))?;
+    let actual = sha256_file(&safe_checksum_path(package_dir, &key)?)?;
+    if !expected.eq_ignore_ascii_case(&actual) {
+        return Err(format!("checksum mismatch for '{key}'; the installed file was modified after installation"));
+    }
+    Ok(())
+}
+
 fn verify_package_signature(
     destination: &Path,
     checksums: &[u8],
@@ -1644,6 +1674,47 @@ mod tests {
 
         assert!(PluginTrustStore::list_base64_keys(root.path()).unwrap().is_empty());
         assert!(!PluginTrustStore::load(root.path()).unwrap().keys.contains_key("sample-repository"));
+    }
+
+    #[test]
+    fn installed_file_checksum_detects_tampering() {
+        let root = tempfile::tempdir().unwrap();
+        let package = root.path();
+        std::fs::create_dir_all(package.join("bin")).unwrap();
+        std::fs::write(package.join("bin/sidecar"), b"original").unwrap();
+        std::fs::write(package.join("bin/other"), b"x").unwrap();
+        std::fs::write(
+            package.join(PLUGIN_CHECKSUMS_FILE),
+            serde_json::to_vec(&serde_json::json!({
+                "algorithm": "sha256",
+                "files": { "bin/sidecar": sha256_hex(b"original") }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let executable = package.join("bin/sidecar");
+
+        super::verify_installed_file_checksum(package, &executable, true).unwrap();
+
+        std::fs::write(&executable, b"tampered").unwrap();
+        let error = super::verify_installed_file_checksum(package, &executable, true).unwrap_err();
+        assert!(error.contains("checksum mismatch"), "unexpected error: {error}");
+
+        let error = super::verify_installed_file_checksum(package, &package.join("bin/other"), true).unwrap_err();
+        assert!(error.contains("not covered"), "unexpected error: {error}");
+
+        let outside = tempfile::tempdir().unwrap();
+        assert!(super::verify_installed_file_checksum(package, &outside.path().join("x"), true).is_err());
+    }
+
+    #[test]
+    fn installed_file_checksum_requires_the_manifest_only_for_package_installs() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("sidecar"), b"bin").unwrap();
+        let executable = root.path().join("sidecar");
+        super::verify_installed_file_checksum(root.path(), &executable, false).unwrap();
+        let error = super::verify_installed_file_checksum(root.path(), &executable, true).unwrap_err();
+        assert!(error.contains(PLUGIN_CHECKSUMS_FILE), "unexpected error: {error}");
     }
 
     #[test]

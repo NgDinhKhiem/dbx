@@ -234,6 +234,7 @@ import { CANVAS_DATA_GRID_ROW_HEIGHT, MAX_CANVAS_DATA_GRID_PIXEL_RATIO, canvasDa
 import { resolveCrosshairTarget, type CrosshairTarget } from "@/lib/dataGrid/crosshairHighlight";
 import { DATA_GRID_DARK_STRIPED_ROW_BG, DATA_GRID_LIGHT_STRIPED_ROW_BG, dataGridActiveRowBackground } from "@/lib/dataGrid/dataGridPaintTheme";
 import { createRowLowerTextCache } from "@/lib/dataGrid/dataGridRowLowerText";
+import { createSourceRowItemCache, createVisibleRowProjector } from "@/lib/dataGrid/dataGridRowItemCache";
 import { dataGridPreviewLabelKey, dataGridSaveActionMode, dataGridSaveToolbarState } from "@/lib/dataGrid/dataGridSaveUi";
 import { buildDataGridSavedRowRefreshPlan, dataGridSavedRowRefreshPatches } from "@/lib/dataGrid/dataGridSavedRowRefresh";
 import type { QueryEditabilityReason } from "@/lib/sql/sqlAnalysis";
@@ -4514,8 +4515,12 @@ const displayRowIndexByIdLookup = computed(() => {
   return lookup;
 });
 
+// Clean source rows keep their RowItem across displayItems recomputes, so an
+// edit only recreates the rows it touched instead of every loaded row.
+const sourceRowItemCache = createSourceRowItemCache<Extract<DisplayRowRef, { sourceIndex: number }>, RowItem>();
+
 function rowItemFromDisplayRef(ref: DisplayRowRef): RowItem {
-  void largeValueResolutionVersion.value;
+  const resolutionVersion = largeValueResolutionVersion.value;
   if (ref.isNew) {
     return {
       ...ref,
@@ -4531,13 +4536,30 @@ function rowItemFromDisplayRef(ref: DisplayRowRef): RowItem {
       isDirtyCol: cleanDirtyColumns.value,
     };
   }
-  const row = props.result.rows[ref.sourceIndex] ?? [];
+  const rows = props.result.rows;
+  const sourceRow = rows[ref.sourceIndex];
+  const row = sourceRow ?? [];
   const dirty = dirtyRows.value.get(ref.sourceIndex);
-  return {
+  const columnCount = props.result.columns.length;
+  sourceRowItemCache.sync(rows, resolutionVersion, cleanDirtyColumns.value);
+  if (dirty?.size) {
+    // Per-row change maps are mutated in place, so edited rows are rebuilt.
+    sourceRowItemCache.delete(ref.sourceIndex);
+    return {
+      ...ref,
+      data: rowDataWithChanges(row, ref.sourceIndex),
+      isDirtyCol: dirtyColumnsForRow(dirty, columnCount),
+    };
+  }
+  const cached = sourceRowItemCache.get(ref, sourceRow);
+  if (cached) return cached;
+  const item: RowItem = {
     ...ref,
     data: rowDataWithChanges(row, ref.sourceIndex),
-    isDirtyCol: dirtyColumnsForRow(dirty, props.result.columns.length),
+    isDirtyCol: dirtyColumnsForRow(dirty, columnCount),
   };
+  sourceRowItemCache.set(ref, sourceRow, item);
+  return item;
 }
 
 function displayItemAt(rowIndex: number): RowItem | undefined {
@@ -4761,21 +4783,19 @@ function getRowItem(rowId: number): RowItem | undefined {
   return rowIndex >= 0 ? displayItemAt(rowIndex) : undefined;
 }
 
-function visibleRowData(row: CellValue[]): CellValue[] {
-  return visibleColumnIndexes.value.map((index) => row[index]);
-}
+// Memoized per RowItem object: unchanged rows keep their projection, so a
+// single edit no longer copies rows × visible columns.
+const projectVisibleRowItem = createVisibleRowProjector<RowItem>();
 
-function visibleDirtyColumns(row: boolean[]): boolean[] {
-  return visibleColumnIndexes.value.map((index) => row[index] ?? false);
-}
+const visibleDisplayItems = computed<RowItem[]>(() => {
+  const indexes = visibleColumnIndexes.value;
+  return displayItems.value.map((item) => projectVisibleRowItem(item, indexes));
+});
 
-const visibleDisplayItems = computed<RowItem[]>(() =>
-  displayItems.value.map((item) => ({
-    ...item,
-    data: visibleRowData(item.data),
-    isDirtyCol: visibleDirtyColumns(item.isDirtyCol),
-  })),
-);
+function getVisibleRowItem(rowId: number): RowItem | undefined {
+  const item = getRowItem(rowId);
+  return item ? projectVisibleRowItem(item, visibleColumnIndexes.value) : undefined;
+}
 
 const largeValueRuntimeInstance = useDataGridLargeValues({
   result: computed(() => props.result),
@@ -7613,7 +7633,7 @@ const {
   selectedRange,
   contextCell: exportContextCell,
   contextSelectionIsSynthetic,
-  getRowItem: (rowId: number) => visibleDisplayItems.value.find((item) => item.id === rowId),
+  getRowItem: getVisibleRowItem,
   selectedRowIds,
   hasRowSelection,
   resolveSourceValues: resolveLargeValueCells,

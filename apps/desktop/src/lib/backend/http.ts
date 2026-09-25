@@ -84,6 +84,8 @@ import type { SchemaDiffPreparation, SchemaDiffPreparationOptions, SchemaSyncSql
 import type { SidebarObjectKind } from "@/lib/database/databaseObjectCapabilities";
 import type { AiConfig, AiTestConnectionResult } from "@/stores/settingsStore";
 import type { AiChatSelectionState, AiEffortCapability } from "@/types/ai";
+import { aiConfigIdForRequest } from "@/lib/ai/aiConfigSecrets";
+import type { SyncImportApplySummary, SyncImportConfirmation, SyncImportReview, SyncImportStatus } from "@/lib/backend/tauri";
 import type {
   AgentDriverInfo,
   AiCompletionRequest,
@@ -567,6 +569,10 @@ export async function readKeychainPasswords(services: string[]): Promise<[string
 
 export async function decryptConfig(payload: unknown, passphrase: string): Promise<string> {
   return post("/api/app-settings/config/decrypt", { payload, passphrase });
+}
+
+export async function exportConnectionsEncrypted(bundle: unknown, passphrase: string): Promise<string> {
+  return post("/api/connection/export-encrypted", { bundle, passphrase });
 }
 
 export async function listSystemFonts(): Promise<string[]> {
@@ -1894,15 +1900,17 @@ export async function buildDataCompareSyncPlan(options: DataCompareSyncPlanOptio
 // AI
 // ---------------------------------------------------------------------------
 
-export async function aiComplete(request: AiCompletionRequest): Promise<string> {
-  return post("/api/ai/complete", { request });
+// AI configs reach the frontend with secrets redacted; `configId` lets the
+// backend fill blank secrets from the stored config with that id.
+export async function aiComplete(request: AiCompletionRequest, configId?: string): Promise<string> {
+  return post("/api/ai/complete", { request, configId: aiConfigIdForRequest(request.config, configId) });
 }
 
-export async function aiStream(sessionId: string, request: AiCompletionRequest, onChunk: (chunk: AiStreamChunk) => void): Promise<void> {
+export async function aiStream(sessionId: string, request: AiCompletionRequest, onChunk: (chunk: AiStreamChunk) => void, configId?: string): Promise<void> {
   const res = await fetch(apiUrl("/api/ai/stream"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ session_id: sessionId, request }),
+    body: JSON.stringify({ session_id: sessionId, request, configId: aiConfigIdForRequest(request.config, configId) }),
   });
   if (!res.ok) throw await backendResponseError(res);
 
@@ -1942,16 +1950,16 @@ export async function aiCancelStream(sessionId: string): Promise<boolean> {
   return post("/api/ai/cancel-stream", { sessionId });
 }
 
-export async function aiTestConnection(config: AiConfig): Promise<AiTestConnectionResult> {
-  return post("/api/ai/test-connection", { config });
+export async function aiTestConnection(config: AiConfig, configId?: string): Promise<AiTestConnectionResult> {
+  return post("/api/ai/test-connection", { config, configId: aiConfigIdForRequest(config, configId) });
 }
 
-export async function aiListModels(config: AiConfig): Promise<AiModelInfo[]> {
-  return post("/api/ai/models", { config });
+export async function aiListModels(config: AiConfig, configId?: string): Promise<AiModelInfo[]> {
+  return post("/api/ai/models", { config, configId: aiConfigIdForRequest(config, configId) });
 }
 
-export async function aiResolveModelEffort(config: AiConfig, modelId: string): Promise<AiEffortCapability> {
-  return post("/api/ai/model-effort", { config, modelId });
+export async function aiResolveModelEffort(config: AiConfig, modelId: string, configId?: string): Promise<AiEffortCapability> {
+  return post("/api/ai/model-effort", { config, modelId, configId: aiConfigIdForRequest(config, configId) });
 }
 
 export async function saveAiChatSelection(selection: AiChatSelectionState): Promise<void> {
@@ -2002,6 +2010,7 @@ export async function aiAgentStream(
       confirmedDatabase,
       confirmedSchema,
       selectedDatabases,
+      configId: aiConfigIdForRequest(request.config),
     }),
     signal,
   });
@@ -2329,13 +2338,12 @@ export interface WebDavSyncSummary {
 }
 
 export interface WebDavDownloadResult {
+  status: SyncImportStatus;
   summary: WebDavSyncSummary;
+  review?: SyncImportReview;
   editorSettings?: unknown;
-  desktopSettings: DesktopSettings;
-  applySummary: {
-    encryptedSecretsPresent: boolean;
-    secretsApplied: boolean;
-  };
+  desktopSettings?: DesktopSettings;
+  applySummary?: SyncImportApplySummary;
 }
 
 export interface WebDavPasswordStatus {
@@ -2372,10 +2380,12 @@ export interface SnippetSyncSummary {
 }
 
 export interface SnippetDownloadResult {
+  status: SyncImportStatus;
   summary: SnippetSyncSummary;
+  review?: SyncImportReview;
   editorSettings?: unknown;
-  desktopSettings: DesktopSettings;
-  applySummary: WebDavDownloadResult["applySummary"];
+  desktopSettings?: DesktopSettings;
+  applySummary?: SyncImportApplySummary;
 }
 
 export interface SnippetTokenStatus {
@@ -2422,8 +2432,8 @@ export async function webdavSyncUpload(config: WebDavConfig, editorSettings?: un
   });
 }
 
-export async function webdavSyncDownload(config: WebDavConfig, secretsPassphrase?: string, restoreSecrets = true): Promise<WebDavDownloadResult> {
-  return post("/api/cloud-sync/webdav/download", { config, secretsPassphrase, restoreSecrets });
+export async function webdavSyncDownload(config: WebDavConfig, secretsPassphrase?: string, restoreSecrets = true, confirmation?: SyncImportConfirmation | null): Promise<WebDavDownloadResult> {
+  return post("/api/cloud-sync/webdav/download", { config, secretsPassphrase, restoreSecrets, confirmation: confirmation ?? undefined });
 }
 
 export async function snippetSyncTest(config: SnippetSyncConfig): Promise<void> {
@@ -2464,12 +2474,13 @@ export async function snippetSyncUpload(config: SnippetSyncConfig, editorSetting
   });
 }
 
-export async function snippetSyncDownload(config: SnippetSyncConfig, snippetPassphrase?: string, restoreSecrets = false, secretsPassphrase?: string): Promise<SnippetDownloadResult> {
+export async function snippetSyncDownload(config: SnippetSyncConfig, snippetPassphrase?: string, restoreSecrets = false, secretsPassphrase?: string, confirmation?: SyncImportConfirmation | null): Promise<SnippetDownloadResult> {
   return post("/api/cloud-sync/snippet/download", {
     config,
     snippetPassphrase,
     restoreSecrets,
     secretsPassphrase,
+    confirmation: confirmation ?? undefined,
   });
 }
 
@@ -2620,6 +2631,22 @@ export async function writeExternalSqlFile(_path: string, _content: string, _opt
 
 export async function saveExternalSqlFile(_defaultFileName: string, _content: string, _filterExtension?: string): Promise<{ path: string; version: import("@/types/database").ExternalSqlFileVersion } | null> {
   throw new Error("Saving SQL files locally is only available in the desktop app");
+}
+
+export async function pickExternalFiles(_options: import("@/lib/backend/tauri").PickExternalFilesOptions = {}): Promise<string[]> {
+  throw new Error("Native file pickers are only available in the desktop app");
+}
+
+export async function pickExternalDirectory(_title?: string): Promise<string | null> {
+  throw new Error("Native folder pickers are only available in the desktop app");
+}
+
+export async function pickExternalSavePath(_defaultFileName?: string, _extension?: string): Promise<string | null> {
+  throw new Error("Native save dialogs are only available in the desktop app");
+}
+
+export async function requestExternalPathAccess(_paths: string[], _directory: boolean): Promise<boolean> {
+  return false;
 }
 
 export interface SqlFileEntry {

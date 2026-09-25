@@ -163,6 +163,25 @@ export interface ConnectionConfig {
   production_databases?: string[];
   /** Metadata captured from the latest successful connection test for the saved config. */
   database_info?: DatabaseConnectionInfo;
+  /**
+   * Read-only, backend-provided: secret paths that are stored for this
+   * connection (e.g. `password`, `transport_layers.<id>.password`,
+   * `connection_secrets.<key>`). Stored secrets are never sent to the
+   * frontend; their fields arrive blank. See `lib/connection/savedSecrets.ts`.
+   */
+  saved_secrets?: string[];
+  /**
+   * Request-only: secret paths whose stored value must be deleted. A blank
+   * secret field keeps its stored value unless its path is listed here.
+   * Stripped by the backend before persisting.
+   */
+  cleared_secrets?: string[];
+  /**
+   * Request-only: when this config's id has no stored secrets yet (e.g. a
+   * duplicated connection), blank secret fields fall back to the stored
+   * secrets of this other saved connection. Stripped by the backend.
+   */
+  secrets_from_connection_id?: string;
 }
 
 export type IdentifierCase = "lower" | "upper" | "mixed";

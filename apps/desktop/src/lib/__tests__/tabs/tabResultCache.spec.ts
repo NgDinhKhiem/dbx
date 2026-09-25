@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { decodeTabResultSnapshot, encodeTabResultSnapshot, readResultCacheBackends, promoteFallbackResultCacheRead, resultCacheBackendOrder, resultCacheRuntimeConfig, selectResultCachePruneKeys, writeResultCacheBackends, type ResultCacheBackend } from "@/lib/tabs/tabResultCache";
+import { clearPersistedResultCache, decodeTabResultSnapshot, encodeTabResultSnapshot, readResultCacheBackends, promoteFallbackResultCacheRead, resultCacheBackendOrder, resultCacheRuntimeConfig, selectResultCachePruneKeys, writeResultCacheBackends, type ResultCacheBackend } from "@/lib/tabs/tabResultCache";
 import { queryResultLifecycleSnapshot } from "@/lib/__tests__/fixtures/queryResultLifecycle";
 
 function backend(name: ResultCacheBackend["name"], overrides: Partial<ResultCacheBackend> = {}): ResultCacheBackend {
@@ -19,7 +19,30 @@ function backend(name: ResultCacheBackend["name"], overrides: Partial<ResultCach
 describe("tab result cache statement execution metadata", () => {
   it("selects one authoritative backend before fallback", () => {
     expect(resultCacheBackendOrder(true)).toEqual(["runtime", "indexed-db"]);
-    expect(resultCacheBackendOrder(false)).toEqual(["indexed-db", "runtime"]);
+    expect(resultCacheBackendOrder(false, { primary: "indexed-db", fallbackEnabled: true })).toEqual(["indexed-db", "runtime"]);
+  });
+
+  it("never persists browser results to IndexedDB unless explicitly configured", () => {
+    const webDefault = resultCacheRuntimeConfig(false, {} as ImportMetaEnv);
+    expect(webDefault.primary).toBe("runtime");
+    expect(resultCacheBackendOrder(false, webDefault)).toEqual(["runtime"]);
+    expect(resultCacheRuntimeConfig(false, { VITE_DBX_RESULT_CACHE_BACKEND: "indexed-db" } as ImportMetaEnv).primary).toBe("indexed-db");
+    expect(resultCacheRuntimeConfig(true, { VITE_DBX_RESULT_CACHE_BACKEND: "indexed-db" } as ImportMetaEnv).primary).toBe("runtime");
+  });
+
+  it("clears the persisted browser result cache", async () => {
+    const deleteDatabase = vi.fn(() => {
+      const request = {} as { onsuccess?: () => void; onerror?: () => void; onblocked?: () => void };
+      queueMicrotask(() => request.onsuccess?.());
+      return request;
+    });
+    vi.stubGlobal("indexedDB", { deleteDatabase });
+    try {
+      await clearPersistedResultCache();
+      expect(deleteDatabase).toHaveBeenCalledWith("dbx-tab-runtime-cache");
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("uses explicit browser runtime configuration", () => {

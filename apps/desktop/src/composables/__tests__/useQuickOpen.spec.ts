@@ -1,10 +1,14 @@
 import { nextTick } from "vue";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { matchQuickOpenText, useQuickOpen } from "@/composables/useQuickOpen";
 import * as api from "@/lib/backend/api";
 import { getSqlFileFilter, getSqlFileFolderPaths, sqlFileFoldersVersion } from "@/lib/sqlFile/sqlFileFolders";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useSavedSqlStore } from "@/stores/savedSqlStore";
+import { loadPinyin } from "@/lib/common/pinyin";
+
+// pinyin-pro is lazy-loaded in the app; load it up front so Han initials resolve synchronously.
+beforeAll(() => loadPinyin());
 
 vi.mock("@/stores/connectionStore", () => ({
   useConnectionStore: vi.fn(),

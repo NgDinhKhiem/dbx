@@ -294,7 +294,17 @@ pub struct PluginMarketplace {
 impl PluginMarketplace {
     pub fn new(root_dir: PathBuf, app_version: impl Into<String>) -> Result<Self, String> {
         let client = Client::builder()
-            .redirect(Policy::limited(5))
+            // Redirects must not downgrade a download to plain HTTP: the
+            // package bytes and catalog are only as trustworthy as the transport.
+            .redirect(Policy::custom(|attempt| {
+                if attempt.previous().len() >= 5 {
+                    attempt.error("too many redirects")
+                } else if !is_secure_transport_url(attempt.url()) {
+                    attempt.error("redirect to a plain HTTP URL refused; use HTTPS")
+                } else {
+                    attempt.follow()
+                }
+            }))
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(300))
             .user_agent(format!("DBX/{}/plugin-marketplace", env!("CARGO_PKG_VERSION")))
@@ -677,7 +687,14 @@ fn validate_and_resolve_catalog(
             ));
         }
         if let Some(icon) = plugin.icon.as_deref().and_then(trimmed_nonempty) {
-            plugin.icon = Some(resolve_http_url(catalog_url, icon, "Plugin icon URL")?.to_string());
+            // Icons are cosmetic: an insecure icon URL is dropped rather than
+            // failing the whole catalog.
+            let icon = resolve_http_url(catalog_url, icon, "Plugin icon URL");
+            plugin.icon = match icon {
+                Ok(url) => Some(url.to_string()),
+                Err(error) if error.contains("must use HTTPS") => None,
+                Err(error) => return Err(error),
+            };
         }
     }
     Ok(())
@@ -804,7 +821,32 @@ fn ensure_http_url(url: Url, label: &str) -> Result<Url, String> {
     if url.host_str().is_none() {
         return Err(format!("{label} must include a host"));
     }
+    if !is_secure_transport_url(&url) {
+        return Err(format!("{label} must use HTTPS (plain http:// is only allowed for localhost)"));
+    }
     Ok(url)
+}
+
+/// HTTPS anywhere, plain HTTP only for loopback hosts (local development
+/// servers). Package signatures do not cover unsigned development installs or
+/// catalog metadata, so a network attacker must not be able to swap them.
+fn is_secure_transport_url(url: &Url) -> bool {
+    match url.scheme() {
+        "https" => true,
+        "http" => is_loopback_host(url),
+        _ => false,
+    }
+}
+
+fn is_loopback_host(url: &Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
 }
 
 fn trimmed_nonempty(value: &str) -> Option<&str> {
@@ -1432,6 +1474,36 @@ mod tests {
 
         assert_eq!(result.plugin.manifest.id, "marketplace.install");
         assert_eq!(result.signature, crate::plugins::PluginSignatureStatus::Unsigned);
+    }
+
+    #[test]
+    fn plain_http_is_only_accepted_for_loopback_hosts() {
+        for allowed in [
+            "https://plugins.example.com/plugin.dbxp",
+            "http://127.0.0.1:8080/plugin.dbxp",
+            "http://localhost/plugin.dbxp",
+            "http://[::1]:9000/catalog.json",
+        ] {
+            assert!(parse_http_url(allowed, "URL").is_ok(), "{allowed} should be accepted");
+        }
+        for refused in ["http://plugins.example.com/plugin.dbxp", "http://10.0.0.5/catalog.json", "http://localhost.evil.com/x"] {
+            let error = parse_http_url(refused, "URL").unwrap_err();
+            assert!(error.contains("must use HTTPS"), "unexpected error for {refused}: {error}");
+        }
+        let base = Url::parse("https://plugins.example.com/catalog/index.json").unwrap();
+        assert!(resolve_http_url(&base, "http://cdn.example.com/plugin.dbxp", "Plugin artifact URL").is_err());
+        assert!(resolve_http_url(&base, "../dist/plugin.dbxp", "Plugin artifact URL").is_ok());
+    }
+
+    #[tokio::test]
+    async fn refuses_plain_http_url_installs_for_remote_hosts() {
+        let root = tempfile::tempdir().unwrap();
+        let marketplace = PluginMarketplace::new(root.path().to_path_buf(), "0.5.68").unwrap();
+        let error = marketplace
+            .install_url_package("http://plugins.example.com/plugin.dbxp", PluginInstallPolicy::LocalSigned, |_, _| {})
+            .await
+            .unwrap_err();
+        assert!(error.contains("must use HTTPS"), "unexpected error: {error}");
     }
 
     #[tokio::test]

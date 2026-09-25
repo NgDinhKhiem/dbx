@@ -185,7 +185,7 @@ vi.mock("@/stores/settingsStore", () => ({
 vi.mock("@/lib/common/clipboard", () => ({ copyToClipboard: mocks.copyToClipboard }));
 vi.mock("@/composables/useTheme", () => ({ useTheme: () => ({ isDark: ref(false), themePalette: ref({}) }) }));
 vi.mock("@/composables/useToast", () => ({ useToast: () => ({ toast: mocks.toast }) }));
-vi.mock("@/lib/sql/sqlHighlighter", () => ({ createShikiSqlHighlighter: vi.fn(async () => (sql: string) => sql) }));
+vi.mock("@/lib/sql/sqlHighlighter", () => ({ createShikiSqlHighlighter: vi.fn(async () => (sql: string) => sql), escapeHtml: (sql: string) => sql.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") }));
 vi.mock("@/lib/editor/editorThemes", () => ({
   editorFontTheme: vi.fn(() => []),
   loadEditorTheme: vi.fn(async () => []),

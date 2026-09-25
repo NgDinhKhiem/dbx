@@ -1,4 +1,46 @@
-import { pinyin } from "pinyin-pro";
+import { shallowRef } from "vue";
+
+// pinyin-pro ships a large dictionary. It is only needed once text containing
+// Han characters is matched, so it is loaded on demand (and preloaded when the
+// app goes idle) instead of landing in the startup bundle.
+type PinyinFn = (typeof import("pinyin-pro"))["pinyin"];
+
+let pinyinImpl: PinyinFn | undefined;
+let pinyinLoad: Promise<void> | undefined;
+/**
+ * Bumped once pinyin-pro has loaded. Reactive consumers (computed search
+ * results) that matched Han text before then read it and re-evaluate.
+ */
+const pinyinReadyVersion = shallowRef(0);
+
+/** Loads pinyin-pro; resolves immediately once loaded. Safe to call repeatedly. */
+export function loadPinyin(): Promise<void> {
+  if (pinyinImpl) return Promise.resolve();
+  pinyinLoad ??= import("pinyin-pro").then(
+    (module) => {
+      pinyinImpl = module.pinyin;
+      pinyinReadyVersion.value += 1;
+    },
+    (error) => {
+      // Allow a later retry (e.g. a transient chunk load failure).
+      pinyinLoad = undefined;
+      throw error;
+    },
+  );
+  return pinyinLoad;
+}
+
+export function isPinyinLoaded(): boolean {
+  return pinyinImpl !== undefined;
+}
+
+/** Preloads pinyin-pro once the app is idle so the first Han search is complete. */
+export function preloadPinyinWhenIdle(): void {
+  if (pinyinImpl || pinyinLoad || typeof window === "undefined") return;
+  const start = () => void loadPinyin().catch((error) => console.warn("[DBX][pinyin] Failed to load pinyin-pro:", error));
+  if (typeof window.requestIdleCallback === "function") window.requestIdleCallback(start, { timeout: 10_000 });
+  else window.setTimeout(start, 2_000);
+}
 
 const HAN_CHAR = /\p{Script=Han}/u;
 const ASCII_ALNUM = /[a-z0-9]/i;
@@ -23,7 +65,9 @@ export function containsHan(text: string): boolean {
  * as-is (lowercased) and every other character dropped. Used for DataGrip-style
  * initials matching, e.g. pinyinFirstLetters("总租金") === "zzj".
  *
- * Only the default reading is used for polyphonic characters.
+ * Only the default reading is used for polyphonic characters. Until pinyin-pro
+ * has loaded (see `loadPinyin`), Han characters are skipped and the result is
+ * not cached; reactive callers re-run automatically once it is available.
  */
 export function pinyinFirstLetters(text: string): string {
   const cached = firstLetterCache.get(text);
@@ -32,15 +76,29 @@ export function pinyinFirstLetters(text: string): string {
     firstLetterCache.set(text, cached);
     return cached;
   }
+  const pinyin = pinyinImpl;
   let result = "";
+  let complete = true;
   for (const char of text) {
     if (HAN_CHAR.test(char)) {
-      result += pinyin(char, { pattern: "first", toneType: "none" });
+      if (pinyin) {
+        result += pinyin(char, { pattern: "first", toneType: "none" });
+      } else {
+        // Not loaded yet: Han characters contribute no initials for now.
+        complete = false;
+      }
     } else if (ASCII_ALNUM.test(char)) {
       result += char.toLowerCase();
     }
   }
-  cacheFirstLetters(text, result);
+  if (complete) {
+    cacheFirstLetters(text, result);
+  } else {
+    // Track the load so reactive callers recompute with real initials, and
+    // start it now in case the idle preload has not run yet.
+    void pinyinReadyVersion.value;
+    void loadPinyin().catch((error) => console.warn("[DBX][pinyin] Failed to load pinyin-pro:", error));
+  }
   return result;
 }
 
@@ -91,3 +149,5 @@ export function pinyinAwareMatchScore(candidate: string, query: string): number 
   }
   return -1;
 }
+
+preloadPinyinWhenIdle();

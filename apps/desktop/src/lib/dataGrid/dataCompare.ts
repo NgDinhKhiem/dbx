@@ -224,3 +224,26 @@ export function matchColumnNameIgnoreCase(name: string, columns: string[]): stri
   const lowerName = name.toLowerCase();
   return columns.find((column) => column.toLowerCase() === lowerName);
 }
+
+export type DataCompareTruncationNotice = "missingTargetTooLarge" | "partial";
+
+/**
+ * Why a table's compare result is incomplete, if it is. The backend stops at
+ * `fullCompareMaxRows`: for a missing target table it then emits only the
+ * CREATE TABLE statements (no row inserts), and for an existing target it
+ * compares a capped row set, so the generated sync SQL may be partial.
+ */
+export function dataCompareTruncationNotice(item: {
+  sourceTruncated: boolean;
+  targetTruncated: boolean;
+  targetRowCount: number;
+  added: number;
+  removed: number;
+  modified: number;
+  preSyncStatements?: readonly string[];
+}): DataCompareTruncationNotice | undefined {
+  if (!item.sourceTruncated && !item.targetTruncated) return undefined;
+  const noRowChanges = item.added + item.removed + item.modified === 0;
+  if (item.sourceTruncated && !item.targetTruncated && item.targetRowCount === 0 && noRowChanges && (item.preSyncStatements?.length ?? 0) > 0) return "missingTargetTooLarge";
+  return "partial";
+}

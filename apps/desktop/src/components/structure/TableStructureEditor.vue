@@ -30,7 +30,7 @@ import { editorFontTheme, loadEditorTheme } from "@/lib/editor/editorThemes";
 import { createDbxCodeMirrorSqlDialect } from "@/lib/editor/codemirrorSqlDialect";
 import { useToast } from "@/composables/useToast";
 import { useVerticalOverlayScrollbar } from "@/composables/useVerticalOverlayScrollbar";
-import { type SqlHighlighter, createShikiSqlHighlighter } from "@/lib/sql/sqlHighlighter";
+import { type SqlHighlighter, createShikiSqlHighlighter, escapeHtml } from "@/lib/sql/sqlHighlighter";
 import { joinSqlStatementsForScript } from "@/lib/sql/sqlBatchScript";
 import { applyDdlDatabaseQualifier, formatGeneratedDdlIdentifierQuotes, omitDdlIdentifierQuotes } from "@/lib/sql/ddlDisplay";
 import { splitSqlStatementRanges } from "@/lib/sql/sqlStatementRanges";
@@ -176,7 +176,9 @@ onMounted(async () => {
 const highlightedSql = computed(() => {
   if (!pendingStatements.value.length) return "";
   const sql = previewSqlText.value;
-  return sqlHighlighter.value?.(sql) ?? sql;
+  // v-html sink: until shiki loads, the preview must still be escaped because
+  // it embeds column names, comments and defaults verbatim.
+  return sqlHighlighter.value?.(sql) ?? escapeHtml(sql);
 });
 const previewSqlText = computed(() => joinSqlStatementsForScript(pendingStatements.value, databaseType.value));
 

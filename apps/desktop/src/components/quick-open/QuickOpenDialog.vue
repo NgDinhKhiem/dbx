@@ -11,6 +11,7 @@ import { useToast } from "@/composables/useToast";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { formatShortcutDisplay } from "@/lib/editor/shortcutDisplay";
 import { getGlobalSearchRoots, saveGlobalSearchRoots, getGlobalSearchExtensions, saveGlobalSearchExtensions } from "@/lib/globalSearch/globalSearchSettings";
+import * as api from "@/lib/backend/api";
 
 const props = defineProps<{
   open: boolean;
@@ -46,11 +47,10 @@ function refreshSearchSettings(): void {
 
 async function addSearchDirectory(): Promise<void> {
   try {
-    const { open } = await import("@tauri-apps/plugin-dialog");
-    const selected = await open({ directory: true, multiple: true });
+    // Backend picker: content search only walks folders granted this way.
+    const selected = await api.pickExternalDirectory();
     if (!selected) return;
-    const chosen = Array.isArray(selected) ? selected : [selected];
-    const next = [...new Set([...searchRoots.value, ...chosen.filter((p): p is string => typeof p === "string")])];
+    const next = [...new Set([...searchRoots.value, selected])];
     saveGlobalSearchRoots(next);
     refreshSearchSettings();
   } catch {
