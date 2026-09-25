@@ -1,7 +1,7 @@
 use percent_encoding::percent_decode_str;
 use rusqlite::functions::{Context, FunctionFlags};
 use rusqlite::types::{Value, ValueRef};
-use rusqlite::{Connection, LoadExtensionGuard, OpenFlags};
+use rusqlite::{Connection, InterruptHandle, LoadExtensionGuard, OpenFlags};
 use sqlparser::ast::Statement;
 use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::Parser;
@@ -31,6 +31,10 @@ const SQLITE_LEGACY_PAGE_SIZES: &[i64] = &[4096, 1024, 512, 2048, 8192, 16384, 3
 #[derive(Clone)]
 pub struct SqliteHandle {
     conn: Option<Arc<Mutex<Connection>>>,
+    /// Captured when the connection opens so interrupting a running statement
+    /// never has to take `conn`'s lock, which that statement holds for its
+    /// whole duration.
+    interrupt: Option<Arc<InterruptHandle>>,
     worker: Option<Arc<super::sqlite_worker::SqliteWorkerClient>>,
 }
 
@@ -42,7 +46,7 @@ pub struct SqliteExtensionSpec {
 
 impl SqliteHandle {
     pub fn from_worker(worker: Arc<super::sqlite_worker::SqliteWorkerClient>) -> Self {
-        Self { conn: None, worker: Some(worker) }
+        Self { conn: None, interrupt: None, worker: Some(worker) }
     }
 
     pub fn is_remote(&self) -> bool {
@@ -59,6 +63,17 @@ impl SqliteHandle {
         }
     }
 
+    /// Returns a lock-free closure that interrupts the statement currently
+    /// running on the local connection (no-op when none is running). `None`
+    /// for remote worker sessions.
+    pub fn interrupter(&self) -> Option<impl Fn() + Send + Sync + 'static> {
+        let interrupt = self.interrupt.clone()?;
+        Some(move || interrupt.interrupt())
+    }
+
+    /// Runs `f` with the connection locked. This blocks the calling thread
+    /// while another statement runs, so call it only from blocking contexts
+    /// (e.g. inside `tokio::task::spawn_blocking`), never directly from async code.
     pub fn with_connection<T, F>(&self, f: F) -> Result<T, String>
     where
         F: FnOnce(&mut Connection) -> Result<T, String>,
@@ -209,7 +224,8 @@ fn open_sqlite_handle(
         load_sqlite_extensions(&conn, &extensions)?;
         register_sqlite_compat_functions(&conn)?;
 
-        return Ok(SqliteHandle { conn: Some(Arc::new(Mutex::new(conn))), worker: None });
+        let interrupt = Arc::new(conn.get_interrupt_handle());
+        return Ok(SqliteHandle { conn: Some(Arc::new(Mutex::new(conn))), interrupt: Some(interrupt), worker: None });
     }
 
     Err(unlock_error.unwrap_or_else(|| "Encrypted SQLite database unlock failed.".to_string()))
@@ -675,6 +691,79 @@ mod tests {
         let result = execute_query(&pool, "SELECT name FROM memory_probe WHERE id = 1;").await.expect("select row");
 
         assert_eq!(result.rows[0][0], serde_json::json!("Ada"));
+    }
+
+    #[tokio::test]
+    async fn timed_out_statement_is_interrupted_and_releases_the_connection() {
+        let pool = connect_path(":memory:").await.expect("connect in-memory SQLite");
+        assert!(pool.interrupter().is_some(), "local handles expose a lock-free interrupter");
+        let slow = "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 200000000) \
+                    SELECT count(*) FROM cnt";
+        let timed_out =
+            tokio::time::timeout(std::time::Duration::from_millis(50), execute_query_with_max_rows(&pool, slow, None))
+                .await;
+        assert!(timed_out.is_err(), "the slow statement must still be running when the timeout fires");
+
+        // Without the interrupt the abandoned statement keeps the lock for seconds.
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), execute_query(&pool, "SELECT 1"))
+            .await
+            .expect("the next query must not wait for the abandoned statement")
+            .expect("next query succeeds");
+        assert_eq!(result.rows[0][0], serde_json::json!(1));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn statement_abandoned_while_waiting_for_the_lock_never_runs() {
+        use std::sync::mpsc;
+
+        let pool = connect_path(":memory:").await.expect("connect in-memory SQLite");
+        execute_query(&pool, "CREATE TABLE t (id INTEGER)").await.expect("create table");
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let holder = {
+            let pool = pool.clone();
+            std::thread::spawn(move || {
+                pool.with_connection(|_conn| {
+                    let _ = locked_tx.send(());
+                    let _ = release_rx.recv();
+                    Ok(())
+                })
+                .expect("hold the connection lock");
+            })
+        };
+        locked_rx.recv().expect("helper holds the lock");
+        let timed_out = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            execute_query_with_max_rows(&pool, "INSERT INTO t VALUES (1)", None),
+        )
+        .await;
+        assert!(timed_out.is_err());
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+
+        let result = execute_query(&pool, "SELECT COUNT(*) FROM t").await.expect("count rows");
+        assert_eq!(result.rows[0][0], serde_json::json!(0), "the abandoned INSERT must not run later");
+    }
+
+    #[test]
+    fn abandoning_a_finished_statement_does_not_interrupt_later_statements() {
+        let conn = Connection::open_in_memory().unwrap();
+        let interrupt = Some(Arc::new(conn.get_interrupt_handle()));
+        let pool = SqliteHandle { conn: Some(Arc::new(Mutex::new(conn))), interrupt, worker: None };
+        let finished = StatementExecution::new(&pool);
+        drop(finished.begin().unwrap());
+        finished.abandon();
+        assert_eq!(*finished.state.lock().unwrap(), StatementState::Finished);
+        let sql = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 1000) SELECT count(*) FROM c";
+        let count: i64 =
+            pool.with_connection(|conn| conn.query_row(sql, [], |row| row.get(0)).map_err(|e| e.to_string())).unwrap();
+        assert_eq!(count, 1000);
+
+        let pending = StatementExecution::new(&pool);
+        pending.abandon();
+        assert!(pending.begin().is_err(), "an abandoned statement must not start");
     }
 
     #[tokio::test]
@@ -2859,9 +2948,92 @@ pub async fn execute_query_with_max_rows(
         return worker.query(&sql, max_rows).await;
     }
     let pool = pool.clone();
-    tokio::task::spawn_blocking(move || execute_query_blocking(&pool, &sql, max_rows, None))
+    let execution = StatementExecution::new(&pool);
+    let _abandon_on_drop = execution.abandon_on_drop();
+    tokio::task::spawn_blocking(move || execute_query_blocking(&pool, &sql, max_rows, None, Some(&execution)))
         .await
         .map_err(|e| e.to_string())?
+}
+
+/// Ties one local statement to the future awaiting it. If that future is
+/// dropped before the statement finishes (query timeout, cancellation), the
+/// statement is interrupted so it releases the connection lock instead of
+/// running on in `spawn_blocking` and stalling the next query; if it has not
+/// started yet (still waiting for the lock) it is skipped. The state machine
+/// guarantees the interrupt only ever reaches this statement, never a later
+/// one on the same connection.
+#[derive(Clone)]
+struct StatementExecution {
+    state: Arc<Mutex<StatementState>>,
+    interrupt: Option<Arc<InterruptHandle>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatementState {
+    Pending,
+    Running,
+    Finished,
+    Abandoned,
+}
+
+impl StatementExecution {
+    fn new(pool: &SqliteHandle) -> Self {
+        Self { state: Arc::new(Mutex::new(StatementState::Pending)), interrupt: pool.interrupt.clone() }
+    }
+
+    /// Called with the connection lock held. Returns a guard that marks the
+    /// statement finished when dropped (still under the connection lock).
+    fn begin(&self) -> Result<StatementRunning<'_>, String> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if *state == StatementState::Abandoned {
+            return Err("Query was cancelled before it started".to_string());
+        }
+        *state = StatementState::Running;
+        Ok(StatementRunning { execution: self })
+    }
+
+    /// Returns a guard that abandons (and interrupts) the statement unless it
+    /// has already finished when the guard is dropped.
+    fn abandon_on_drop(&self) -> AbandonStatementOnDrop {
+        AbandonStatementOnDrop { execution: self.clone() }
+    }
+
+    fn abandon(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        match *state {
+            StatementState::Running => {
+                // Interrupt while holding `state`: the statement cannot report
+                // Finished (and so release the connection to another statement)
+                // until this returns.
+                if let Some(interrupt) = &self.interrupt {
+                    interrupt.interrupt();
+                }
+                *state = StatementState::Abandoned;
+            }
+            StatementState::Pending => *state = StatementState::Abandoned,
+            StatementState::Finished | StatementState::Abandoned => {}
+        }
+    }
+}
+
+struct StatementRunning<'a> {
+    execution: &'a StatementExecution,
+}
+
+impl Drop for StatementRunning<'_> {
+    fn drop(&mut self) {
+        *self.execution.state.lock().unwrap_or_else(|e| e.into_inner()) = StatementState::Finished;
+    }
+}
+
+struct AbandonStatementOnDrop {
+    execution: StatementExecution,
+}
+
+impl Drop for AbandonStatementOnDrop {
+    fn drop(&mut self) {
+        self.execution.abandon();
+    }
 }
 
 /// Progress-aware variant of [`execute_query_with_max_rows`] for long transfers.
@@ -2886,11 +3058,15 @@ pub async fn execute_query_with_max_rows_progress(
     let pool = pool.clone();
     let timeout_error = format!("Query timed out after {} seconds", timeout.map_or(0, |timeout| timeout.as_secs()));
     let clock_for_query = progress_clock.clone();
+    let execution = StatementExecution::new(&pool);
+    let _abandon_on_drop = execution.abandon_on_drop();
     crate::execution::await_stream_with_progress_timeout(
         async move {
-            tokio::task::spawn_blocking(move || execute_query_blocking(&pool, &sql, max_rows, Some(&clock_for_query)))
-                .await
-                .map_err(|e| e.to_string())?
+            tokio::task::spawn_blocking(move || {
+                execute_query_blocking(&pool, &sql, max_rows, Some(&clock_for_query), Some(&execution))
+            })
+            .await
+            .map_err(|e| e.to_string())?
         },
         timeout,
         progress_clock,
@@ -2905,11 +3081,14 @@ fn execute_query_blocking(
     sql: &str,
     max_rows: Option<usize>,
     progress_clock: Option<&crate::execution::StreamProgressClock>,
+    execution: Option<&StatementExecution>,
 ) -> Result<QueryResult, String> {
     let start = Instant::now();
     let row_limit = query_result_row_limit(max_rows);
 
     pool.with_connection(|conn| {
+        // Dropped at the end of this closure, i.e. before the lock is released.
+        let _running = execution.map(StatementExecution::begin).transpose()?;
         if sqlite_statement_returns_rows(sql) {
             let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
             let columns = stmt.column_names().iter().map(|name| name.to_string()).collect::<Vec<_>>();

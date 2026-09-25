@@ -1917,6 +1917,9 @@ async fn execute_select_prepared(
             .filter_map(|(index, col_type)| (*col_type == PgColType::Geometry).then_some(index)),
     );
     let mut truncated = false;
+    // Per-cell SRIDs are only needed when the result has geometry columns; skip
+    // the per-row allocation for every other result.
+    let has_geometry = column_classes.contains(&PgColType::Geometry);
 
     let rows_start = Instant::now();
     while let Some(row_result) = stream.next().await {
@@ -1928,19 +1931,22 @@ async fn execute_select_prepared(
             break;
         }
         let row = row_result?;
-        let mut values = Vec::with_capacity(row.columns().len());
-        let mut row_srids = vec![None; row.columns().len()];
-        for (i, row_srid) in row_srids.iter_mut().enumerate() {
+        let column_count = row.columns().len();
+        let mut values = Vec::with_capacity(column_count);
+        let mut row_srids = if has_geometry { vec![None; column_count] } else { Vec::new() };
+        for i in 0..column_count {
             let col_type = column_classes.get(i).copied().unwrap_or(PgColType::Other);
             let (value, srid) = pg_value_to_json_with_srid(&row, i, col_type);
             if col_type == PgColType::Geometry {
                 spatial_columns.observe(i, srid);
-                *row_srid = srid;
+                row_srids[i] = srid;
             }
             values.push(value);
         }
         result_rows.push(values);
-        spatial_values.push(row_srids);
+        if has_geometry {
+            spatial_values.push(row_srids);
+        }
     }
     log::info!(
         "[postgres][select:rows:done] elapsed_ms={} total_ms={} row_count={} truncated={}",
@@ -2016,8 +2022,10 @@ async fn execute_select_text(
                     break;
                 }
                 let mut values = Vec::with_capacity(row.len());
-                let mut row_srids = vec![None; row.len()];
-                for (i, row_srid) in row_srids.iter_mut().enumerate() {
+                // Text values of unknown type are sniffed for geometry, so the
+                // SRID matrix is allocated lazily on the first spatial cell.
+                let mut row_srids: Option<Vec<Option<u32>>> = None;
+                for i in 0..row.len() {
                     match row.try_get(i).map_err(pg_error_to_string)? {
                         Some(value) => {
                             let (decoded, srid, is_spatial) =
@@ -2025,7 +2033,7 @@ async fn execute_select_text(
                             values.push(decoded);
                             if is_spatial {
                                 spatial_columns.observe(i, srid);
-                                *row_srid = srid;
+                                row_srids.get_or_insert_with(|| vec![None; row.len()])[i] = srid;
                             }
                         }
                         None => {
@@ -2033,8 +2041,8 @@ async fn execute_select_text(
                         }
                     }
                 }
+                push_lazy_spatial_row(&mut spatial_values, result_rows.len(), row.len(), row_srids);
                 result_rows.push(values);
-                spatial_values.push(row_srids);
             }
             Err(_) if result_rows.len() >= row_limit => {
                 truncated = true;
@@ -2046,7 +2054,11 @@ async fn execute_select_text(
         }
     }
 
-    let (spatial_columns, spatial_values) = spatial_columns.finish_with_values(spatial_values);
+    let (spatial_columns, mut spatial_values) = spatial_columns.finish_with_values(spatial_values);
+    if !spatial_columns.is_empty() {
+        // Geometry columns whose cells were all NULL never started the lazy matrix.
+        spatial_values.resize(result_rows.len(), vec![None; columns.len()]);
+    }
     Ok(QueryResult {
         column_types: matching_pg_text_column_types(&columns, prepared_column_types),
         columns,
@@ -2063,6 +2075,25 @@ async fn execute_select_text(
         elasticsearch_raw_body: None,
         messages: Vec::new(),
     })
+}
+
+/// Appends one row of per-cell SRIDs without materializing an all-`None`
+/// matrix for results that contain no spatial values. Once the first spatial
+/// cell appears, earlier rows are backfilled so rows and SRIDs stay aligned.
+fn push_lazy_spatial_row(
+    spatial_values: &mut Vec<Vec<Option<u32>>>,
+    row_index: usize,
+    column_count: usize,
+    row_srids: Option<Vec<Option<u32>>>,
+) {
+    match row_srids {
+        Some(srids) => {
+            spatial_values.resize(row_index, vec![None; column_count]);
+            spatial_values.push(srids);
+        }
+        None if !spatial_values.is_empty() => spatial_values.push(vec![None; column_count]),
+        None => {}
+    }
 }
 
 async fn finish_prepared_select(
@@ -2506,7 +2537,52 @@ fn postgres_connection_key_from_row(row: &Row) -> Option<PostgresConnectionKey> 
 /// Notice buffers for live connections, keyed by connection identity. Entries
 /// are weak so they disappear once the pooled connection (and its driver
 /// task) is dropped.
-type PostgresNoticeBuffers = HashMap<PostgresConnectionKey, Weak<Mutex<Vec<QueryMessage>>>>;
+type PostgresNoticeBuffers = HashMap<PostgresConnectionKey, Weak<Mutex<PostgresNoticeBuffer>>>;
+
+/// Notices kept per statement; a `RAISE NOTICE` loop must not grow the
+/// buffer (and the result payload) without bound.
+const MAX_POSTGRES_NOTICES_PER_STATEMENT: usize = 1000;
+
+/// Per-connection notice buffer, drained around every statement. Notices past
+/// [`MAX_POSTGRES_NOTICES_PER_STATEMENT`] are counted instead of stored and
+/// reported as one trailing "N notices dropped" message.
+#[derive(Debug, Default)]
+struct PostgresNoticeBuffer {
+    messages: Vec<QueryMessage>,
+    dropped: usize,
+}
+
+impl PostgresNoticeBuffer {
+    #[cfg(test)]
+    fn from_messages(messages: Vec<QueryMessage>) -> Self {
+        Self { messages, dropped: 0 }
+    }
+
+    fn push(&mut self, message: QueryMessage) {
+        if self.messages.len() < MAX_POSTGRES_NOTICES_PER_STATEMENT {
+            self.messages.push(message);
+        } else {
+            self.dropped += 1;
+        }
+    }
+
+    fn take(&mut self) -> Vec<QueryMessage> {
+        let dropped = std::mem::take(&mut self.dropped);
+        let mut messages = std::mem::take(&mut self.messages);
+        if dropped > 0 {
+            messages.push(QueryMessage {
+                severity: "WARNING".to_string(),
+                message: format!(
+                    "{dropped} notices dropped (only the first {MAX_POSTGRES_NOTICES_PER_STATEMENT} notices of a statement are kept)"
+                ),
+                code: None,
+                detail: None,
+                hint: None,
+            });
+        }
+        messages
+    }
+}
 
 fn postgres_notice_buffers() -> &'static Mutex<PostgresNoticeBuffers> {
     static BUFFERS: OnceLock<Mutex<PostgresNoticeBuffers>> = OnceLock::new();
@@ -2564,7 +2640,7 @@ where
             // No query can complete before the connection is being driven, so
             // the notice buffer is handed to the driver task through a slot
             // that is filled once the backend PID is known.
-            let notice_buffer = Arc::new(Mutex::new(None::<Arc<Mutex<Vec<QueryMessage>>>>));
+            let notice_buffer = Arc::new(Mutex::new(None::<Arc<Mutex<PostgresNoticeBuffer>>>));
             let task_buffer = Arc::clone(&notice_buffer);
             let conn_task = tokio::spawn(async move {
                 loop {
@@ -2603,7 +2679,7 @@ where
             // by the driver task instead. Never fail the connection over this.
             if let Ok(row) = client.query_one(POSTGRES_CONNECTION_IDENTITY_SQL, &[]).await {
                 if let Some(key) = postgres_connection_key_from_row(&row) {
-                    let buffer = Arc::new(Mutex::new(Vec::new()));
+                    let buffer = Arc::new(Mutex::new(PostgresNoticeBuffer::default()));
                     let mut buffers = postgres_notice_buffers().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     buffers.retain(|_, weak| weak.strong_count() > 0);
                     buffers.insert(key, Arc::downgrade(&buffer));
@@ -2666,7 +2742,7 @@ fn take_notices_for_key(key: &PostgresConnectionKey) -> Vec<QueryMessage> {
     let Some(buffer) = buffer else {
         return Vec::new();
     };
-    let notices = std::mem::take(&mut *buffer.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+    let notices = buffer.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
     notices
 }
 
@@ -10537,7 +10613,10 @@ mod tests {
     #[test]
     fn take_notices_for_key_returns_buffered_notices_and_empties_buffer() {
         let key = ("test-host".to_string(), "9000001".to_string(), "9000001".to_string());
-        let buffer = Arc::new(Mutex::new(vec![test_query_message("first"), test_query_message("second")]));
+        let buffer = Arc::new(Mutex::new(PostgresNoticeBuffer::from_messages(vec![
+            test_query_message("first"),
+            test_query_message("second"),
+        ])));
         postgres_notice_buffers()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -10559,11 +10638,41 @@ mod tests {
     }
 
     #[test]
+    fn lazy_spatial_rows_allocate_nothing_until_a_spatial_cell_and_then_backfill() {
+        let mut spatial_values = Vec::new();
+        push_lazy_spatial_row(&mut spatial_values, 0, 2, None);
+        push_lazy_spatial_row(&mut spatial_values, 1, 2, None);
+        assert!(spatial_values.is_empty(), "non-spatial rows must not allocate SRID slots");
+
+        push_lazy_spatial_row(&mut spatial_values, 2, 2, Some(vec![None, Some(4326)]));
+        push_lazy_spatial_row(&mut spatial_values, 3, 2, None);
+        assert_eq!(spatial_values, vec![vec![None, None], vec![None, None], vec![None, Some(4326)], vec![None, None]]);
+    }
+
+    #[test]
+    fn notice_buffer_caps_messages_per_statement_and_reports_the_dropped_count() {
+        let mut buffer = PostgresNoticeBuffer::default();
+        for index in 0..MAX_POSTGRES_NOTICES_PER_STATEMENT + 25 {
+            buffer.push(test_query_message(&format!("notice {index}")));
+        }
+        let notices = buffer.take();
+        assert_eq!(notices.len(), MAX_POSTGRES_NOTICES_PER_STATEMENT + 1);
+        assert_eq!(notices[0].message, "notice 0");
+        assert!(notices.last().unwrap().message.starts_with("25 notices dropped"), "{}", notices.last().unwrap().message);
+
+        // The next statement starts with an empty buffer and no dropped count.
+        buffer.push(test_query_message("next"));
+        let notices = buffer.take();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].message, "next");
+    }
+
+    #[test]
     fn take_notices_for_key_prunes_dead_buffers_and_misses_return_empty() {
         let live_key = ("test-host".to_string(), "9000002".to_string(), "9000002".to_string());
         let dead_key = ("test-host".to_string(), "9000003".to_string(), "9000003".to_string());
-        let live = Arc::new(Mutex::new(vec![test_query_message("live")]));
-        let dead = Arc::new(Mutex::new(vec![test_query_message("dead")]));
+        let live = Arc::new(Mutex::new(PostgresNoticeBuffer::from_messages(vec![test_query_message("live")])));
+        let dead = Arc::new(Mutex::new(PostgresNoticeBuffer::from_messages(vec![test_query_message("dead")])));
         {
             let mut buffers = postgres_notice_buffers().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             buffers.insert(live_key.clone(), Arc::downgrade(&live));
@@ -10591,8 +10700,8 @@ mod tests {
         // keeps notice attribution separate.
         let key_a = ("server-a".to_string(), "5432".to_string(), "42".to_string());
         let key_b = ("server-b".to_string(), "5432".to_string(), "42".to_string());
-        let buffer_a = Arc::new(Mutex::new(vec![test_query_message("from-a")]));
-        let buffer_b = Arc::new(Mutex::new(vec![test_query_message("from-b")]));
+        let buffer_a = Arc::new(Mutex::new(PostgresNoticeBuffer::from_messages(vec![test_query_message("from-a")])));
+        let buffer_b = Arc::new(Mutex::new(PostgresNoticeBuffer::from_messages(vec![test_query_message("from-b")])));
         {
             let mut buffers = postgres_notice_buffers().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             buffers.insert(key_a.clone(), Arc::downgrade(&buffer_a));

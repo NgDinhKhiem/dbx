@@ -991,6 +991,7 @@ async fn forward_loop(
     listener: &TcpListener,
     target: &TunnelTarget,
     allow_exec_channel_proxy: bool,
+    bridges: &mut tokio::task::JoinSet<()>,
 ) {
     let mut idle_check = tokio::time::interval(IDLE_SESSION_CHECK_INTERVAL);
     idle_check.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -998,6 +999,7 @@ async fn forward_loop(
     loop {
         let accepted = tokio::select! {
             result = listener.accept() => result,
+            Some(_) = bridges.join_next(), if !bridges.is_empty() => continue,
             _ = idle_check.tick() => {
                 if session.is_closed() {
                     log::warn!("SSH session closed while tunnel was idle");
@@ -1115,7 +1117,7 @@ async fn forward_loop(
             }
         }
 
-        tokio::spawn(async move {
+        bridges.spawn(async move {
             let mut channel_stream = channel.into_stream();
             if let Err(e) = tokio::io::copy_bidirectional(&mut stream, &mut channel_stream).await {
                 log::debug!("SSH tunnel stream ended with an I/O error: {e}");
@@ -1150,13 +1152,16 @@ async fn tunnel_reconnect_loop(
     allow_exec_channel_proxy: bool,
     status: Arc<TunnelStatus>,
 ) {
+    // Bridges are owned by this task so aborting it (`stop_tunnel`) also
+    // aborts every forwarded connection instead of leaving them running.
+    let mut bridges = tokio::task::JoinSet::new();
     loop {
         // Reaching the top of the loop means a live session: either the initial
         // handshake or a successful reconnect. Clear any recorded failure.
         status.mark_connected();
         log::info!("SSH tunnel active: {}:{} -> {}", connect_host, connect_port, target.description());
 
-        forward_loop(&session, &listener, &target, allow_exec_channel_proxy).await;
+        forward_loop(&session, &listener, &target, allow_exec_channel_proxy, &mut bridges).await;
 
         status.mark_disconnected();
         log::warn!("SSH tunnel connection lost ({}:{}), reconnecting...", connect_host, connect_port);

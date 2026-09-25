@@ -44,6 +44,14 @@ const ARCHIVE_EXTRACT_BACKOFF_MS: &[u64] = &[100, 250, 500];
 /// the download server, local disk, or the application's file descriptors.
 const MAX_CONCURRENT_AGENT_UPDATES: usize = 4;
 
+/// Runs blocking filesystem work (archive extraction, directory removal with
+/// sleep-based retries) off the async runtime's worker threads.
+async fn run_blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tokio::task::spawn_blocking(work).await.map_err(|error| format!("Blocking agent file task failed: {error}"))?
+}
+
 /// Delete an old JRE directory, retrying on Windows to cover the daemon-exit
 /// and AV-scan release window. Returns the original `std::io::Error` when all
 /// retries fail so callers can decide whether to fall back to rename-stash.
@@ -562,21 +570,97 @@ async fn fetch_registry_from_urls(
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|err| format!("Failed to create HTTP client: {err}"))?;
-    let resp = open_download_response(&client, urls, "dbx-agent-manager", cancellations)
-        .await
-        .map_err(|err| format!("Failed to fetch agent registry: {err}"))?;
-    // Race the body parse too: a stalled/partial body must not hold the
+    let trusted_keys = crate::agent_registry_signature::trusted_registry_keys()?;
+    if trusted_keys.is_empty() {
+        crate::agent_registry_signature::warn_unsigned_registry_once();
+    }
+    // Mirrors are tried in order; a mirror whose registry is unreachable,
+    // unparsable or (when keys are configured) not validly signed is skipped.
+    let mut errors = Vec::new();
+    for url in urls {
+        match fetch_registry_candidate(&client, url, &trusted_keys, cancellations).await {
+            Ok(registry) => {
+                REGISTRY_CACHE.lock().await.insert(source, (std::time::Instant::now(), registry.clone()));
+                return Ok(registry);
+            }
+            Err(error) if error == AGENT_DOWNLOAD_CANCELED_ERROR => return Err(error),
+            Err(error) => errors.push(error),
+        }
+    }
+    Err(format!("Failed to fetch agent registry: {}", errors.join("; ")))
+}
+
+const MAX_ONLINE_REGISTRY_BYTES: usize = 8 * 1024 * 1024;
+
+/// Fetches one mirror's registry and, when trusted keys are configured, its
+/// detached signature from the same mirror (`<registry url>.sig`). The
+/// signature covers the exact bytes that are then parsed.
+async fn fetch_registry_candidate(
+    client: &reqwest::Client,
+    url: &str,
+    trusted_keys: &[ed25519_dalek::VerifyingKey],
+    cancellations: &[&AgentInstallCancellation],
+) -> Result<AgentRegistry, String> {
+    let resp = open_download_response(client, &[url.to_string()], "dbx-agent-manager", cancellations).await?;
+    // Race the body read too: a stalled/partial body must not hold the
     // registry fetch hostage until the 10s client timeout.
-    let registry: AgentRegistry = if cancellations.is_empty() {
-        resp.json().await.map_err(|err| format!("Failed to parse registry: {err}"))?
+    let bytes = read_limited_response_body(resp, MAX_ONLINE_REGISTRY_BYTES, cancellations)
+        .await
+        .map_err(|err| cancel_or(err, |err| format!("{url}: failed to read registry: {err}")))?;
+    if !trusted_keys.is_empty() {
+        let signature_url = format!("{url}{}", crate::agent_registry_signature::AGENT_REGISTRY_SIGNATURE_SUFFIX);
+        let signature_resp =
+            open_download_response(client, std::slice::from_ref(&signature_url), "dbx-agent-manager", cancellations)
+                .await
+                .map_err(|err| cancel_or(err, |err| format!("agent registry signature is required but missing: {err}")))?;
+        let signature = read_limited_response_body(
+            signature_resp,
+            crate::agent_registry_signature::MAX_AGENT_REGISTRY_SIGNATURE_BYTES,
+            cancellations,
+        )
+        .await
+        .map_err(|err| cancel_or(err, |err| format!("{signature_url}: failed to read signature: {err}")))?;
+        crate::agent_registry_signature::verify_registry_signature(
+            &bytes,
+            &String::from_utf8_lossy(&signature),
+            trusted_keys,
+        )
+        .map_err(|err| format!("{url}: {err}"))?;
+    }
+    serde_json::from_slice(&bytes).map_err(|err| format!("{url}: Failed to parse registry: {err}"))
+}
+
+fn cancel_or(error: String, describe: impl FnOnce(String) -> String) -> String {
+    if error == AGENT_DOWNLOAD_CANCELED_ERROR {
+        error
+    } else {
+        describe(error)
+    }
+}
+
+async fn read_limited_response_body(
+    mut resp: reqwest::Response,
+    limit: usize,
+    cancellations: &[&AgentInstallCancellation],
+) -> Result<Vec<u8>, String> {
+    let read = async {
+        let mut body = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(|err| err.to_string())? {
+            if body.len() + chunk.len() > limit {
+                return Err(format!("response is larger than {limit} bytes"));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok::<Vec<u8>, String>(body)
+    };
+    if cancellations.is_empty() {
+        read.await
     } else {
         tokio::select! {
-            result = resp.json() => result.map_err(|err| format!("Failed to parse registry: {err}"))?,
-            _ = first_cancellation(cancellations) => return Err(AGENT_DOWNLOAD_CANCELED_ERROR.to_string()),
+            result = read => result,
+            _ = first_cancellation(cancellations) => Err(AGENT_DOWNLOAD_CANCELED_ERROR.to_string()),
         }
-    };
-    REGISTRY_CACHE.lock().await.insert(source, (std::time::Instant::now(), registry.clone()));
-    Ok(registry)
+    }
 }
 
 async fn open_download_response(
@@ -1028,9 +1112,10 @@ pub async fn uninstall_agent_jre(am: &AgentManager, jre_key: &str) -> Result<(),
         // we try to remove the directory (Windows ERROR_ACCESS_DENIED otherwise).
         am.stop_daemons().await;
         let jre_dir = am.jre_dir(jre_key);
-        if let Err(err) = remove_jre_dir_with_retry(&jre_dir) {
-            return Err(format_jre_dir_remove_error(&jre_dir, &err));
-        }
+        run_blocking(move || {
+            remove_jre_dir_with_retry(&jre_dir).map_err(|err| format_jre_dir_remove_error(&jre_dir, &err))
+        })
+        .await?;
         am.mutate_state(|state| state.jre_versions.remove(jre_key))?;
     }
     Ok(())
@@ -1085,9 +1170,9 @@ pub async fn reinstall_agent_jre_from(
     // handles on Windows (Issue #1100). Falls back to a rename-stash if the
     // directory still cannot be removed.
     am.stop_daemons().await;
-    let stash = replace_old_jre_dir(&jre_dir)?;
+    let stash = replace_old_jre_dir_blocking(&jre_dir).await?;
     persist_pending_jre_cleanup(am, stash.as_ref()).await?;
-    extract_jre_archive(&jre_archive, &jre_dir, platform_jre.format)?;
+    extract_jre_archive_blocking(&jre_archive, &jre_dir, platform_jre.format).await?;
     std::fs::remove_file(&jre_archive).ok();
     am.mutate_state(|state| state.jre_versions.insert(jre_key.to_string(), jre_info.version.clone()))?;
     cleanup_jre_download_cache_after_success(am, jre_key);
@@ -1375,14 +1460,14 @@ async fn ensure_jre_from_registry(
     // (Windows ERROR_ACCESS_DENIED, Issue #1100).  In a concurrent
     // upgrade-all this avoids killing unrelated daemons mid-install.
     stop_daemons_using_jre(am, jre_key).await;
-    let stash = replace_old_jre_dir(&jre_dir)?;
+    let stash = replace_old_jre_dir_blocking(&jre_dir).await?;
 
     // Persist the stash path *before* extraction so that a crash during
     // archive extraction (or a process kill) doesn't leave the renamed-stash
     // directory as an orphan that never gets cleaned up.
     persist_pending_jre_cleanup(am, stash.as_ref()).await?;
 
-    extract_jre_archive(&jre_archive, &jre_dir, platform_jre.format)?;
+    extract_jre_archive_blocking(&jre_archive, &jre_dir, platform_jre.format).await?;
     std::fs::remove_file(&jre_archive).ok();
     cleanup_jre_download_cache_after_success(am, jre_key);
 
@@ -1916,7 +2001,12 @@ async fn download_with_progress(
     cancellations: &[&AgentInstallCancellation],
 ) -> Result<(), String> {
     const DOWNLOAD_ATTEMPTS: usize = 4;
-    let expected_sha256 = normalized_sha256(expected_sha256)?;
+    // Every downloaded artifact (driver JAR, native binary/bundle, JRE) must be
+    // pinned by the (signed) registry: without a SHA-256 there is nothing that
+    // ties the bytes from a mirror to what was published, so refuse to install.
+    let expected_sha256 = Some(normalized_sha256(expected_sha256)?.ok_or_else(|| {
+        format!("Agent registry has no SHA-256 checksum for {url}; refusing to install an unverified artifact")
+    })?);
     // Observe the exact operation tokens threaded from the command layer: a
     // single install passes its own token; a batch passes BOTH the row token
     // and the batch token so a batch cancel-all interrupts a driver whose
@@ -2541,7 +2631,7 @@ pub struct OfflineImportResult {
     pub failures: Vec<OfflineImportFailure>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TarZstdJrePackageInfo {
     key: String,
     version: String,
@@ -2643,10 +2733,13 @@ async fn import_tar_zstd_jre_package(
         .tempdir_in(am.base_dir())
         .map_err(|error| error.to_string())?;
     progress(AgentProgressEvent::step("jre-extract"));
-    extract_and_validate_standalone_jre(package_path, staging.path(), info)?;
+    let staging_path = staging.path().to_path_buf();
+    let (package, package_info) = (package_path.to_path_buf(), info.clone());
+    run_blocking(move || extract_and_validate_standalone_jre(&package, &staging_path, &package_info)).await?;
     // Validate before stopping active daemons or replacing a working runtime.
     am.stop_daemons().await;
-    let pending_cleanup = replace_imported_jre_dir(staging.path(), &am.jre_dir(&info.key))?;
+    let (staging_path, jre_dir) = (staging.path().to_path_buf(), am.jre_dir(&info.key));
+    let pending_cleanup = run_blocking(move || replace_imported_jre_dir(&staging_path, &jre_dir)).await?;
     am.mutate_state(|state| {
         state.jre_versions.insert(info.key.clone(), info.version.clone());
         if let Some(path) = pending_cleanup {
@@ -2938,7 +3031,7 @@ pub async fn import_offline_zip(
         // A blocked write (anti-virus, disk quota) or an invalid archive must
         // not abort the rest of the package: record the failure and continue so
         // the drivers still install.
-        let outcome = (|| -> Result<(), String> {
+        let copied = (|| -> Result<PathBuf, String> {
             let mut entry = archive
                 .by_name(entry_name)
                 .map_err(|e| format!("Failed to read {entry_name}: {}", describe_error(&e)))?;
@@ -2949,30 +3042,42 @@ pub async fn import_offline_zip(
                 std::io::copy(&mut entry, &mut out)
                     .map_err(|e| format!("Failed to extract JRE archive: {}", describe_error(&e)))?;
             }
-
-            let jre_dir = am.jre_dir(jre_key);
-            let staging_dir = am.base_dir().join(format!(".jre-offline-import-{}", uuid::Uuid::new_v4()));
-            if let Err(error) = extract_jre_archive(&tmp_archive, &staging_dir, *format) {
-                std::fs::remove_dir_all(&staging_dir).ok();
-                std::fs::remove_file(&tmp_archive).ok();
-                return Err(error);
-            }
-            if !jre_dir_contains_java(&staging_dir) {
-                std::fs::remove_dir_all(&staging_dir).ok();
-                std::fs::remove_file(&tmp_archive).ok();
-                return Err(format!("Offline JRE archive does not contain a Java executable: {entry_name}"));
-            }
-            let pending_cleanup = replace_imported_jre_dir(&staging_dir, &jre_dir)?;
-            std::fs::remove_file(&tmp_archive).ok();
-            if let Some(path) = pending_cleanup {
-                local_state.pending_jre_cleanup.push(path);
-            }
-
-            if let Some(ver) = jre_version {
-                local_state.jre_versions.insert(jre_key.clone(), ver);
-            }
-            Ok(())
+            Ok(tmp_archive)
         })();
+        let outcome = match copied {
+            Ok(tmp_archive) => {
+                let jre_dir = am.jre_dir(jre_key);
+                let staging_dir = am.base_dir().join(format!(".jre-offline-import-{}", uuid::Uuid::new_v4()));
+                let (format, entry_name) = (*format, entry_name.clone());
+                // Extraction retries with sleeps and replacing the directory
+                // may retry removal, so keep both off the async workers.
+                run_blocking(move || {
+                    if let Err(error) = extract_jre_archive(&tmp_archive, &staging_dir, format) {
+                        std::fs::remove_dir_all(&staging_dir).ok();
+                        std::fs::remove_file(&tmp_archive).ok();
+                        return Err(error);
+                    }
+                    if !jre_dir_contains_java(&staging_dir) {
+                        std::fs::remove_dir_all(&staging_dir).ok();
+                        std::fs::remove_file(&tmp_archive).ok();
+                        return Err(format!("Offline JRE archive does not contain a Java executable: {entry_name}"));
+                    }
+                    let pending_cleanup = replace_imported_jre_dir(&staging_dir, &jre_dir)?;
+                    std::fs::remove_file(&tmp_archive).ok();
+                    Ok(pending_cleanup)
+                })
+                .await
+                .map(|pending_cleanup| {
+                    if let Some(path) = pending_cleanup {
+                        local_state.pending_jre_cleanup.push(path);
+                    }
+                    if let Some(ver) = jre_version {
+                        local_state.jre_versions.insert(jre_key.clone(), ver);
+                    }
+                })
+            }
+            Err(error) => Err(error),
+        };
         match outcome {
             Ok(()) => result.jre_installed.push(jre_key.clone()),
             Err(error) => {
@@ -3335,6 +3440,16 @@ fn jre_archive_suffix(format: Option<ArtifactFormat>) -> &'static str {
 
 fn jre_archive_download_path(am: &AgentManager, jre_key: &str, format: Option<ArtifactFormat>) -> PathBuf {
     am.base_dir().join(format!("jre-{jre_key}-download{}", jre_archive_suffix(format)))
+}
+
+async fn extract_jre_archive_blocking(archive: &Path, dest: &Path, format: Option<ArtifactFormat>) -> Result<(), String> {
+    let (archive, dest) = (archive.to_path_buf(), dest.to_path_buf());
+    run_blocking(move || extract_jre_archive(&archive, &dest, format)).await
+}
+
+async fn replace_old_jre_dir_blocking(path: &Path) -> Result<Option<PathBuf>, String> {
+    let path = path.to_path_buf();
+    run_blocking(move || replace_old_jre_dir(&path)).await
 }
 
 fn extract_jre_archive(archive: &Path, dest: &Path, format: Option<ArtifactFormat>) -> Result<(), String> {
@@ -4213,12 +4328,16 @@ mod agent_registry_install_tests {
         archive.finish().unwrap();
     }
 
+    /// Any well-formed digest; for tests that never get as far as verifying bytes.
+    const PLACEHOLDER_SHA256: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
     fn registry_with_native_and_legacy_jar(
         db_type: &str,
         version: &str,
         native_url: &str,
-        native_size: u64,
+        native_bytes: impl AsRef<[u8]>,
     ) -> AgentRegistry {
+        let native_bytes = native_bytes.as_ref();
         let mut drivers = std::collections::HashMap::new();
         drivers.insert(
             db_type.to_string(),
@@ -4235,7 +4354,12 @@ mod agent_registry_install_tests {
                 }),
                 native: [(
                     AgentManager::current_platform().to_string(),
-                    ArtifactInfo { url: native_url.to_string(), sha256: None, size: native_size, format: None },
+                    ArtifactInfo {
+                        url: native_url.to_string(),
+                        sha256: Some(sha256_bytes(native_bytes)),
+                        size: native_bytes.len() as u64,
+                        format: None,
+                    },
                 )]
                 .into_iter()
                 .collect(),
@@ -4244,7 +4368,8 @@ mod agent_registry_install_tests {
         AgentRegistry { jre: None, jres: std::collections::HashMap::new(), drivers }
     }
 
-    fn registry_with_jar(db_type: &str, version: &str, url: &str, size: u64) -> AgentRegistry {
+    fn registry_with_jar(db_type: &str, version: &str, url: &str, bytes: impl AsRef<[u8]>) -> AgentRegistry {
+        let bytes = bytes.as_ref();
         let mut drivers = std::collections::HashMap::new();
         drivers.insert(
             db_type.to_string(),
@@ -4253,7 +4378,12 @@ mod agent_registry_install_tests {
                 label: db_type.to_string(),
                 min_app_version: "0.1.0".to_string(),
                 jre: DEFAULT_JRE_KEY.to_string(),
-                jar: Some(ArtifactInfo { url: url.to_string(), sha256: None, size, format: None }),
+                jar: Some(ArtifactInfo {
+                    url: url.to_string(),
+                    sha256: Some(sha256_bytes(bytes)),
+                    size: bytes.len() as u64,
+                    format: None,
+                }),
                 native: std::collections::HashMap::new(),
             },
         );
@@ -4285,7 +4415,7 @@ mod agent_registry_install_tests {
             am,
             url,
             bytes.len() as u64,
-            None,
+            Some(&sha256_bytes(bytes)),
             Some(CacheIdentity::Driver { db_type, version }),
             dest,
         );
@@ -4489,7 +4619,8 @@ mod agent_registry_install_tests {
         assert!(err.contains("mysql"), "expected dependent driver in error: {err}");
     }
 
-    fn registry_with_jre(jre_key: &str, version: &str, url: &str, size: u64) -> AgentRegistry {
+    fn registry_with_jre(jre_key: &str, version: &str, url: &str, archive: impl AsRef<[u8]>) -> AgentRegistry {
+        let archive = archive.as_ref();
         AgentRegistry {
             jre: None,
             jres: [(
@@ -4498,7 +4629,12 @@ mod agent_registry_install_tests {
                     version: version.to_string(),
                     platforms: [(
                         AgentManager::current_platform().to_string(),
-                        ArtifactInfo { url: url.to_string(), sha256: None, size, format: None },
+                        ArtifactInfo {
+                            url: url.to_string(),
+                            sha256: Some(sha256_bytes(archive)),
+                            size: archive.len() as u64,
+                            format: None,
+                        },
                     )]
                     .into_iter()
                     .collect(),
@@ -4548,11 +4684,12 @@ mod agent_registry_install_tests {
         archive: &[u8],
     ) {
         let dest = jre_archive_download_path(am, jre_key, format);
+        let computed_sha256 = sha256_bytes(archive);
         let cache_path = cached_download_path(
             am,
             url,
             archive.len() as u64,
-            expected_sha256,
+            Some(expected_sha256.unwrap_or(&computed_sha256)),
             Some(CacheIdentity::Jre { key: jre_key, version }),
             &dest,
         );
@@ -4567,13 +4704,13 @@ mod agent_registry_install_tests {
     fn mongodb_registry_with_jre(
         driver_version: &str,
         driver_url: &str,
-        driver_size: u64,
+        driver_bytes: &[u8],
         jre_version: &str,
         jre_url: &str,
-        jre_size: u64,
+        jre_archive: &[u8],
     ) -> AgentRegistry {
-        let mut registry = registry_with_jar("mongodb", driver_version, driver_url, driver_size);
-        registry.jres = registry_with_jre(DEFAULT_JRE_KEY, jre_version, jre_url, jre_size).jres;
+        let mut registry = registry_with_jar("mongodb", driver_version, driver_url, driver_bytes);
+        registry.jres = registry_with_jre(DEFAULT_JRE_KEY, jre_version, jre_url, jre_archive).jres;
         registry
     }
 
@@ -4590,10 +4727,10 @@ mod agent_registry_install_tests {
         let registry = mongodb_registry_with_jre(
             driver_version,
             driver_url,
-            driver_bytes.len() as u64,
+            &driver_bytes,
             jre_version,
             jre_url,
-            jre_archive.len() as u64,
+            &jre_archive,
         );
         write_cached_driver_download(
             &manager,
@@ -4671,10 +4808,10 @@ mod agent_registry_install_tests {
         let registry = mongodb_registry_with_jre(
             "9.9.9",
             "https://example.com/dbx-agent-mongodb-latest.jar",
-            test_agent_jar().len() as u64,
+            &test_agent_jar(),
             jre_version,
             jre_url,
-            jre_archive.len() as u64,
+            &jre_archive,
         );
         write_cached_jre_download(&manager, DEFAULT_JRE_KEY, jre_version, jre_url, None, None, &jre_archive);
         cache_test_registry(registry).await;
@@ -4699,10 +4836,10 @@ mod agent_registry_install_tests {
         let registry = mongodb_registry_with_jre(
             driver_version,
             driver_url,
-            driver_bytes.len() as u64,
+            &driver_bytes,
             jre_version,
             jre_url,
-            jre_archive.len() as u64,
+            &jre_archive,
         );
         let driver_cache_path = write_cached_driver_download(
             &manager,
@@ -4738,7 +4875,7 @@ mod agent_registry_install_tests {
         let driver_version = "0.1.47";
         let driver_url = "https://example.com/dbx-agent-mongodb.jar";
         let corrupt_driver = b"not-a-jar";
-        let registry = registry_with_jar("mongodb", driver_version, driver_url, corrupt_driver.len() as u64);
+        let registry = registry_with_jar("mongodb", driver_version, driver_url, &corrupt_driver);
         write_cached_driver_download(
             &manager,
             "mongodb",
@@ -4802,7 +4939,7 @@ mod agent_registry_install_tests {
         let version = "0.1.31";
         let native_url = "https://example.com/dbx-agent-hive";
         let native_bytes = b"native-agent";
-        let registry = registry_with_native_and_legacy_jar(db_type, version, native_url, native_bytes.len() as u64);
+        let registry = registry_with_native_and_legacy_jar(db_type, version, native_url, &native_bytes);
         let native_path = manager.driver_native_path(db_type);
         std::fs::create_dir_all(manager.driver_dir(db_type)).unwrap();
         write_test_agent_jar(&manager.driver_jar_path(db_type));
@@ -4847,11 +4984,21 @@ mod agent_registry_install_tests {
         let mut native = std::collections::HashMap::new();
         native.insert(
             "linux-x64".to_string(),
-            ArtifactInfo { url: x64_url.to_string(), sha256: None, size: x64_bytes.len() as u64, format: None },
+            ArtifactInfo {
+                url: x64_url.to_string(),
+                sha256: Some(sha256_bytes(x64_bytes)),
+                size: x64_bytes.len() as u64,
+                format: None,
+            },
         );
         native.insert(
             "linux-aarch64".to_string(),
-            ArtifactInfo { url: arm_url.to_string(), sha256: None, size: arm_bytes.len() as u64, format: None },
+            ArtifactInfo {
+                url: arm_url.to_string(),
+                sha256: Some(sha256_bytes(arm_bytes)),
+                size: arm_bytes.len() as u64,
+                format: None,
+            },
         );
         let mut drivers = std::collections::HashMap::new();
         drivers.insert(
@@ -4927,7 +5074,7 @@ mod agent_registry_install_tests {
         install_jre(&manager);
         record_driver(&manager, db_type);
         write_cached_driver_download(&manager, db_type, new_version, url, &target_path, &new_bytes);
-        let registry = registry_with_jar(db_type, new_version, url, new_bytes.len() as u64);
+        let registry = registry_with_jar(db_type, new_version, url, &new_bytes);
         let cancellation = manager.begin_install_cancellation("cancel-after-cached-download").await;
         let progress_cancellation = Arc::clone(&cancellation);
         let progress = move |event: AgentProgressEvent| {
@@ -4964,7 +5111,7 @@ mod agent_registry_install_tests {
         let native_bytes = current_platform_native_binary();
         let package_bytes = build_tar_zstd_driver_package(db_type, version, DriverArtifactKind::Native, &native_bytes);
         let mut registry =
-            registry_with_native_and_legacy_jar(db_type, version, package_url, package_bytes.len() as u64);
+            registry_with_native_and_legacy_jar(db_type, version, package_url, &package_bytes);
         registry.drivers.get_mut(db_type).unwrap().native.get_mut(AgentManager::current_platform()).unwrap().format =
             Some(ArtifactFormat::TarZstd);
         let native_path = manager.driver_native_path(db_type);
@@ -5000,7 +5147,7 @@ mod agent_registry_install_tests {
         let package_url = "https://example.com/dbx-agent-dameng.tar.zst";
         let jar_bytes = test_agent_jar();
         let package_bytes = build_tar_zstd_driver_package(db_type, version, DriverArtifactKind::Jar, &jar_bytes);
-        let mut registry = registry_with_jar(db_type, version, package_url, package_bytes.len() as u64);
+        let mut registry = registry_with_jar(db_type, version, package_url, &package_bytes);
         registry.drivers.get_mut(db_type).unwrap().jar.as_mut().unwrap().format = Some(ArtifactFormat::TarZstd);
         manager
             .mutate_state(|state| {
@@ -5043,11 +5190,11 @@ mod agent_registry_install_tests {
         let corrupt_jar = b"not-a-jar";
 
         let mut registry =
-            registry_with_native_and_legacy_jar("oracle", "2.0.0", oracle_url, oracle_bytes.len() as u64);
+            registry_with_native_and_legacy_jar("oracle", "2.0.0", oracle_url, &oracle_bytes);
         registry.drivers.extend(
-            registry_with_native_and_legacy_jar("dameng", "2.0.0", dameng_url, dameng_bytes.len() as u64).drivers,
+            registry_with_native_and_legacy_jar("dameng", "2.0.0", dameng_url, &dameng_bytes).drivers,
         );
-        registry.drivers.extend(registry_with_jar("kingbase", "2.0.0", kingbase_url, corrupt_jar.len() as u64).drivers);
+        registry.drivers.extend(registry_with_jar("kingbase", "2.0.0", kingbase_url, &corrupt_jar).drivers);
 
         let mut state = manager.load_state();
         state.java_runtime = JavaRuntimeConfig { mode: JavaRuntimeMode::System, custom_java_path: None };
@@ -5126,7 +5273,7 @@ mod agent_registry_install_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let native_url = format!("http://{addr}/dbx-agent-oracle");
-        let registry = registry_with_native_and_legacy_jar(db_type, version, &native_url, native_bytes.len() as u64);
+        let registry = registry_with_native_and_legacy_jar(db_type, version, &native_url, &native_bytes);
 
         // Mark the driver installed at an older version so the batch considers
         // it updatable.
@@ -5234,7 +5381,7 @@ mod agent_registry_install_tests {
         let version = "21.0.12";
         let url = "https://example.com/dbx-jre.tar.gz";
         let archive = build_jre_archive(&manager, jre_key);
-        let registry = registry_with_jre(jre_key, version, url, archive.len() as u64);
+        let registry = registry_with_jre(jre_key, version, url, &archive);
         let events = std::sync::Mutex::new(Vec::new());
         let progress = |event| events.lock().unwrap().push(event);
 
@@ -5291,7 +5438,7 @@ mod agent_registry_install_tests {
         let url = "https://example.com/dbx-jre.tar.zst";
         let archive = build_zstd_jre_archive(&manager, jre_key);
         let expected_sha256 = format!("{:x}", Sha256::digest(&archive));
-        let mut registry = registry_with_jre(jre_key, version, url, archive.len() as u64);
+        let mut registry = registry_with_jre(jre_key, version, url, &archive);
         let artifact =
             registry.jres.get_mut(jre_key).unwrap().platforms.get_mut(AgentManager::current_platform()).unwrap();
         artifact.format = Some(ArtifactFormat::TarZstd);
@@ -5409,7 +5556,7 @@ mod agent_registry_install_tests {
         let version = "0.1.31";
         let native_url = "https://example.com/dbx-agent-oracle";
         let native_bytes = b"native-agent";
-        let registry = registry_with_native_and_legacy_jar(db_type, version, native_url, native_bytes.len() as u64);
+        let registry = registry_with_native_and_legacy_jar(db_type, version, native_url, &native_bytes);
         write_cached_driver_download(
             &manager,
             db_type,
@@ -5559,7 +5706,7 @@ mod agent_registry_install_tests {
             "agents/drivers/dbx-agent-oracle",
             &dest,
             100,
-            None,
+            Some(PLACEHOLDER_SHA256),
             None,
             Some(db_type),
             None,
@@ -5618,7 +5765,7 @@ mod agent_registry_install_tests {
                 "agents/drivers/dbx-agent-oracle",
                 &dest,
                 256 * 1024,
-                None,
+                Some(PLACEHOLDER_SHA256),
                 None,
                 Some(db_type),
                 None,
@@ -5779,7 +5926,7 @@ mod agent_registry_install_tests {
                 "agents/drivers/dbx-agent-oracle",
                 &dest,
                 256 * 1024,
-                None,
+                Some(PLACEHOLDER_SHA256),
                 None,
                 Some(db_type),
                 None,
@@ -5890,6 +6037,98 @@ mod agent_registry_install_tests {
         assert!(result.unwrap_err().contains(AGENT_DOWNLOAD_CANCELED_ERROR));
     }
 
+    /// Serves fixed bodies by request path (404 for anything else).
+    async fn serve_static_paths(routes: Vec<(String, Vec<u8>)>) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let routes = Arc::new(routes);
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else { break };
+                let routes = routes.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0_u8; 1024];
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        let Ok(n) = socket.read(&mut buf).await else { return };
+                        if n == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buf[..n]);
+                    }
+                    let request = String::from_utf8_lossy(&request);
+                    let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let (status, body) = match routes.iter().find(|(route, _)| *route == path) {
+                        Some((_, body)) => ("200 OK", body.clone()),
+                        None => ("404 Not Found", Vec::new()),
+                    };
+                    let header =
+                        format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                    let _ = socket.write_all(header.as_bytes()).await;
+                    let _ = socket.write_all(&body).await;
+                });
+            }
+        });
+        (base, handle)
+    }
+
+    #[tokio::test]
+    async fn signed_registry_is_required_once_a_trusted_key_is_configured() {
+        use base64::Engine as _;
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let key = SigningKey::from_bytes(&[42_u8; 32]);
+        let trusted = vec![key.verifying_key()];
+        let registry_bytes = br#"{"jres":{},"drivers":{}}"#.to_vec();
+        let signature = base64::engine::general_purpose::STANDARD.encode(key.sign(&registry_bytes).to_bytes());
+        let (base, server) = serve_static_paths(vec![
+            ("/signed/agent-registry.json".to_string(), registry_bytes.clone()),
+            ("/signed/agent-registry.json.sig".to_string(), signature.clone().into_bytes()),
+            ("/unsigned/agent-registry.json".to_string(), registry_bytes.clone()),
+            ("/tampered/agent-registry.json".to_string(), br#"{"jres":{}, "drivers":{}}"#.to_vec()),
+            ("/tampered/agent-registry.json.sig".to_string(), signature.into_bytes()),
+        ])
+        .await;
+        let client = reqwest::Client::new();
+        let url = |dir: &str| format!("{base}/{dir}/agent-registry.json");
+
+        fetch_registry_candidate(&client, &url("signed"), &trusted, &[]).await.expect("valid signature");
+        let missing = fetch_registry_candidate(&client, &url("unsigned"), &trusted, &[]).await.unwrap_err();
+        assert!(missing.contains("signature is required"), "{missing}");
+        let tampered = fetch_registry_candidate(&client, &url("tampered"), &trusted, &[]).await.unwrap_err();
+        assert!(tampered.contains("does not match"), "{tampered}");
+        // Without configured keys the unsigned registry is accepted (SHA-256 still mandatory).
+        fetch_registry_candidate(&client, &url("unsigned"), &[], &[]).await.expect("unsigned registry without keys");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn registry_artifacts_without_sha256_are_refused() {
+        let manager = test_manager("missing-sha256");
+        let dest = manager.base_dir().join("downloads").join("oracle-agent");
+        let error = download_with_progress(
+            &manager,
+            &|_| {},
+            "driver",
+            DownloadSource::Official,
+            "https://example.com/dbx-agent-oracle",
+            "agents/drivers/dbx-agent-oracle",
+            &dest,
+            100,
+            None,
+            None,
+            Some("oracle"),
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect_err("an artifact without a SHA-256 must not be downloaded");
+        assert!(error.contains("no SHA-256"), "{error}");
+        assert!(!dest.exists());
+    }
+
     #[tokio::test]
     async fn fetch_registry_precancelled_token_aborts_before_any_network_attempt() {
         let _test_guard = ENSURE_AGENT_TEST_LOCK.lock().await;
@@ -5920,7 +6159,7 @@ mod agent_registry_install_tests {
         let version = "0.1.31";
         let native_url = "https://example.com/dbx-agent-oracle";
         let native_bytes = b"native-agent";
-        let registry = registry_with_native_and_legacy_jar(db_type, version, native_url, native_bytes.len() as u64);
+        let registry = registry_with_native_and_legacy_jar(db_type, version, native_url, &native_bytes);
         write_cached_driver_download(
             &manager,
             db_type,
@@ -5985,7 +6224,7 @@ mod agent_registry_install_tests {
         let version = "0.2.0";
         let jar_url = "https://example.com/dbx-agent-h2.jar";
         let jar_bytes = b"jar";
-        let registry = registry_with_jar(db_type, version, jar_url, jar_bytes.len() as u64);
+        let registry = registry_with_jar(db_type, version, jar_url, &jar_bytes);
         let jar_path = manager.driver_jar_path(db_type);
         let cache_path = write_cached_driver_download(&manager, db_type, version, jar_url, &jar_path, jar_bytes);
         manager
@@ -6264,7 +6503,7 @@ mod agent_registry_install_tests {
         let jar_name = "dbx-agent-h2.jar";
         let jre_name = format!("jre-21-{platform}.tar.gz");
         let jar_bytes = test_agent_jar();
-        let registry = registry_with_jar("h2", "1.0.0", &format!("offline://{jar_name}"), jar_bytes.len() as u64);
+        let registry = registry_with_jar("h2", "1.0.0", &format!("offline://{jar_name}"), &jar_bytes);
         let (_package_dir, package) = write_offline_zip(
             &registry,
             &[(format!("drivers/{jar_name}"), jar_bytes), (format!("jre/{jre_name}"), b"legacy-jre".to_vec())],

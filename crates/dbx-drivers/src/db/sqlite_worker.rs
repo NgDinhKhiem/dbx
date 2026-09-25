@@ -211,35 +211,85 @@ impl SqliteWorkerClient {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let mut encoded = serde_json::to_vec(&WorkerRequest { id, op }).map_err(|e| e.to_string())?;
         encoded.push(b'\n');
-        let mut io = self.io.lock().await;
-        match &mut *io {
-            WorkerIo::Process { stdin, stdout, .. } => {
-                stdin.write_all(&encoded).await.map_err(|e| e.to_string())?;
-                stdin.flush().await.map_err(|e| e.to_string())?;
-                let mut line = String::new();
-                stdout.read_line(&mut line).await.map_err(|e| e.to_string())?;
-                parse_response(id, &line)
+        // The guard closes the session unless this exchange finishes cleanly.
+        // A caller timeout can drop this future after the request was written
+        // but before its response was read (or halfway through reading it);
+        // keeping the pipe would leave that stale response in front of every
+        // later reply. A closed session surfaces as a connection error, so the
+        // pool is rebuilt with a fresh worker on the next use.
+        let mut guard = RoundtripGuard { io: self.io.lock().await, completed: false };
+        let result = match &mut *guard.io {
+            WorkerIo::Closed => {
+                guard.completed = true;
+                return Err(SQLITE_WORKER_CLOSED_ERROR.to_string());
             }
-            WorkerIo::Closed => Err("SQLite worker session is closed".to_string()),
-            WorkerIo::Ssh { stream, .. } => {
-                stream.write_all(&encoded).await.map_err(|e| e.to_string())?;
-                stream.flush().await.map_err(|e| e.to_string())?;
-                parse_response(id, &read_jsonl_line(stream).await?)
-            }
+            WorkerIo::Process { stdin, stdout, .. } => match write_request(&mut **stdin, &encoded).await {
+                Ok(()) => read_response(&mut **stdout, id).await,
+                Err(error) => Err(error),
+            },
+            WorkerIo::Ssh { stream, .. } => match write_request(stream, &encoded).await {
+                Ok(()) => read_response(stream, id).await,
+                Err(error) => Err(error),
+            },
+        };
+        guard.completed = result.is_ok();
+        result
+    }
+}
+
+const SQLITE_WORKER_CLOSED_ERROR: &str = "SQLite worker session is closed; the connection will be re-established";
+/// Upper bound on late responses skipped while waiting for the current id.
+/// Stale lines can only appear if an earlier exchange was abandoned without
+/// the guard closing the session, so this is a defensive limit.
+const SQLITE_WORKER_MAX_STALE_RESPONSES: usize = 16;
+
+/// Holds the I/O lock for one request/response exchange and marks the session
+/// broken when the exchange does not complete (future dropped, I/O error,
+/// oversized or malformed response).
+struct RoundtripGuard<'a> {
+    io: tokio::sync::MutexGuard<'a, WorkerIo>,
+    completed: bool,
+}
+
+impl Drop for RoundtripGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            close_worker_io_now(std::mem::replace(&mut *self.io, WorkerIo::Closed));
         }
     }
+}
+
+fn close_worker_io_now(io: WorkerIo) {
+    match io {
+        WorkerIo::Process { mut child, .. } => {
+            let _ = child.start_kill();
+        }
+        // Dropping the channel stream closes it; the remote worker sees EOF on
+        // stdin and exits.
+        WorkerIo::Ssh { stream } => drop(stream),
+        WorkerIo::Closed => {}
+    }
+}
+
+async fn write_request<W: AsyncWrite + Unpin + ?Sized>(writer: &mut W, encoded: &[u8]) -> Result<(), String> {
+    writer.write_all(encoded).await.map_err(|e| e.to_string())?;
+    writer.flush().await.map_err(|e| e.to_string())
+}
+
+async fn read_response<R: AsyncBufRead + Unpin + ?Sized>(reader: &mut R, id: u64) -> Result<WorkerBody, String> {
+    for _ in 0..=SQLITE_WORKER_MAX_STALE_RESPONSES {
+        let line = read_jsonl_line(reader).await?;
+        if let Some(body) = parse_response(id, &line)? {
+            return Ok(body);
+        }
+    }
+    Err(format!("SQLite worker returned too many stale responses while waiting for request {id}"))
 }
 
 impl Drop for SqliteWorkerClient {
     fn drop(&mut self) {
         if let Ok(mut io) = self.io.try_lock() {
-            match std::mem::replace(&mut *io, WorkerIo::Closed) {
-                WorkerIo::Process { mut child, .. } => {
-                    let _ = child.start_kill();
-                }
-                WorkerIo::Ssh { stream } => drop(stream),
-                WorkerIo::Closed => {}
-            }
+            close_worker_io_now(std::mem::replace(&mut *io, WorkerIo::Closed));
         }
         let Some(path) = self.remove_remote_path.take() else {
             return;
@@ -255,16 +305,30 @@ impl Drop for SqliteWorkerClient {
     }
 }
 
-fn parse_response(id: u64, line: &str) -> Result<WorkerBody, String> {
+/// Returns `Ok(None)` for a stale response to an earlier request (skipped by
+/// the caller) and an error for anything that cannot belong to this session.
+fn parse_response(id: u64, line: &str) -> Result<Option<WorkerBody>, String> {
     let response: WorkerResponse =
         serde_json::from_str(line.trim()).map_err(|e| format!("invalid worker response: {e}"))?;
-    if response.id != id {
-        return Err(format!("SQLite worker response id {} did not match {id}", response.id));
+    if response.id == id {
+        return Ok(Some(response.body));
     }
-    Ok(response.body)
+    if response.id == 0 {
+        // The worker answers requests it could not parse with id 0.
+        let detail = match response.body {
+            WorkerBody::Err { error } => error,
+            WorkerBody::Ok { .. } => "unexpected response".to_string(),
+        };
+        return Err(format!("SQLite worker rejected request {id}: {detail}"));
+    }
+    if response.id < id {
+        log::warn!("[sqlite-worker] skipping stale response {} while waiting for {id}", response.id);
+        return Ok(None);
+    }
+    Err(format!("SQLite worker response id {} did not match {id}", response.id))
 }
 
-async fn read_jsonl_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<String, String> {
+async fn read_jsonl_line<R: AsyncBufRead + Unpin + ?Sized>(reader: &mut R) -> Result<String, String> {
     let mut line = Vec::new();
     loop {
         let buf = reader.fill_buf().await.map_err(|e| format!("SQLite worker closed the SSH session: {e}"))?;
@@ -844,6 +908,121 @@ mod tests {
         let mut reader = BufReader::new(oversized.as_slice());
         let error = read_jsonl_line(&mut reader).await.unwrap_err();
         assert!(error.contains("16 MiB"), "{error}");
+    }
+
+    /// Builds a client over an in-memory pipe; the returned stream plays the
+    /// remote worker side of the JSONL protocol.
+    fn simulated_worker_client() -> (SqliteWorkerClient, BufReader<tokio::io::DuplexStream>) {
+        let (client_side, worker_side) = tokio::io::duplex(64 * 1024);
+        let stream: DynStream = Box::pin(client_side);
+        let client = SqliteWorkerClient {
+            io: AsyncMutex::new(WorkerIo::Ssh { stream: BufReader::new(stream) }),
+            next_id: AtomicU64::new(1),
+            ssh_session: None,
+            remove_remote_path: None,
+        };
+        (client, BufReader::new(worker_side))
+    }
+
+    async fn read_simulated_request(worker: &mut BufReader<tokio::io::DuplexStream>) -> WorkerRequest {
+        let mut line = String::new();
+        worker.read_line(&mut line).await.expect("read request");
+        serde_json::from_str(line.trim()).expect("decode request")
+    }
+
+    async fn write_simulated_response(worker: &mut BufReader<tokio::io::DuplexStream>, id: u64, value: i64) {
+        let response = WorkerResponse {
+            id,
+            body: WorkerBody::query(vec!["v".into()], Vec::new(), vec![vec![serde_json::json!(value)]], 0, false),
+        };
+        let mut encoded = serde_json::to_vec(&response).unwrap();
+        encoded.push(b'\n');
+        worker.get_mut().write_all(&encoded).await.expect("write response");
+    }
+
+    #[tokio::test]
+    async fn abandoned_roundtrip_closes_the_session_instead_of_desyncing_later_calls() {
+        let (client, mut worker) = simulated_worker_client();
+        let timed_out =
+            tokio::time::timeout(Duration::from_millis(50), client.query("SELECT slow()", None)).await;
+        assert!(timed_out.is_err(), "the simulated worker never answered, so the call must time out");
+
+        // The late answer to the abandoned request must never be handed to the next call.
+        let request = read_simulated_request(&mut worker).await;
+        assert_eq!(request.id, 1);
+        let _ = worker
+            .get_mut()
+            .write_all(b"{\"id\":1,\"columns\":[\"v\"],\"rows\":[[1]],\"affected_rows\":0,\"truncated\":false}\n")
+            .await;
+
+        let error = client.query("SELECT 2", None).await.unwrap_err();
+        assert!(error.contains("closed"), "{error}");
+        assert!(!error.contains("did not match"), "{error}");
+        assert!(matches!(*client.io.lock().await, WorkerIo::Closed));
+    }
+
+    #[tokio::test]
+    async fn completed_roundtrips_keep_the_session_open() {
+        let (client, mut worker) = simulated_worker_client();
+        let server = tokio::spawn(async move {
+            for expected in 1..=2 {
+                let request = read_simulated_request(&mut worker).await;
+                assert_eq!(request.id, expected);
+                write_simulated_response(&mut worker, request.id, expected as i64 * 10).await;
+            }
+            worker
+        });
+        assert_eq!(client.query("SELECT 10", None).await.unwrap().rows[0][0], serde_json::json!(10));
+        assert_eq!(client.query("SELECT 20", None).await.unwrap().rows[0][0], serde_json::json!(20));
+        server.await.unwrap();
+        assert!(matches!(*client.io.lock().await, WorkerIo::Ssh { .. }));
+    }
+
+    #[tokio::test]
+    async fn stale_responses_are_skipped_until_the_current_id() {
+        let (client, mut worker) = simulated_worker_client();
+        client.next_id.store(5, Ordering::SeqCst);
+        let server = tokio::spawn(async move {
+            let request = read_simulated_request(&mut worker).await;
+            assert_eq!(request.id, 5);
+            write_simulated_response(&mut worker, 3, 3).await;
+            write_simulated_response(&mut worker, 4, 4).await;
+            write_simulated_response(&mut worker, 5, 5).await;
+            worker
+        });
+        let result = client.query("SELECT 5", None).await.unwrap();
+        assert_eq!(result.rows[0][0], serde_json::json!(5));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_response_closes_the_session() {
+        let (client, mut worker) = simulated_worker_client();
+        let server = tokio::spawn(async move {
+            let _ = read_simulated_request(&mut worker).await;
+            let chunk = vec![b'a'; 1024 * 1024];
+            for _ in 0..=SQLITE_WORKER_MAX_RESPONSE_BYTES / chunk.len() {
+                if worker.get_mut().write_all(&chunk).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let error = client.query("SELECT huge", None).await.unwrap_err();
+        assert!(error.contains("16 MiB"), "{error}");
+        let error = client.query("SELECT 1", None).await.unwrap_err();
+        assert!(error.contains("closed"), "{error}");
+        drop(client);
+        let _ = server.await;
+    }
+
+    #[test]
+    fn parse_response_classifies_ids() {
+        let line = serde_json::to_string(&WorkerResponse { id: 7, body: WorkerBody::ok() }).unwrap();
+        assert!(parse_response(7, &line).unwrap().is_some());
+        assert!(parse_response(8, &line).unwrap().is_none(), "older ids are stale");
+        assert!(parse_response(6, &line).unwrap_err().contains("did not match"));
+        let rejected = serde_json::to_string(&WorkerResponse { id: 0, body: WorkerBody::err("bad line") }).unwrap();
+        assert!(parse_response(3, &rejected).unwrap_err().contains("bad line"));
     }
 
     #[test]
