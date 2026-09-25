@@ -70,6 +70,39 @@ pub struct EsClient {
     /// POST 会返回 405（`allowed: [GET, PUT, HEAD, DELETE]`）；ES 7/8 反过来只认
     /// GET/POST。默认先按 POST 发，命中 405 后按连接改记 PUT。
     sql_endpoint_uses_put: Arc<AtomicBool>,
+    /// `GET /` 探测到的发行版与版本（OpenSearch / Elasticsearch / Easysearch）。
+    /// 按连接缓存一次；传输失败不缓存，下次再探测。
+    cluster_info: Arc<tokio::sync::OnceCell<ElasticsearchClusterInfo>>,
+    /// OpenSearch 的 SQL 插件是否只有旧的 `/_opendistro/_sql` 路径（`/_plugins/_sql`
+    /// 不存在时按连接记住，后续请求直接走旧路径）。
+    opensearch_sql_uses_legacy_path: Arc<AtomicBool>,
+}
+
+/// Distribution and version reported by the cluster root endpoint (`GET /`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ElasticsearchClusterInfo {
+    /// `opensearch`, `elasticsearch`, `easysearch`, ...; `None` when the root
+    /// endpoint could not be read (for example a 403 for restricted accounts).
+    pub distribution: Option<String>,
+    pub version: Option<String>,
+}
+
+impl ElasticsearchClusterInfo {
+    pub fn is_opensearch(&self) -> bool {
+        self.distribution.as_deref().is_some_and(|distribution| distribution.eq_ignore_ascii_case("opensearch"))
+    }
+
+    fn from_root_response(body: &Value) -> Option<Self> {
+        let version = body.get("version")?.as_object()?;
+        let number = version.get("number").and_then(Value::as_str).map(str::to_string);
+        let distribution = version
+            .get("distribution")
+            .and_then(Value::as_str)
+            .map(str::to_ascii_lowercase)
+            .or_else(|| number.as_ref().map(|_| "elasticsearch".to_string()));
+        Some(Self { distribution, version: number })
+    }
 }
 
 impl EsClient {
@@ -136,6 +169,8 @@ impl EsClient {
             index_grouping,
             pit_search_supported: Arc::new(AtomicBool::new(true)),
             sql_endpoint_uses_put: Arc::new(AtomicBool::new(false)),
+            cluster_info: Arc::new(tokio::sync::OnceCell::new()),
+            opensearch_sql_uses_legacy_path: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -244,6 +279,24 @@ impl EsClient {
     fn mark_sql_endpoint_uses_put(&self) {
         self.sql_endpoint_uses_put.store(true, Ordering::Relaxed);
     }
+
+    fn opensearch_sql_uses_legacy_path(&self) -> bool {
+        self.opensearch_sql_uses_legacy_path.load(Ordering::Relaxed)
+    }
+
+    fn mark_opensearch_sql_uses_legacy_path(&self) {
+        self.opensearch_sql_uses_legacy_path.store(true, Ordering::Relaxed);
+    }
+
+    /// Cluster info learned so far, without sending a request.
+    fn cached_cluster_info(&self) -> Option<&ElasticsearchClusterInfo> {
+        self.cluster_info.get()
+    }
+
+    fn remember_cluster_info(&self, info: ElasticsearchClusterInfo) {
+        // A concurrent probe may have stored the same answer first; either value is fine.
+        let _ = self.cluster_info.set(info);
+    }
 }
 
 impl Clone for EsClient {
@@ -260,6 +313,8 @@ impl Clone for EsClient {
             // 共享标记而不是复制值：探测结果要对整个连接生效。
             pit_search_supported: Arc::clone(&self.pit_search_supported),
             sql_endpoint_uses_put: Arc::clone(&self.sql_endpoint_uses_put),
+            cluster_info: Arc::clone(&self.cluster_info),
+            opensearch_sql_uses_legacy_path: Arc::clone(&self.opensearch_sql_uses_legacy_path),
         }
     }
 }
@@ -400,6 +455,15 @@ pub async fn test_connection(client: &mut EsClient, timeout: Duration) -> Result
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(format!("Elasticsearch error ({status}) for {check_path}: {body}"));
+        }
+        // The default check hits the cluster root, which already carries the
+        // distribution/version: remember it so SQL routing needs no extra probe.
+        if check_path.split('?').next() == Some("/") {
+            if let Ok(Ok(body)) = tokio::time::timeout(timeout, resp.json::<Value>()).await {
+                if let Some(info) = ElasticsearchClusterInfo::from_root_response(&body) {
+                    client.remember_cluster_info(info);
+                }
+            }
         }
         return Ok(());
     }
@@ -1033,6 +1097,15 @@ async fn close_es_scroll(client: &EsClient, scroll_id: &str) -> Result<(), Strin
 }
 
 async fn close_es_sql_cursor(client: &EsClient, cursor: &str) -> Result<(), String> {
+    // A SQL cursor only exists after a SQL query, which already detected the distribution.
+    if client.cached_cluster_info().is_some_and(ElasticsearchClusterInfo::is_opensearch) {
+        let (status, body) =
+            send_opensearch_sql_request(client, Some("close"), &serde_json::json!({ "cursor": cursor })).await?;
+        if !status.is_success() {
+            return Err(format!("Elasticsearch error: {body}"));
+        }
+        return Ok(());
+    }
     let resp = send_es_sql_request(client, "/_sql/close", &serde_json::json!({ "cursor": cursor })).await?;
     if !client.response_status(&resp).is_success() {
         let body = resp.text().await.unwrap_or_default();
@@ -1070,6 +1143,63 @@ async fn send_es_sql_request(
         client.mark_sql_endpoint_uses_put();
     }
     Ok(retried)
+}
+
+/// Sends a body to the OpenSearch SQL plugin: `POST /_plugins/_sql?format=jdbc`
+/// (or `/_plugins/_sql/<action>`), falling back to the OpenDistro-era
+/// `/_opendistro/_sql` path when the `_plugins` endpoint does not exist. The
+/// fallback is remembered for the connection.
+async fn send_opensearch_sql_request(
+    client: &EsClient,
+    action: Option<&str>,
+    body: &serde_json::Value,
+) -> Result<(StatusCode, String), String> {
+    async fn send(
+        client: &EsClient,
+        legacy: bool,
+        action: Option<&str>,
+        body: &serde_json::Value,
+    ) -> Result<(StatusCode, String), String> {
+        let base = if legacy { "/_opendistro/_sql" } else { "/_plugins/_sql" };
+        let path = match action {
+            Some(action) => format!("{base}/{action}"),
+            None => format!("{base}?format=jdbc"),
+        };
+        let resp =
+            client.post(&path).json(body).send().await.map_err(|e| format!("Elasticsearch request failed: {e}"))?;
+        let status = client.response_status(&resp);
+        let text = resp.text().await.map_err(|e| format!("Elasticsearch response read failed: {e}"))?;
+        Ok((status, text))
+    }
+
+    let legacy = client.opensearch_sql_uses_legacy_path();
+    let response = send(client, legacy, action, body).await?;
+    if legacy || !opensearch_sql_endpoint_missing(response.0, &response.1) {
+        return Ok(response);
+    }
+    let retried = send(client, true, action, body).await?;
+    if !opensearch_sql_endpoint_missing(retried.0, &retried.1) {
+        client.mark_opensearch_sql_uses_legacy_path();
+    }
+    Ok(retried)
+}
+
+/// True when the response says the SQL endpoint itself is missing, as opposed
+/// to an error from the SQL plugin (which always carries `error.details`, even
+/// for a 404 `IndexNotFoundException`).
+fn opensearch_sql_endpoint_missing(status: StatusCode, body: &str) -> bool {
+    let plugin_error = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .is_some_and(|body| body.pointer("/error/details").is_some());
+    if plugin_error {
+        return false;
+    }
+    match status.as_u16() {
+        404 => true,
+        // Without the plugin, `_plugins` is parsed as an index name or has no handler.
+        400 | 405 => body.contains("_plugins") || body.contains("no handler found"),
+        _ => false,
+    }
 }
 
 /// Close a previously returned ES cursor. Supports DBX-wrapped paged cursors,
@@ -2143,6 +2273,291 @@ fn validate_elasticsearch_ndjson(body: &str) -> Result<String, String> {
     Ok(normalized)
 }
 
+/// Largest response body a raw console request may return.
+pub const ELASTICSEARCH_RAW_REQUEST_MAX_BODY_BYTES: usize = 50 * 1024 * 1024;
+
+/// Returns the cluster distribution and version from `GET /`, probing at most
+/// once per connection. A non-2xx root response (e.g. a 403 for restricted
+/// accounts) is cached as unknown; a transport failure is returned and not cached.
+pub async fn cluster_info(client: &EsClient) -> Result<ElasticsearchClusterInfo, String> {
+    if let Some(info) = client.cached_cluster_info() {
+        return Ok(info.clone());
+    }
+    let resp = client
+        .get("/")
+        .send()
+        .await
+        .map_err(|e| format!("Elasticsearch request failed: {}", format_reqwest_error(&e.without_url())))?;
+    let info = if client.response_status(&resp).is_success() {
+        resp.json::<Value>()
+            .await
+            .ok()
+            .and_then(|body| ElasticsearchClusterInfo::from_root_response(&body))
+            .unwrap_or_default()
+    } else {
+        ElasticsearchClusterInfo::default()
+    };
+    client.remember_cluster_info(info.clone());
+    Ok(info)
+}
+
+async fn is_opensearch(client: &EsClient) -> bool {
+    cluster_info(client).await.is_ok_and(|info| info.is_opensearch())
+}
+
+/// A validated request from the Dev Tools console.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElasticsearchRawRequest {
+    method: Method,
+    path: String,
+    body: Option<String>,
+}
+
+impl ElasticsearchRawRequest {
+    /// Validates the method (GET, POST, PUT, DELETE, HEAD, PATCH) and
+    /// normalizes the path (leading slash, date-math encoding). The path may
+    /// carry a query string.
+    pub fn parse(method: &str, path: &str, body: Option<String>) -> Result<Self, String> {
+        let method_name = method.trim().to_ascii_uppercase();
+        let method = match method_name.as_str() {
+            "GET" => Method::GET,
+            "POST" => Method::POST,
+            "PUT" => Method::PUT,
+            "DELETE" => Method::DELETE,
+            "HEAD" => Method::HEAD,
+            "PATCH" => Method::PATCH,
+            _ => {
+                return Err(format!(
+                    "Unsupported HTTP method: {method_name}. Use GET, POST, PUT, DELETE, HEAD, or PATCH."
+                ))
+            }
+        };
+        let path = normalize_elasticsearch_raw_path(path)?;
+        let body = if method == Method::HEAD { None } else { body.filter(|body| !body.trim().is_empty()) };
+        Ok(Self { method, path, body })
+    }
+
+    pub fn method(&self) -> &str {
+        self.method.as_str()
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Whether the request is allowed on a read-only connection: GET/HEAD,
+    /// plus POST to search-style endpoints and closing PIT/scroll contexts.
+    pub fn is_read_only(&self) -> bool {
+        elasticsearch_raw_request_is_read_only(&self.method, &self.path, self.body.as_deref())
+    }
+}
+
+/// Raw console response. Non-2xx statuses are data, not errors.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ElasticsearchRawResponse {
+    pub status: u16,
+    pub body: String,
+    pub took_ms: u64,
+}
+
+fn normalize_elasticsearch_raw_path(path: &str) -> Result<String, String> {
+    let path = path.trim();
+    if path.chars().any(char::is_control) {
+        return Err("Invalid path: control characters are not allowed".to_string());
+    }
+    let path = if path.starts_with('/') { path.to_string() } else { format!("/{path}") };
+    let path_part = path.split('?').next().unwrap_or(&path);
+    if path_part
+        .split('/')
+        .any(|segment| matches!(percent_decode_str(segment).decode_utf8_lossy().as_ref(), "." | ".."))
+    {
+        return Err("Invalid path: '.' and '..' segments are not allowed".to_string());
+    }
+    Ok(normalize_elasticsearch_rest_path(&path))
+}
+
+pub async fn execute_raw_request(
+    client: &EsClient,
+    request: &ElasticsearchRawRequest,
+) -> Result<ElasticsearchRawResponse, String> {
+    execute_raw_request_with_limit(client, request, ELASTICSEARCH_RAW_REQUEST_MAX_BODY_BYTES).await
+}
+
+async fn execute_raw_request_with_limit(
+    client: &EsClient,
+    request: &ElasticsearchRawRequest,
+    max_body_bytes: usize,
+) -> Result<ElasticsearchRawResponse, String> {
+    let start = std::time::Instant::now();
+    let mut builder = client.request(request.method.clone(), &request.path);
+    if let Some(body) = &request.body {
+        builder = if is_elasticsearch_ndjson_path(&request.path) {
+            let mut body = body.trim_end().to_string();
+            body.push('\n');
+            builder.header(reqwest::header::CONTENT_TYPE, "application/x-ndjson").body(body)
+        } else {
+            builder.header(reqwest::header::CONTENT_TYPE, "application/json").body(body.clone())
+        };
+    }
+    let mut resp = builder
+        .send()
+        .await
+        .map_err(|e| format!("Elasticsearch request failed: {}", format_reqwest_error(&e.without_url())))?;
+    let status = client.response_status(&resp).as_u16();
+
+    let too_large = || {
+        format!(
+            "Elasticsearch response body exceeds the {} MB limit for console requests. Narrow the request \
+             (for example with size, filter_path or _source filtering).",
+            max_body_bytes / (1024 * 1024)
+        )
+    };
+    if resp.content_length().is_some_and(|length| length > max_body_bytes as u64) {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("Elasticsearch response read failed: {}", format_reqwest_error(&e.without_url())))?
+    {
+        if bytes.len() + chunk.len() > max_body_bytes {
+            return Err(too_large());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let body = String::from_utf8(bytes).unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
+    Ok(ElasticsearchRawResponse { status, body, took_ms: start.elapsed().as_millis() as u64 })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchQueryLanguage {
+    Sql,
+    Ppl,
+}
+
+/// Lower-cased, percent-decoded path segments starting at the first API
+/// segment (`_search`, `_plugins`, ...). Index names never start with `_`, so
+/// everything before it is the index/type target.
+fn elasticsearch_api_segments(path: &str) -> Vec<String> {
+    let path = path.split('?').next().unwrap_or(path);
+    let segments: Vec<String> = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| percent_decode_str(segment).decode_utf8_lossy().to_ascii_lowercase())
+        .collect();
+    let start = segments.iter().position(|segment| segment.starts_with('_')).unwrap_or(segments.len());
+    segments[start..].to_vec()
+}
+
+fn elasticsearch_raw_request_is_read_only(method: &Method, path: &str, body: Option<&str>) -> bool {
+    let api = elasticsearch_api_segments(path);
+    let api: Vec<&str> = api.iter().map(String::as_str).collect();
+
+    if let Some(language) = search_query_language_endpoint(&api) {
+        return matches!(*method, Method::GET | Method::HEAD | Method::POST)
+            && search_query_request_is_read_only(language, path, body);
+    }
+
+    match *method {
+        Method::GET | Method::HEAD => true,
+        Method::POST => matches!(
+            api.as_slice(),
+            ["_search"]
+                | ["_search", "template" | "scroll" | "point_in_time"]
+                | ["_search", "scroll", _]
+                | ["_msearch"]
+                | ["_msearch", "template"]
+                | ["_count"]
+                | ["_field_caps"]
+                | ["_validate", "query"]
+                | ["_explain"]
+                | ["_explain", _]
+                | ["_doc", _, "_explain" | "_termvectors"]
+                | ["_termvectors"]
+                | ["_termvectors", _]
+                | ["_mtermvectors"]
+                | ["_render", "template"]
+                | ["_render", "template", _]
+                | ["_rank_eval"]
+                | ["_pit"]
+                | ["_async_search"]
+                | ["_sql", "translate" | "close"]
+                | ["_plugins" | "_opendistro", "_sql" | "_ppl", "_explain"]
+                | ["_plugins" | "_opendistro", "_sql", "close"]
+                | ["_plugins" | "_opendistro", "_asynchronous_search"]
+        ),
+        // Closing a point-in-time or scroll context releases resources only.
+        Method::DELETE => matches!(
+            api.as_slice(),
+            ["_pit"] | ["_search", "point_in_time" | "scroll"] | ["_search", "point_in_time" | "scroll", _]
+        ),
+        _ => false,
+    }
+}
+
+fn search_query_language_endpoint(api: &[&str]) -> Option<SearchQueryLanguage> {
+    match api {
+        ["_sql"] | ["_plugins" | "_opendistro", "_sql"] => Some(SearchQueryLanguage::Sql),
+        ["_plugins" | "_opendistro", "_ppl"] => Some(SearchQueryLanguage::Ppl),
+        _ => None,
+    }
+}
+
+/// SQL/PPL endpoints are read-only only when every statement they carry (JSON
+/// `query`, or the legacy `sql`/`query` URL parameter) is a read. A body with
+/// just a `cursor` continues an existing read.
+fn search_query_request_is_read_only(language: SearchQueryLanguage, path: &str, body: Option<&str>) -> bool {
+    let mut queries = Vec::new();
+    if let Some(body) = body {
+        let Ok(body) = serde_json::from_str::<Value>(body) else {
+            return false;
+        };
+        if let Some(query) = body.get("query") {
+            let Some(query) = query.as_str() else {
+                return false;
+            };
+            queries.push(query.to_string());
+        }
+    }
+    queries.extend(["sql", "query"].into_iter().filter_map(|name| elasticsearch_query_parameter(path, name)));
+    queries.iter().all(|query| match language {
+        SearchQueryLanguage::Sql => sql_statement_is_read_only(query),
+        SearchQueryLanguage::Ppl => ppl_query_is_read_only(query),
+    })
+}
+
+fn strip_leading_sql_comments(input: &str) -> &str {
+    let mut rest = input;
+    loop {
+        rest = rest.trim_start();
+        if let Some(comment) = rest.strip_prefix("--") {
+            rest = comment.split_once('\n').map_or("", |(_, remaining)| remaining);
+        } else if let Some(comment) = rest.strip_prefix("/*") {
+            rest = comment.split_once("*/").map_or("", |(_, remaining)| remaining);
+        } else {
+            return rest;
+        }
+    }
+}
+
+fn leading_word(input: &str) -> String {
+    input.trim_start().chars().take_while(char::is_ascii_alphabetic).collect::<String>().to_ascii_lowercase()
+}
+
+fn sql_statement_is_read_only(query: &str) -> bool {
+    matches!(leading_word(strip_leading_sql_comments(query)).as_str(), "select" | "show" | "describe" | "desc")
+}
+
+fn ppl_query_is_read_only(query: &str) -> bool {
+    let mut commands = query.split('|');
+    let first = commands.next().map(leading_word).unwrap_or_default();
+    // `ml`, `kmeans` and `ad` train or run ML models on the cluster.
+    matches!(first.as_str(), "source" | "search" | "describe" | "show")
+        && commands.all(|command| !matches!(leading_word(command).as_str(), "ml" | "kmeans" | "ad"))
+}
+
 pub type SqlResponseParser = fn(&serde_json::Value, std::time::Instant) -> Option<QueryResult>;
 
 pub async fn execute_rest_query(client: &EsClient, input: &str) -> Result<QueryResult, String> {
@@ -2777,6 +3192,9 @@ async fn execute_sql_query(
     sql_response_parser: SqlResponseParser,
     cursor: Option<&str>,
 ) -> Result<QueryResult, String> {
+    let opensearch = is_opensearch(client).await;
+    let sql_response_parser: SqlResponseParser =
+        if opensearch { parse_opensearch_sql_response } else { sql_response_parser };
     let (body, mut column_metadata) = if let Some(cursor) = cursor {
         if let Ok(search_cursor) = decode_es_search_cursor(cursor) {
             match search_cursor {
@@ -2798,14 +3216,23 @@ async fn execute_sql_query(
         // OFFSET form so ES SQL cursor pagination can return exactly `n` rows
         // per page and continue beyond index.max_result_window.
         let (base_query, limit) = es_sql_pagination(query);
-        let query = adapt_elasticsearch_sql_query(&base_query);
+        let query = if opensearch {
+            adapt_opensearch_sql_query(&base_query)
+        } else {
+            adapt_elasticsearch_sql_query(&base_query)
+        };
         let fetch_size = limit.unwrap_or(ES_SQL_FETCH_SIZE);
         (serde_json::json!({ "query": query, "fetch_size": fetch_size }), None)
     };
 
-    let resp = send_es_sql_request(client, "/_sql", &body).await?;
-    let status = client.response_status(&resp);
-    let mut response_body: serde_json::Value = resp.json().await.unwrap_or_else(|_| serde_json::Value::Null);
+    let (status, mut response_body) = if opensearch {
+        let (status, text) = send_opensearch_sql_request(client, None, &body).await?;
+        (status, serde_json::from_str(&text).unwrap_or(serde_json::Value::Null))
+    } else {
+        let resp = send_es_sql_request(client, "/_sql", &body).await?;
+        let status = client.response_status(&resp);
+        (status, resp.json().await.unwrap_or(serde_json::Value::Null))
+    };
 
     if !status.is_success() {
         return Err(format_sql_error(status, &response_body));
@@ -2852,6 +3279,16 @@ fn sql_cursor_column_metadata(body: &serde_json::Value) -> Option<(String, Vec<s
 }
 
 fn adapt_elasticsearch_sql_query(query: &str) -> String {
+    adapt_sql_identifiers(query, '"')
+}
+
+/// OpenSearch SQL treats double-quoted text as a string literal, so special
+/// identifiers must be quoted with backticks there.
+fn adapt_opensearch_sql_query(query: &str) -> String {
+    adapt_sql_identifiers(query, '`')
+}
+
+fn adapt_sql_identifiers(query: &str, quote: char) -> String {
     let mut output = String::with_capacity(query.len());
     let mut index = 0;
     let mut state = SqlScanState::Normal;
@@ -2886,14 +3323,14 @@ fn adapt_elasticsearch_sql_query(query: &str) -> String {
                 }
                 '@' if is_at_identifier_boundary(&output) => {
                     let (identifier, next_index) = read_while(query, index, is_elasticsearch_identifier_part);
-                    output.push('"');
+                    output.push(quote);
                     output.push_str(identifier);
-                    output.push('"');
+                    output.push(quote);
                     index = next_index;
                 }
                 _ => {
                     if let Some(keyword) = relation_keyword_at(query, index) {
-                        index = quote_relation_after_keyword(query, index, keyword, &mut output);
+                        index = quote_relation_after_keyword(query, index, keyword, quote, &mut output);
                     } else {
                         output.push(ch);
                         index += ch.len_utf8();
@@ -2938,7 +3375,7 @@ fn adapt_elasticsearch_sql_query(query: &str) -> String {
     output
 }
 
-fn quote_relation_after_keyword(query: &str, index: usize, keyword: &str, output: &mut String) -> usize {
+fn quote_relation_after_keyword(query: &str, index: usize, keyword: &str, quote: char, output: &mut String) -> usize {
     let mut cursor = index + keyword.len();
     output.push_str(&query[index..cursor]);
 
@@ -2964,9 +3401,9 @@ fn quote_relation_after_keyword(query: &str, index: usize, keyword: &str, output
 
     let relation = &query[relation_start..cursor];
     if relation_name_needs_quotes(relation) {
-        output.push('"');
+        output.push(quote);
         output.push_str(relation);
-        output.push('"');
+        output.push(quote);
     } else {
         output.push_str(relation);
     }
@@ -3098,6 +3535,15 @@ fn next_char_at(query: &str, index: usize) -> Option<char> {
 
 fn parse_sql_response(body: &serde_json::Value, start: std::time::Instant) -> Option<QueryResult> {
     parse_tabular_sql_response(body, start, "columns", "rows", None)
+}
+
+/// Parses the OpenSearch/OpenDistro SQL `format=jdbc` shape (`schema` /
+/// `datarows`), accepting the Elasticsearch `columns`/`rows` shape as well.
+pub fn parse_opensearch_sql_response(body: &serde_json::Value, start: std::time::Instant) -> Option<QueryResult> {
+    // `total` counts every match and ignores LIMIT, so it is only the result
+    // size while a cursor is paging through those matches.
+    let total_key = body.get("cursor").and_then(serde_json::Value::as_str).map(|_| "total");
+    parse_tabular_sql_response(body, start, "schema", "datarows", total_key).or_else(|| parse_sql_response(body, start))
 }
 
 pub fn parse_tabular_sql_response(
@@ -4105,6 +4551,14 @@ mod tests {
         })
     }
 
+    /// Marks a mock client as plain Elasticsearch so SQL tests skip the `GET /` probe.
+    fn remember_elasticsearch_distribution(client: &EsClient) {
+        client.remember_cluster_info(super::ElasticsearchClusterInfo {
+            distribution: Some("elasticsearch".to_string()),
+            version: Some("7.17.0".to_string()),
+        });
+    }
+
     /// PIT 开得成功、但不认 `_shard_doc` 的集群返回的报错体。
     fn missing_shard_doc_error_body() -> String {
         r#"{"error":{"root_cause":[{"type":"query_shard_exception","reason":"No mapping found for [_shard_doc] in order to sort on","index":"products"}],"type":"search_phase_execution_exception","reason":"all shards failed"},"status":400}"#
@@ -4446,6 +4900,7 @@ mod tests {
         });
 
         let client = EsClient::new(&format!("http://{addr}"), None, None, false, Duration::from_secs(1));
+        remember_elasticsearch_distribution(&client);
         let first = super::execute_rest_query(&client, "SELECT name FROM products").await.unwrap();
         let second =
             super::execute_rest_query_with_cursor(&client, "SELECT name FROM products", first.session_id.as_deref())
@@ -4477,6 +4932,7 @@ mod tests {
                 .await;
 
         let client = EsClient::new(&format!("http://{addr}"), None, None, false, Duration::from_secs(1));
+        remember_elasticsearch_distribution(&client);
         let result = super::execute_rest_query(&client, "SELECT name FROM products").await.unwrap();
         let requests = server.await.unwrap();
 
@@ -4494,6 +4950,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = serve_responses(listener, vec![(200, es_sql_rows_body("es6-row-2"))]).await;
         let client = EsClient::new(&format!("http://{addr}"), None, None, false, Duration::from_secs(1));
+        remember_elasticsearch_distribution(&client);
         client.mark_sql_endpoint_uses_put();
         super::execute_rest_query(&client, "SELECT name FROM products").await.unwrap();
         let requests = server.await.unwrap();
@@ -4519,6 +4976,7 @@ mod tests {
         .await;
 
         let client = EsClient::new(&format!("http://{addr}"), None, None, false, Duration::from_secs(1));
+        remember_elasticsearch_distribution(&client);
         let result = super::execute_rest_query(&client, "SELECT name FROM products").await.unwrap();
         super::close_cursor(&client, &result.session_id.expect("cursor returned")).await.unwrap();
         let requests = server.await.unwrap();
@@ -4542,6 +5000,7 @@ mod tests {
         .await;
 
         let client = EsClient::new(&format!("http://{addr}"), None, None, false, Duration::from_secs(1));
+        remember_elasticsearch_distribution(&client);
         let error = super::execute_rest_query(&client, "SELECT name FROM products").await.unwrap_err();
         let requests = server.await.unwrap();
 
@@ -5879,5 +6338,366 @@ mod tests {
         super::test_connection(&mut client, timeout)
             .await
             .expect("Elasticsearch TLS connection with custom CA should succeed");
+    }
+
+    fn raw_request(method: &str, path: &str, body: Option<&str>) -> super::ElasticsearchRawRequest {
+        super::ElasticsearchRawRequest::parse(method, path, body.map(str::to_string)).unwrap()
+    }
+
+    fn opensearch_root_body() -> String {
+        r#"{"name":"node-1","version":{"distribution":"opensearch","number":"2.11.1"},"tagline":"The OpenSearch Project: https://opensearch.org/"}"#
+            .to_string()
+    }
+
+    #[test]
+    fn raw_request_normalizes_paths_and_validates_methods() {
+        let request = raw_request("get", "logs-*/_search?size=0&q=level:WARN", None);
+        assert_eq!(request.method(), "GET");
+        assert_eq!(request.path(), "/logs-*/_search?size=0&q=level:WARN");
+        assert_eq!(raw_request("GET", "  ", None).path(), "/");
+        assert_eq!(raw_request("GET", "/_cat/indices?v", None).path(), "/_cat/indices?v");
+        assert_eq!(raw_request("GET", "<logs-{now/d}>/_search", None).path(), "/%3Clogs-%7Bnow%2Fd%7D%3E/_search");
+        assert_eq!(raw_request("patch", "/_plugins/_ism/policies/p", Some("{}")).method(), "PATCH");
+        // HEAD never carries a body; whitespace-only bodies are dropped.
+        assert_eq!(raw_request("HEAD", "/logs", Some("{}")), raw_request("HEAD", "/logs", None));
+        assert_eq!(raw_request("POST", "/_search", Some("  \n")), raw_request("POST", "/_search", None));
+
+        let error = super::ElasticsearchRawRequest::parse("OPTIONS", "/", None).unwrap_err();
+        assert!(error.contains("Unsupported HTTP method: OPTIONS"), "{error}");
+        for path in ["/../_nodes", "/logs/%2E%2E/x", "/_search\r\nHost: evil"] {
+            assert!(super::ElasticsearchRawRequest::parse("GET", path, None).is_err(), "{path:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn raw_request_read_only_allow_deny_table() {
+        let sql = |query: &str| format!(r#"{{"query":"{query}"}}"#);
+        let cases: Vec<(&str, &str, Option<String>, bool)> = vec![
+            ("GET", "/_cluster/health", None, true),
+            ("HEAD", "/logs", None, true),
+            ("GET", "/logs/_mapping", None, true),
+            ("POST", "/logs-*/_search?size=0", Some("{}".into()), true),
+            ("POST", "/_search/scroll", Some(r#"{"scroll_id":"x"}"#.into()), true),
+            ("POST", "/logs/_search/template", Some("{}".into()), true),
+            ("POST", "/_msearch", Some("{}\n{}\n".into()), true),
+            ("POST", "/logs/_msearch/template", Some("{}\n{}\n".into()), true),
+            ("POST", "/logs/_count", Some("{}".into()), true),
+            ("POST", "/logs/_field_caps?fields=*", None, true),
+            ("POST", "/logs/_validate/query?explain", Some("{}".into()), true),
+            ("POST", "/logs/_explain/1", Some("{}".into()), true),
+            ("POST", "/logs/_doc/1/_explain", Some("{}".into()), true),
+            ("POST", "/logs/_termvectors/1", None, true),
+            ("POST", "/_mtermvectors", Some("{}".into()), true),
+            ("POST", "/_render/template", Some("{}".into()), true),
+            ("POST", "/logs/_rank_eval", Some("{}".into()), true),
+            ("POST", "/logs/_async_search", Some("{}".into()), true),
+            ("POST", "/logs/_pit?keep_alive=1m", None, true),
+            ("DELETE", "/_pit", Some(r#"{"id":"x"}"#.into()), true),
+            ("POST", "/logs/_search/point_in_time?keep_alive=1m", None, true),
+            ("DELETE", "/_search/point_in_time/_all", None, true),
+            ("DELETE", "/_search/scroll", Some(r#"{"scroll_id":"x"}"#.into()), true),
+            ("POST", "/_sql?format=txt", Some(sql("SELECT * FROM logs")), true),
+            ("POST", "/_sql", Some(r#"{"cursor":"abc"}"#.into()), true),
+            ("POST", "/_sql/translate", Some(sql("SELECT 1")), true),
+            ("POST", "/_sql/close", Some(r#"{"cursor":"abc"}"#.into()), true),
+            ("POST", "/_plugins/_sql?format=jdbc", Some(sql("-- note\\n select level from logs")), true),
+            ("POST", "/_plugins/_sql", Some(sql("SHOW TABLES LIKE %")), true),
+            ("POST", "/_plugins/_sql/_explain", Some(sql("DELETE FROM logs")), true),
+            ("POST", "/_opendistro/_sql", Some(sql("SELECT 1")), true),
+            ("POST", "/_plugins/_ppl", Some(sql("source=logs | where level = 'WARN' | stats count()")), true),
+            ("POST", "/_plugins/_asynchronous_search", Some("{}".into()), true),
+            // Writes and admin calls.
+            ("PUT", "/logs", Some("{}".into()), false),
+            ("PATCH", "/_plugins/_security/api/internalusers", Some("[]".into()), false),
+            ("DELETE", "/logs", None, false),
+            ("DELETE", "/logs/_doc/1", None, false),
+            ("POST", "/logs/_doc", Some("{}".into()), false),
+            ("POST", "/logs/_update/1", Some("{}".into()), false),
+            ("POST", "/logs/_bulk", Some("{}\n".into()), false),
+            ("POST", "/logs/_delete_by_query", Some("{}".into()), false),
+            ("POST", "/logs/_update_by_query", Some("{}".into()), false),
+            ("POST", "/logs/_mapping", Some("{}".into()), false),
+            ("POST", "/_reindex", Some("{}".into()), false),
+            ("POST", "/logs/_close", None, false),
+            ("POST", "/logs/_refresh", None, false),
+            ("POST", "/_cluster/reroute", None, false),
+            ("POST", "/logs/_doc/_search", Some("{}".into()), false),
+            ("POST", "/logs/%5Fdoc/1", Some("{}".into()), false),
+            ("POST", "/_sql", Some(sql("DELETE FROM logs")), false),
+            ("POST", "/_plugins/_sql", Some(sql("DELETE FROM logs WHERE a = 1")), false),
+            ("POST", "/_opendistro/_sql", Some("not json".into()), false),
+            ("GET", "/_opendistro/_sql?sql=DELETE%20FROM%20logs", None, false),
+            ("PUT", "/_sql", Some(sql("SELECT 1")), false),
+            ("POST", "/_plugins/_ppl", Some(sql("source=logs | kmeans centroids=3")), false),
+            ("DELETE", "/_async_search/abc", None, false),
+        ];
+        for (method, path, body, expected) in cases {
+            let request = raw_request(method, path, body.as_deref());
+            assert_eq!(request.is_read_only(), expected, "{method} {path} {body:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_request_sends_patch_and_returns_non_2xx_as_data() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let error_body =
+            r#"{"error":{"type":"index_not_found_exception","reason":"no such index [missing]"},"status":404}"#;
+        let server = serve_responses(
+            listener,
+            vec![
+                (200, r#"{"acknowledged":true,"big":12345678901234567890}"#.to_string()),
+                (404, error_body.to_string()),
+            ],
+        )
+        .await;
+
+        let client = EsClient::new(&format!("http://{addr}"), None, None, false, Duration::from_secs(1));
+        let patched = super::execute_raw_request(
+            &client,
+            &raw_request("PATCH", "_plugins/_ism/policies/p?if_seq_no=1", Some(r#"{"policy":{"n":1.50}}"#)),
+        )
+        .await
+        .unwrap();
+        let missing = super::execute_raw_request(&client, &raw_request("GET", "/missing/_search", None)).await.unwrap();
+        let requests = server.await.unwrap();
+
+        assert!(requests[0].starts_with("PATCH /_plugins/_ism/policies/p?if_seq_no=1 "), "{}", requests[0]);
+        assert!(requests[0].to_ascii_lowercase().contains("content-type: application/json"), "{}", requests[0]);
+        // The body is forwarded byte-for-byte (no JSON re-serialization).
+        assert!(requests[0].ends_with(r#"{"policy":{"n":1.50}}"#), "{}", requests[0]);
+        assert_eq!(patched.status, 200);
+        assert_eq!(patched.body, r#"{"acknowledged":true,"big":12345678901234567890}"#);
+        assert_eq!(missing.status, 404);
+        assert_eq!(missing.body, error_body);
+
+        let json = serde_json::to_value(&missing).unwrap();
+        assert!(json.get("tookMs").is_some(), "{json}");
+    }
+
+    #[tokio::test]
+    async fn raw_request_sends_ndjson_with_trailing_newline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = serve_responses(listener, vec![(200, r#"{"responses":[]}"#.to_string())]).await;
+
+        let client = EsClient::new(&format!("http://{addr}"), None, None, false, Duration::from_secs(1));
+        let body = "{\"index\":\"logs\"}\n{\"query\":{\"match_all\":{}}}";
+        super::execute_raw_request(&client, &raw_request("POST", "/_msearch", Some(body))).await.unwrap();
+        let requests = server.await.unwrap();
+
+        assert!(requests[0].to_ascii_lowercase().contains("content-type: application/x-ndjson"), "{}", requests[0]);
+        assert!(requests[0].ends_with("{\"query\":{\"match_all\":{}}}\n"), "{}", requests[0]);
+    }
+
+    #[tokio::test]
+    async fn raw_request_rejects_oversized_response_bodies() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = serve_responses(listener, vec![(200, format!(r#"{{"data":"{}"}}"#, "x".repeat(4096)))]).await;
+
+        let client = EsClient::new(&format!("http://{addr}"), None, None, false, Duration::from_secs(1));
+        let error = super::execute_raw_request_with_limit(&client, &raw_request("GET", "/_search", None), 1024)
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert!(error.contains("exceeds"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn raw_request_transport_failure_is_an_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let client = EsClient::new(&format!("http://{addr}"), None, None, false, Duration::from_secs(1));
+        let error = super::execute_raw_request(&client, &raw_request("GET", "/", None)).await.unwrap_err();
+        assert!(error.starts_with("Elasticsearch request failed"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn cluster_info_detects_opensearch_once_per_client() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = serve_responses(listener, vec![(200, opensearch_root_body())]).await;
+
+        let client = EsClient::new(&format!("http://{addr}"), None, None, false, Duration::from_secs(1));
+        let first = super::cluster_info(&client).await.unwrap();
+        // The clone shares the cache, so it must not probe again (the mock only answers once).
+        let second = super::cluster_info(&client.clone()).await.unwrap();
+        let requests = server.await.unwrap();
+
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET / "), "{}", requests[0]);
+        assert!(first.is_opensearch());
+        assert_eq!(first.version.as_deref(), Some("2.11.1"));
+        assert_eq!(first, second);
+
+        let elasticsearch = super::ElasticsearchClusterInfo::from_root_response(
+            &json!({ "version": { "number": "8.13.0", "build_flavor": "default" } }),
+        )
+        .unwrap();
+        assert_eq!(elasticsearch.distribution.as_deref(), Some("elasticsearch"));
+        assert!(!elasticsearch.is_opensearch());
+    }
+
+    #[tokio::test]
+    async fn test_connection_remembers_cluster_info_from_root_check() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = serve_responses(listener, vec![(200, opensearch_root_body())]).await;
+
+        let mut client = EsClient::new(&format!("http://{addr}"), None, None, false, Duration::from_secs(1));
+        super::test_connection(&mut client, Duration::from_secs(1)).await.unwrap();
+        server.await.unwrap();
+
+        assert!(client.cached_cluster_info().is_some_and(super::ElasticsearchClusterInfo::is_opensearch));
+    }
+
+    #[tokio::test]
+    async fn opensearch_sql_uses_plugins_endpoint_with_jdbc_format_and_closes_cursor() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = serve_responses(
+            listener,
+            vec![
+                (200, opensearch_root_body()),
+                (
+                    200,
+                    r#"{"schema":[{"name":"level","type":"keyword"},{"name":"c","type":"long"}],"datarows":[["INFO",573],["WARN",19]],"total":3,"size":2,"cursor":"os-1","status":200}"#
+                        .to_string(),
+                ),
+                (200, r#"{"succeeded":true}"#.to_string()),
+            ],
+        )
+        .await;
+
+        let client = EsClient::new(&format!("http://{addr}"), None, None, false, Duration::from_secs(1));
+        let result = super::execute_rest_query(
+            &client,
+            "SELECT level, COUNT(*) AS c FROM logs-local-* WHERE @timestamp > '2026-01-01' GROUP BY level",
+        )
+        .await
+        .unwrap();
+        super::close_cursor(&client, &result.session_id.clone().expect("cursor returned")).await.unwrap();
+        let requests = server.await.unwrap();
+
+        assert!(requests[0].starts_with("GET / "), "{}", requests[0]);
+        assert!(requests[1].starts_with("POST /_plugins/_sql?format=jdbc "), "{}", requests[1]);
+        // OpenSearch SQL reads double quotes as string literals, so identifiers get backticks.
+        assert!(requests[1].contains(r#"FROM `logs-local-*` WHERE `@timestamp` > '2026-01-01'"#), "{}", requests[1]);
+        assert!(requests[2].starts_with("POST /_plugins/_sql/close "), "{}", requests[2]);
+        assert!(requests[2].ends_with(r#"{"cursor":"os-1"}"#), "{}", requests[2]);
+        assert_eq!(result.columns, vec!["level", "c"]);
+        assert_eq!(result.rows, vec![vec![json!("INFO"), json!(573)], vec![json!("WARN"), json!(19)]]);
+        assert_eq!(result.affected_rows, 3);
+        assert!(result.has_more);
+    }
+
+    #[tokio::test]
+    async fn opensearch_sql_falls_back_to_opendistro_path_when_plugins_endpoint_is_missing() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = serve_responses(
+            listener,
+            vec![
+                (200, opensearch_root_body()),
+                (404, r#"{"error":{"root_cause":[{"type":"index_not_found_exception","reason":"no such index [_plugins]"}],"type":"index_not_found_exception","reason":"no such index [_plugins]"},"status":404}"#.to_string()),
+                (200, r#"{"schema":[{"name":"n","type":"integer"}],"datarows":[[1]],"total":1,"size":1,"status":200}"#.to_string()),
+                (200, r#"{"schema":[{"name":"n","type":"integer"}],"datarows":[[2]],"total":1,"size":1,"status":200}"#.to_string()),
+            ],
+        )
+        .await;
+
+        let client = EsClient::new(&format!("http://{addr}"), None, None, false, Duration::from_secs(1));
+        let first = super::execute_rest_query(&client, "SELECT 1 AS n").await.unwrap();
+        let second = super::execute_rest_query(&client, "SELECT 2 AS n").await.unwrap();
+        let requests = server.await.unwrap();
+
+        assert!(requests[1].starts_with("POST /_plugins/_sql?format=jdbc "), "{}", requests[1]);
+        assert!(requests[2].starts_with("POST /_opendistro/_sql?format=jdbc "), "{}", requests[2]);
+        // The fallback is remembered for the connection.
+        assert!(requests[3].starts_with("POST /_opendistro/_sql?format=jdbc "), "{}", requests[3]);
+        assert_eq!(first.rows, vec![vec![json!(1)]]);
+        assert_eq!(second.rows, vec![vec![json!(2)]]);
+    }
+
+    #[tokio::test]
+    async fn opensearch_sql_plugin_not_found_error_does_not_trigger_the_fallback() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = serve_responses(
+            listener,
+            vec![
+                (200, opensearch_root_body()),
+                (404, r#"{"error":{"reason":"Error occurred in OpenSearch engine: no such index [missing]","details":"org.opensearch.index.IndexNotFoundException: no such index [missing]","type":"IndexNotFoundException"},"status":404}"#.to_string()),
+            ],
+        )
+        .await;
+
+        let client = EsClient::new(&format!("http://{addr}"), None, None, false, Duration::from_secs(1));
+        let error = super::execute_rest_query(&client, "SELECT level FROM missing GROUP BY level").await.unwrap_err();
+        let requests = server.await.unwrap();
+
+        assert_eq!(requests.len(), 2);
+        assert!(error.contains("no such index [missing]"), "{error}");
+        assert!(!client.opensearch_sql_uses_legacy_path());
+    }
+
+    #[test]
+    fn parses_opensearch_jdbc_sql_responses() {
+        let start = std::time::Instant::now();
+        let limited = super::parse_opensearch_sql_response(
+            &json!({
+                "schema": [{ "name": "level", "type": "keyword" }, { "name": "@timestamp", "type": "timestamp" }],
+                "datarows": [["INFO", "2026-09-25 08:28:07.822"], ["WARN", null]],
+                "total": 593,
+                "size": 2,
+                "status": 200
+            }),
+            start,
+        )
+        .unwrap();
+        assert_eq!(limited.columns, vec!["level", "@timestamp"]);
+        assert_eq!(limited.rows[1], vec![json!("WARN"), serde_json::Value::Null]);
+        // Without a cursor `total` counts matches beyond LIMIT, not returned rows.
+        assert_eq!(limited.affected_rows, 2);
+        assert!(!limited.has_more);
+
+        let paged = super::parse_opensearch_sql_response(
+            &json!({ "schema": [{ "name": "n", "type": "long" }], "datarows": [[1]], "total": 42, "cursor": "c-1" }),
+            start,
+        )
+        .unwrap();
+        assert_eq!(paged.affected_rows, 42);
+        assert_eq!(paged.session_id.as_deref(), Some("c-1"));
+        assert!(paged.has_more);
+
+        let elasticsearch_shape = super::parse_opensearch_sql_response(
+            &json!({ "columns": [{ "name": "n", "type": "long" }], "rows": [[1]] }),
+            start,
+        )
+        .unwrap();
+        assert_eq!(elasticsearch_shape.rows, vec![vec![json!(1)]]);
+        assert!(super::parse_opensearch_sql_response(&json!({ "error": "x" }), start).is_none());
+    }
+
+    #[test]
+    fn opensearch_sql_endpoint_missing_distinguishes_core_errors_from_plugin_errors() {
+        use reqwest::StatusCode;
+        assert!(super::opensearch_sql_endpoint_missing(StatusCode::NOT_FOUND, "{}"));
+        assert!(super::opensearch_sql_endpoint_missing(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"type":"invalid_index_name_exception","reason":"Invalid index name [_plugins], must not start with '_'"}}"#
+        ));
+        assert!(super::opensearch_sql_endpoint_missing(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"no handler found for uri [/_plugins/_sql] and method [POST]"}"#
+        ));
+        assert!(!super::opensearch_sql_endpoint_missing(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"reason":"Invalid SQL query","details":"syntax error","type":"SyntaxCheckException"},"status":400}"#
+        ));
+        assert!(!super::opensearch_sql_endpoint_missing(StatusCode::INTERNAL_SERVER_ERROR, "{}"));
     }
 }

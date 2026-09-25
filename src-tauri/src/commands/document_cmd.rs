@@ -143,6 +143,26 @@ pub async fn elasticsearch_get_index_metadata(
 }
 
 #[tauri::command]
+pub async fn elasticsearch_raw_request(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    method: String,
+    path: String,
+    body: Option<String>,
+) -> Result<dbx_core::db::elasticsearch_driver::ElasticsearchRawResponse, String> {
+    // Read-only protection is enforced in core, per request method/endpoint.
+    dbx_core::document_ops::elasticsearch_raw_request_core(&state, &connection_id, &method, &path, body).await
+}
+
+#[tauri::command]
+pub async fn elasticsearch_cluster_info(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+) -> Result<dbx_core::db::elasticsearch_driver::ElasticsearchClusterInfo, String> {
+    dbx_core::document_ops::elasticsearch_cluster_info_core(&state, &connection_id).await
+}
+
+#[tauri::command]
 pub async fn elasticsearch_delete_all_documents(
     state: State<'_, Arc<AppState>>,
     connection_id: String,

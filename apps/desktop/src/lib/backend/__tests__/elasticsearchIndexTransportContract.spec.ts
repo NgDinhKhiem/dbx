@@ -22,6 +22,8 @@ function functionBody(source: string, operation: string): string {
 const operations = [
   { name: "elasticsearchGetIndexMetadata", command: "elasticsearch_get_index_metadata", route: "/api/document-store/elasticsearch/index-metadata" },
   { name: "elasticsearchDeleteAllDocuments", command: "elasticsearch_delete_all_documents", route: "/api/document-store/elasticsearch/documents/delete-all" },
+  { name: "elasticsearchRawRequest", command: "elasticsearch_raw_request", route: "/api/elasticsearch/raw-request" },
+  { name: "elasticsearchClusterInfo", command: "elasticsearch_cluster_info", route: "/api/elasticsearch/cluster-info" },
 ] as const;
 
 describe("Elasticsearch index action dual transport contract", () => {
@@ -45,6 +47,20 @@ describe("Elasticsearch index action dual transport contract", () => {
     for (const field of ["total", "deleted", "versionConflicts", "timedOut", "failures"]) {
       expect(tauri, `ElasticsearchDeleteByQueryResult.${field}`).toContain(`  ${field}:`);
     }
+  });
+
+  it("sends the raw request fields the Rust command and web route deserialize", () => {
+    for (const source of [functionBody(tauri, "elasticsearchRawRequest"), functionBody(http, "elasticsearchRawRequest")]) {
+      for (const field of ["connectionId", "method: request.method", "path: request.path", "body: request.body"]) {
+        expect(source).toContain(field);
+      }
+    }
+    // The console reads non-2xx statuses from the response instead of a thrown error.
+    for (const field of ["status", "body", "tookMs"]) {
+      expect(tauri, `ElasticsearchRawResponse.${field}`).toContain(`  ${field}:`);
+    }
+    expect(coreOps).toContain("pub async fn elasticsearch_raw_request_core(");
+    expect(coreOps.slice(coreOps.indexOf("pub async fn elasticsearch_raw_request_core("))).toContain("READ_ONLY");
   });
 
   it("guards the destructive clear behind a backend write check", () => {

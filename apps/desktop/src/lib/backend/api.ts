@@ -893,6 +893,8 @@ export const mongoFindOneAndDelete = forward("mongoFindOneAndDelete");
 export const elasticsearchListIndices = forward("elasticsearchListIndices");
 export const elasticsearchGetIndexMetadata = forward("elasticsearchGetIndexMetadata");
 export const elasticsearchDeleteAllDocuments = forward("elasticsearchDeleteAllDocuments");
+export const elasticsearchRawRequest = forward("elasticsearchRawRequest");
+export const elasticsearchClusterInfo = forward("elasticsearchClusterInfo");
 export const vectorListCollections = forward("vectorListCollections");
 
 // History
@@ -1114,6 +1116,10 @@ export type {
   GlobalSearchRequest,
   GlobalSearchMatch,
   GlobalSearchSettings,
+  ElasticsearchRawRequestMethod,
+  ElasticsearchRawRequest,
+  ElasticsearchRawResponse,
+  ElasticsearchClusterInfo,
 } from "@/lib/backend/tauri";
 
 // MQTT

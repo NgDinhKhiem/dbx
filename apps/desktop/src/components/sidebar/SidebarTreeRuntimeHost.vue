@@ -39,6 +39,8 @@ import {
   Search,
   FolderInput,
   FolderPlus,
+  Compass,
+  SquareTerminal,
   Regex,
   Eraser,
   Scissors,
@@ -5551,6 +5553,28 @@ interface SidebarMenuFactoryContext {
 
 type SidebarMenuFactory = (context: SidebarMenuFactoryContext) => boolean;
 
+/** Elasticsearch-compatible clusters (Elasticsearch/OpenSearch, Easysearch) get Discover and Dev Tools. */
+function isSearchClusterConnection(): boolean {
+  const type = currentDatabaseType();
+  return type === "elasticsearch" || type === "easysearch";
+}
+
+async function openSearchDiscover(indexPattern?: string) {
+  const connectionId = activeNode.value.connectionId;
+  if (!connectionId) return;
+  await connectionStore.ensureConnected(connectionId);
+  connectionStore.activeConnectionId = connectionId;
+  queryStore.openElasticsearchDiscover(connectionId, indexPattern);
+}
+
+async function openSearchConsole() {
+  const connectionId = activeNode.value.connectionId;
+  if (!connectionId) return;
+  await connectionStore.ensureConnected(connectionId);
+  connectionStore.activeConnectionId = connectionId;
+  queryStore.openElasticsearchConsole(connectionId);
+}
+
 function buildConnectionSidebarMenu(context: SidebarMenuFactoryContext): boolean {
   const { node, items } = context;
   // 2. Connection
@@ -5591,6 +5615,10 @@ function buildConnectionSidebarMenu(context: SidebarMenuFactoryContext): boolean
     }
     if (canCreateMeilisearchIndex.value) {
       items.push({ label: t("meilisearch.createIndex"), action: openCreateMeilisearchIndexDialog, icon: Plus });
+    }
+    if (isSearchClusterConnection()) {
+      items.push({ label: t("contextMenu.openDiscover"), action: () => void openSearchDiscover(), icon: Compass });
+      items.push({ label: t("contextMenu.openDevTools"), action: () => void openSearchConsole(), icon: SquareTerminal });
     }
     const connectionWorkspace = node.connectionId ? driverProfileDatabaseWorkspace(connectionStore.getConfig(node.connectionId)?.driver_profile) : undefined;
     if (connectionWorkspace?.entryScopes.includes("connection")) {
@@ -6142,6 +6170,9 @@ function buildSpecialSidebarMenu(context: SidebarMenuFactoryContext): boolean {
     }
     if (!isMeilisearchIndex) {
       items.push({ label: t("contextMenu.viewData"), action: toggle, icon: TableProperties });
+      if (node.type === "elasticsearch-index" && isSearchClusterConnection()) {
+        items.push({ label: t("contextMenu.openDiscover"), action: () => void openSearchDiscover(node.label), icon: Compass });
+      }
       items.push({ label: t("contextMenu.newQuery"), action: newQuery, icon: TerminalSquare });
     }
     if (canRenameMongoCollection.value) {

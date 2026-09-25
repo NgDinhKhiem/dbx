@@ -1959,6 +1959,8 @@ export interface QueryTab {
     | "postgres-dashboard"
     | "xugu-dashboard"
     | "solr-admin"
+    | "es-discover"
+    | "es-console"
     | "dolt-version-control"
     | "plugin-workbench"
     | "plugin-filesystem";

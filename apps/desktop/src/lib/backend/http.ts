@@ -195,6 +195,9 @@ import type {
   MeilisearchIndexSettings,
   ElasticsearchIndexMetadataKind,
   ElasticsearchDeleteByQueryResult,
+  ElasticsearchRawRequest,
+  ElasticsearchRawResponse,
+  ElasticsearchClusterInfo,
 } from "@/lib/backend/tauri";
 import type { QueryEditability } from "@/lib/sql/sqlAnalysis";
 import type { PluginTableMetadata, PluginTableMetadataRequest } from "@/types/pluginSchemaMetadata";
@@ -4634,6 +4637,19 @@ export async function elasticsearchDeleteAllDocuments(connectionId: string, inde
     connectionId,
     index,
   });
+}
+
+export async function elasticsearchRawRequest(connectionId: string, request: ElasticsearchRawRequest): Promise<ElasticsearchRawResponse> {
+  return post("/api/elasticsearch/raw-request", {
+    connectionId,
+    method: request.method,
+    path: request.path,
+    body: request.body,
+  });
+}
+
+export async function elasticsearchClusterInfo(connectionId: string): Promise<ElasticsearchClusterInfo> {
+  return post("/api/elasticsearch/cluster-info", { connectionId });
 }
 
 export async function mongoCountDocuments(connectionId: string, database: string, collection: string, filter?: string, mode?: "accurate" | "legacy", executionId?: string): Promise<number> {

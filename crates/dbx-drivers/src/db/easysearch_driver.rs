@@ -168,6 +168,17 @@ pub async fn execute_rest_query_with_cursor(
         .map_err(easysearch_error)
 }
 
+pub async fn execute_raw_request(
+    client: &EasysearchClient,
+    request: &elasticsearch_driver::ElasticsearchRawRequest,
+) -> Result<elasticsearch_driver::ElasticsearchRawResponse, String> {
+    elasticsearch_driver::execute_raw_request(&client.inner, request).await.map_err(easysearch_error)
+}
+
+pub async fn cluster_info(client: &EasysearchClient) -> Result<elasticsearch_driver::ElasticsearchClusterInfo, String> {
+    elasticsearch_driver::cluster_info(&client.inner).await.map_err(easysearch_error)
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;

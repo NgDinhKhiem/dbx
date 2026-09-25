@@ -422,6 +422,49 @@ pub async fn elasticsearch_get_index_metadata(
     Ok(Json(result))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ElasticsearchRawRequestBody {
+    pub connection_id: String,
+    pub method: String,
+    pub path: String,
+    #[serde(default)]
+    pub body: Option<String>,
+}
+
+pub async fn elasticsearch_raw_request(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<ElasticsearchRawRequestBody>,
+) -> Result<Json<dbx_core::db::elasticsearch_driver::ElasticsearchRawResponse>, AppError> {
+    // Read-only protection is enforced in core, per request method/endpoint.
+    let result = dbx_core::document_ops::elasticsearch_raw_request_core(
+        &state.app,
+        &req.connection_id,
+        &req.method,
+        &req.path,
+        req.body,
+    )
+    .await
+    .map_err(AppError::from)?;
+    Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ElasticsearchConnectionRequest {
+    pub connection_id: String,
+}
+
+pub async fn elasticsearch_cluster_info(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<ElasticsearchConnectionRequest>,
+) -> Result<Json<dbx_core::db::elasticsearch_driver::ElasticsearchClusterInfo>, AppError> {
+    let result = dbx_core::document_ops::elasticsearch_cluster_info_core(&state.app, &req.connection_id)
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(result))
+}
+
 pub async fn elasticsearch_delete_all_documents(
     State(state): State<Arc<WebState>>,
     Json(req): Json<ElasticsearchIndexRequest>,
