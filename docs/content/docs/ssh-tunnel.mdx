@@ -108,13 +108,35 @@ Upload `deploy/dbx_tunnel.php` to a PHP web server that can reach the database.
 
 Configure these environment variables on the PHP server:
 
-| Variable                         | Required | Description                                                                 |
-| -------------------------------- | -------- | --------------------------------------------------------------------------- |
-| `DBX_TUNNEL_TOKEN`               | Yes      | Shared token. Enter the same value in DBX.                                  |
-| `DBX_TUNNEL_ALLOWED_HOSTS`       | No       | Comma-separated target host allow-list. Strongly recommended.               |
-| `DBX_TUNNEL_DIR`                 | No       | Session queue directory. Defaults to a temp directory.                      |
-| `DBX_TUNNEL_MAX_SESSION_SECONDS` | No       | Maximum session lifetime. Defaults to `3600`.                               |
-| `DBX_TUNNEL_PHP`                 | No       | PHP CLI path used when PHP-FPM `fastcgi_finish_request` is not available.   |
+| Variable                          | Required | Description |
+| --------------------------------- | -------- | ----------- |
+| `DBX_TUNNEL_TOKEN`                | Yes      | Shared token. Enter the same value in DBX. |
+| `DBX_TUNNEL_ALLOWED_HOSTS`        | Yes\*    | Comma-separated target allow-list (see below). `DBX_TUNNEL_ALLOWED_TARGETS` is accepted as an alias. |
+| `DBX_TUNNEL_ALLOW_ANY_TARGET`     | Yes\*    | `true` allows any target instead of an allow-list. Loopback, link-local, and metadata addresses stay blocked. |
+| `DBX_TUNNEL_ALLOW_INSECURE_HTTP`  | No       | `true` accepts plain-HTTP requests. Defaults to `false`: only HTTPS is accepted. |
+| `DBX_TUNNEL_TRUSTED_PROXIES`      | No       | Comma-separated proxy IPs or CIDRs whose `X-Forwarded-Proto` header is trusted, for TLS terminated at a reverse proxy. |
+| `DBX_TUNNEL_DEFAULT_PORTS`        | No       | Ports allowed for host-only allow-list entries. Defaults to common database ports (3306, 5432, 1433, 1521, 27017, 6379, 8123, 9000, 9200, and others). |
+| `DBX_TUNNEL_MAX_SESSIONS`         | No       | Maximum concurrent sessions. Defaults to `16`. With PHP-FPM each session holds one worker, so keep it below `pm.max_children`. |
+| `DBX_TUNNEL_IDLE_TIMEOUT_SECONDS` | No       | A session closes when DBX has not polled or written for this long. Defaults to `120`. |
+| `DBX_TUNNEL_MAX_SESSION_SECONDS`  | No       | Maximum session lifetime. Defaults to `3600`. |
+| `DBX_TUNNEL_MAX_WRITE_BYTES`      | No       | Maximum body of one `write` request. Defaults to `1048576` (1 MiB). |
+| `DBX_TUNNEL_MAX_QUEUE_BYTES`      | No       | Maximum buffered bytes per direction. Defaults to `16777216` (16 MiB). |
+| `DBX_TUNNEL_DIR`                  | No       | Session queue directory. Defaults to `dbx_tunnel_<uid>` in the system temp directory. It must be owned by the PHP user and is forced to mode `0700`. |
+| `DBX_TUNNEL_PHP`                  | No       | PHP CLI path used when PHP-FPM `fastcgi_finish_request` is not available. |
+
+\* Set one of `DBX_TUNNEL_ALLOWED_HOSTS` or `DBX_TUNNEL_ALLOW_ANY_TARGET`. With neither, the script refuses every connection.
+
+Allow-list entries:
+
+| Entry | Allows |
+| ----- | ------ |
+| `mysql.internal:3306` | Exactly that host and port |
+| `pg.internal` | That host on default database ports only |
+| `redis.internal:*` | That host on any port |
+| `[2001:db8::5]:5432` | An IPv6 address with a port |
+| `*.db.example.com:5432` | Any subdomain on that port |
+
+Loopback (`127.0.0.0/8`, `::1`), link-local (`169.254.0.0/16`, `fe80::/10`), and cloud metadata addresses are refused even for an allowed host name. To reach a database on the PHP server itself, list the IP or `localhost` explicitly, for example `127.0.0.1:3306` or `localhost:3306`. The script resolves host names once and connects to the checked IP, so DNS changes cannot redirect an allowed name to an internal address.
 
 In DBX, add an **HTTP Tunnel** layer and fill:
 
@@ -143,7 +165,7 @@ The request protocol is short HTTP polling:
 1. DBX starts a TCP listener in its current runtime.
 2. The database driver connects to that local port.
 3. DBX sends `open` to `dbx_tunnel.php` with a session id, target host, target port, and connect timeout.
-4. The PHP script validates the token and allow-list, then starts a worker that opens a TCP socket to the database.
+4. The PHP script checks HTTPS, the token, the allow-list, and the session limit, then starts a worker that opens a TCP socket to the database.
 5. Bytes from the database driver are sent to the script with `write`.
 6. DBX polls the script with `read`; response bytes are written back to the local database driver connection.
 7. When the connection ends, DBX sends `close` and the PHP worker closes the database socket.
@@ -152,9 +174,11 @@ This does not require DBX Web and does not use WebSocket.
 
 ### Security And Limits
 
-- Use HTTPS for the script URL.
+- Use HTTPS for the script URL. The script rejects plain HTTP unless `DBX_TUNNEL_ALLOW_INSECURE_HTTP=true`; behind a TLS-terminating proxy, set `DBX_TUNNEL_TRUSTED_PROXIES`.
 - Set a long random `DBX_TUNNEL_TOKEN`.
-- Set `DBX_TUNNEL_ALLOWED_HOSTS` so the script cannot become a general internal TCP relay.
+- Prefer `DBX_TUNNEL_ALLOWED_HOSTS` with explicit `host:port` entries over `DBX_TUNNEL_ALLOW_ANY_TARGET`, so the script cannot become a general internal TCP relay.
+- Error responses are generic; connection details are written to the PHP error log.
+- Upgrading from an older script: existing deployments need `DBX_TUNNEL_ALLOWED_HOSTS` (or `DBX_TUNNEL_ALLOW_ANY_TARGET=true`), and plain-HTTP deployments also need `DBX_TUNNEL_ALLOW_INSECURE_HTTP=true`.
 - Restrict public access to the script path where possible.
 - HTTP tunnel is convenient, but it is usually slower than direct TCP, VPN, or SSH because it forwards bytes through HTTP polling and a server-side queue.
 - If combined with other layers, HTTP tunnel must be the first tunnel / proxy layer because it is the outermost network boundary.

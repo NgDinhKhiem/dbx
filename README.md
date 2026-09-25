@@ -445,6 +445,35 @@ environment:
 When building the frontend yourself with an absolute asset base, set
 `VITE_DBX_BASE_PATH=/dbx/` before `pnpm build`.
 
+### Web security settings
+
+DBX Web protects the UI with an access password. Set it with `DBX_PASSWORD`
+(recommended for Docker; it replaces the stored password on every start, so it
+cannot be changed from the UI). Without `DBX_PASSWORD`, the first visitor sets
+the password in the browser: a browser on the server itself (`localhost`) can do
+this directly, while any other client must also enter the one-time **setup
+token** that DBX prints in its log at startup (`docker logs dbx`).
+`DBX_DISABLE_PASSWORD=1` turns authentication off; only use it on a trusted
+machine or behind your own authentication.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `DBX_HOST` | `127.0.0.1` | Listen address. The Docker image sets `0.0.0.0`. Binding a non-loopback address with `DBX_DISABLE_PASSWORD` logs a warning. |
+| `DBX_PORT` | `4224` | Listen port. |
+| `DBX_ALLOWED_HOSTS` | unset | Comma-separated host names accepted on `/api` (`*.example.com` matches subdomains, `*` disables the check). When set, the check is always on; when unset, it is on only with `DBX_DISABLE_PASSWORD`, allowing IP addresses and `localhost` (DNS-rebinding protection). |
+| `DBX_TRUSTED_PROXIES` | unset | Comma-separated IPs/CIDRs of reverse proxies (for example `172.16.0.0/12`). Only these may supply `X-Forwarded-For`/`X-Real-IP` (per-client login rate limiting), `X-Forwarded-Proto` and `X-Forwarded-Host`. |
+| `DBX_COOKIE_SECURE` | `auto` | `true`/`false` forces the session cookie `Secure` flag; `auto` sets it when a trusted proxy sends `X-Forwarded-Proto: https`. |
+| `DBX_PUBLIC_ORIGIN` | unset | Extra browser origins (for example `https://dbx.example.com`) allowed to open WebSockets when the proxy does not preserve the `Host` header. |
+| `DBX_SESSION_IDLE_TIMEOUT_SECS` | `43200` (12h) | Log out sessions idle for this long. |
+| `DBX_SESSION_MAX_AGE_SECS` | `604800` (7d) | Maximum session lifetime; also the cookie `Max-Age`. |
+| `DBX_SESSION_MAX_COUNT` | `1024` | Maximum concurrent sessions; the least recently used one is dropped. |
+| `DBX_CSP` | built-in policy | Overrides the `Content-Security-Policy` sent with the web UI; set it to an empty value to send none. |
+| `DBX_ALLOW_UNSIGNED_PLUGINS` | off | Set to `1` to allow installing unsigned plugins from the web UI. Never allowed with `DBX_DEMO_MODE`. |
+
+Login, setup-token and password-change attempts are limited per client IP
+(5 failures, then an exponentially growing lockout starting at 60 seconds).
+Changing the password signs out all other sessions.
+
 ## Getting Started
 
 ### Prerequisites

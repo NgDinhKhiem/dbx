@@ -87,7 +87,8 @@ description: 安装 DBX、创建第一个连接，并了解桌面版、Docker �
     docker run -d \
       --pull=always \
       --name dbx \
-      -p 4224:4224 \
+      -p 127.0.0.1:4224:4224 \
+      -e DBX_PASSWORD='change-this-password' \
       -v dbx-data:/app/data \
       t8y2/dbx:latest
     ```
@@ -96,21 +97,34 @@ description: 安装 DBX、创建第一个连接，并了解桌面版、Docker �
 
     ### 环境变量
 
-    Docker 镜像支持以下启动参数。使用 `-e 变量名=值` 指定，例如生产环境可添加 `-e DBX_PASSWORD=your-password`：
+    Docker 镜像支持以下启动参数。使用 `-e 变量名=值` 指定：
 
     | 参数 | 默认值 | 用途 |
     | --- | --- | --- |
-    | `DBX_PASSWORD` | 未设置 | Web 登录密码，生产环境建议设置 |
+    | `DBX_PASSWORD` | 未设置 | Web 登录密码，请设置强密码；compose 文件未设置时拒绝启动 |
     | `DBX_DISABLE_PASSWORD` | `false` | 设为 `true` 或 `1` 可关闭登录保护 |
     | `DBX_DATA_DIR` | `/app/data` | 持久化数据目录 |
     | `DBX_PORT` | `4224` | 容器内监听端口 |
+    | `DBX_HOST` | 镜像内为 `0.0.0.0` | 监听地址。Web 服务默认 `127.0.0.1`；镜像监听容器内全部网卡，端口映射才能生效 |
     | `DBX_PUBLIC_BASE_PATH` | `/` | 子路径部署，例如 `/dbx` |
+    | `DBX_RUN_AS_ROOT` | 未设置 | 设为 `1` 时继续以 root 运行（见下文） |
 
     启动后访问 `http://localhost:4224`。
+
+    示例只把端口发布在 `127.0.0.1`。需要从其他机器访问时，请在前面加一层 TLS 反向代理，或在可信网络中发布到全部网卡（`-p 4224:4224`）。
+
+    未配置密码时，DBX 会在容器日志中打印一次性初始化令牌（setup token）。不在服务器本机上的浏览器（包括宿主机浏览器通过映射端口访问容器）设置首个密码时必须填写该令牌：
+
+    ```bash
+    docker logs dbx 2>&1 | grep -i -A1 "setup token"
+    ```
+
+    容器内 DBX 以非特权用户 `dbx`（uid/gid `10001`）运行：容器以 root 启动，仅用于把 `/app/data` 和 `/app/backups` 交给该用户（旧版以 root 运行的镜像创建的数据卷也会自动迁移），随后降权。如果挂载的文件（例如 root 所有、权限 `0600` 的 secret）无法让 uid `10001` 读取，可设置 `DBX_RUN_AS_ROOT=1`。使用 `--user` 启动时，请确保数据目录对该用户可写。镜像内置针对 `/api/auth/check` 的健康检查。
 
     `deploy/docker-compose.yml` 用于构建当前源码。若要部署已发布镜像，请使用 `deploy/docker-compose.release.yml`：
 
     ```bash
+    export DBX_PASSWORD='change-this-password'   # 或写入同目录的 .env 文件
     docker compose -f deploy/docker-compose.release.yml up -d
     ```
 
@@ -122,7 +136,11 @@ description: 安装 DBX、创建第一个连接，并了解桌面版、Docker �
         # image: docker.cnb.cool/dbxio.com/dbx:latest
         pull_policy: always
         ports:
-          - "4224:4224"
+          # 默认只发布在本机回环地址；设置 DBX_BIND=0.0.0.0 可发布到全部网卡。
+          - "${DBX_BIND:-127.0.0.1}:4224:4224"
+        environment:
+          # 必填：未设置 DBX_PASSWORD 时 compose 拒绝启动。
+          DBX_PASSWORD: ${DBX_PASSWORD:?Set DBX_PASSWORD}
         volumes:
           - dbx-data:/app/data
         restart: unless-stopped

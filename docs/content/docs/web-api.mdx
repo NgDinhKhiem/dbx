@@ -45,6 +45,7 @@ Example response:
 | --- | --- |
 | `required` | Password protection is enabled |
 | `setup_required` | First-run password setup is still needed |
+| `setup_token_required` | Setup must include the one-time token printed in the server log (false for a browser on the server itself) |
 | `authenticated` | Current request already has a valid session |
 
 ### First-Run Setup
@@ -54,9 +55,12 @@ POST /api/auth/setup
 Content-Type: application/json
 
 {
-  "password": "your-password"
+  "password": "your-password",
+  "setup_token": "token-from-the-server-log"
 }
 ```
+
+When no password is configured, DBX prints a one-time setup token in its log (`docker logs <container>` for Docker). Clients that are not on the server itself must send it as `setup_token`; otherwise setup returns `403` with `SETUP_TOKEN_INVALID`. Prefer setting `DBX_PASSWORD` for server deployments.
 
 ### Login
 
@@ -87,6 +91,7 @@ Cookie: dbx_session=...
 | `DBX_PASSWORD` | Set an initial password at container startup |
 | `DBX_DISABLE_PASSWORD=1` | Disable password protection entirely |
 | `DBX_PORT` | Change the listen port (default `4224`) |
+| `DBX_HOST` | Listen address (default `127.0.0.1`; the Docker image sets `0.0.0.0`) |
 | `DBX_DATA_DIR` | Data directory containing `dbx.db` |
 | `DBX_PUBLIC_BASE_PATH` | Serve DBX under a subpath such as `/dbx` |
 | `DBX_MAX_UPLOAD_MB` | Override the general request and uploaded-file limit; default 1024 MB. Multipart routes reserve fixed protocol overhead (set at least `4096` for a 4 GiB file) |
@@ -310,7 +315,7 @@ When MCP runs against a deployed Web instance, set:
 {
   "env": {
     "DBX_WEB_URL": "http://localhost:4224",
-    "DBX_WEB_PASSWORD": "your-password"
+    "DBX_WEB_PASSWORD": "${DBX_WEB_PASSWORD}"
   }
 }
 ```
