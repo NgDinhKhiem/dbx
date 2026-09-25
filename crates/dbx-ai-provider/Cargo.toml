@@ -10,7 +10,7 @@ dbx-platform = { path = "../dbx-platform" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["arbitrary_precision", "preserve_order"] }
 futures = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "socks"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "rustls-tls-native-roots", "socks"] }
 tokio = { version = "1", features = ["process", "io-util", "sync", "time", "rt", "macros"] }
 log = "0.4"
 uuid = { version = "1", features = ["v4", "serde"] }

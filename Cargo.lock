@@ -7221,6 +7221,7 @@ dependencies = [
  "pin-project-lite",
  "quinn",
  "rustls 0.23.43",
+ "rustls-native-certs 0.8.4",
  "rustls-pki-types",
  "serde",
  "serde_json",

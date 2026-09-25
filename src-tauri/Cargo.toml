@@ -59,7 +59,7 @@ tokio-util = { version = "0.7", features = ["compat"] }
 # Keep rustls like every other workspace crate; reqwest default features would
 # pull native-tls/OpenSSL as a second TLS stack. charset/http2/system-proxy
 # preserve the rest of the previous default feature set.
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "socks", "charset", "http2", "system-proxy"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "rustls-tls-native-roots", "socks", "charset", "http2", "system-proxy"] }
 regex = "1"
 grep = "0.3"
 ignore = "0.4"
