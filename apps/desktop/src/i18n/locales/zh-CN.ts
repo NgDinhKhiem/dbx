@@ -4340,6 +4340,8 @@ export default withEnglishFallback({
     },
   },
   esDiscover: {
+    resizeColumn: "调整列宽：{column}",
+    resizeColumnHint: "拖动调整列宽，双击恢复",
     indexPattern: "索引模式",
     indexPatternPlaceholder: "索引模式，例如 logs-*",
     loadingIndices: "正在加载索引…",

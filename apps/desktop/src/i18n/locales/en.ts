@@ -4364,6 +4364,8 @@ export default {
     },
   },
   esDiscover: {
+    resizeColumn: "Resize column {column}",
+    resizeColumnHint: "Drag to resize, double-click to reset",
     indexPattern: "Index pattern",
     indexPatternPlaceholder: "Index pattern, e.g. logs-*",
     loadingIndices: "Loading indices…",

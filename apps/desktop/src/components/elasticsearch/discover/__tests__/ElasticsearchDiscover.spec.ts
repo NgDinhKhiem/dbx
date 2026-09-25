@@ -310,4 +310,48 @@ describe("ElasticsearchDiscover", () => {
     expect(table.textContent).toContain("level");
     expect(table.textContent).toContain("ERROR");
   });
+
+  describe("column resizing", () => {
+    function drag(handle: HTMLElement, fromX: number, toX: number) {
+      handle.dispatchEvent(new MouseEvent("mousedown", { button: 0, clientX: fromX, bubbles: true }));
+      document.dispatchEvent(new MouseEvent("mousemove", { clientX: toX, bubbles: true }));
+      document.dispatchEvent(new MouseEvent("mouseup", { clientX: toX, bubbles: true }));
+    }
+
+    it("drags a column wider, clamps it, and saves the width in the tab state", async () => {
+      const { container, stateChanges } = await mountDiscover(baseState({ columns: ["level"] }));
+      const searchesBefore = searchCalls().length;
+      drag(query(container, "[data-testid=discover-resize-level]"), 100, 400);
+      await flush();
+      expect(query(container, "[data-testid=discover-col-level]").style.width).toBe("300px");
+      expect(stateChanges.at(-1)?.columnWidths).toEqual({ level: 300 });
+      // Resizing never sorts or searches.
+      expect(searchCalls().length).toBe(searchesBefore);
+
+      drag(query(container, "[data-testid=discover-resize-level]"), 400, -5000);
+      await flush();
+      expect(stateChanges.at(-1)?.columnWidths).toEqual({ level: 60 });
+    });
+
+    it("restores saved widths and resets a column on double-click", async () => {
+      const { container, stateChanges } = await mountDiscover(baseState({ columns: ["level"], columnWidths: { level: 250, "\u0000time": 140, bogus: Number.NaN } as Record<string, number> }));
+      expect(query(container, "[data-testid=discover-col-level]").style.width).toBe("250px");
+      expect(query(container, "[data-testid=discover-col-time]").style.width).toBe("140px");
+      query(container, "[data-testid=discover-resize-level]").dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+      await flush();
+      expect(query(container, "[data-testid=discover-col-level]").style.width).toBe("");
+      expect(stateChanges.at(-1)?.columnWidths).toEqual({ "\u0000time": 140 });
+    });
+
+    it("resizes from the keyboard", async () => {
+      const { container, stateChanges } = await mountDiscover(baseState({ columns: ["level"], columnWidths: { level: 200 } }));
+      const handle = query(container, "[data-testid=discover-resize-level]");
+      handle.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
+      await flush();
+      expect(stateChanges.at(-1)?.columnWidths).toEqual({ level: 216 });
+      handle.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", shiftKey: true, bubbles: true }));
+      await flush();
+      expect(stateChanges.at(-1)?.columnWidths).toEqual({ level: 152 });
+    });
+  });
 });

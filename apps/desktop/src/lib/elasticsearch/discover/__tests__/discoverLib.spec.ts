@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { clampColumnWidth, discoverTableMinWidth, sanitizeColumnWidths, withColumnWidth } from "@/lib/elasticsearch/discover/columnWidths";
 import { computeTopValues, fieldSegments, flattenSource, formatFieldValue, getHitFieldValue, HIGHLIGHT_POST_TAG, HIGHLIGHT_PRE_TAG, hitJson, parseHighlight, sourceSummary, truncateSegments } from "../documents";
 import { extractErrorInfo } from "../errors";
 import { indexPatternSuggestions, matchesIndexPattern, wildcardBase } from "../indexPatterns";
@@ -298,5 +299,22 @@ describe("sqlPpl", () => {
     });
     expect(parseTabularResponse(JSON.stringify({ columns: [{ name: "a", type: "long" }], rows: [[1], [2]] }))).toEqual({ columns: [{ name: "a", type: "long" }], rows: [[1], [2]], total: 2 });
     expect(() => parseTabularResponse("{}")).toThrow();
+  });
+});
+
+describe("discover column widths", () => {
+  it("clamps, sanitizes and updates widths", () => {
+    expect(clampColumnWidth(10)).toBe(60);
+    expect(clampColumnWidth(99999)).toBe(2000);
+    expect(clampColumnWidth(123.6)).toBe(124);
+    expect(sanitizeColumnWidths({ a: 100, b: "x", c: Number.POSITIVE_INFINITY, "": 5, d: 5 })).toEqual({ a: 100, d: 60 });
+    expect(sanitizeColumnWidths(null)).toEqual({});
+    expect(sanitizeColumnWidths([1, 2])).toEqual({});
+    expect(withColumnWidth({ a: 100 }, "b", 300)).toEqual({ a: 100, b: 300 });
+    expect(withColumnWidth({ a: 100, b: 300 }, "a", null)).toEqual({ b: 300 });
+  });
+
+  it("keeps room for auto-sized columns in the table minimum width", () => {
+    expect(discoverTableMinWidth(24, [192, undefined, 300])).toBe(24 + 192 + 160 + 300);
   });
 });

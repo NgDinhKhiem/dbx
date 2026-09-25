@@ -39,6 +39,8 @@ export interface DiscoverState {
   filters: DiscoverFilter[];
   columns: string[];
   sort: DiscoverSort[];
+  /** Resized column widths in px, keyed by field name (`_source` for Document). */
+  columnWidths?: Record<string, number>;
 }
 
 export type DiscoverFieldType = "string" | "text" | "keyword" | "number" | "date" | "boolean" | "ip" | "geo" | "object" | "nested" | "binary" | "conflict" | "unknown";

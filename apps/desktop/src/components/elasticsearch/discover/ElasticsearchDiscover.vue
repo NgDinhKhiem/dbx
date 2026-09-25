@@ -5,6 +5,7 @@ import { LoaderCircle, RefreshCw, SearchX } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import ErrorBanner from "@/components/ui/ErrorBanner.vue";
+import { sanitizeColumnWidths, withColumnWidth } from "@/lib/elasticsearch/discover/columnWidths";
 import DiscoverDocTable from "./DiscoverDocTable.vue";
 import DiscoverFieldSidebar from "./DiscoverFieldSidebar.vue";
 import DiscoverFilterBar from "./DiscoverFilterBar.vue";
@@ -49,6 +50,7 @@ const queryDraft = ref(initial?.query ?? "");
 const filters = ref<DiscoverFilter[]>(cloneFilters(initial?.filters ?? []));
 const columns = ref<string[]>([...(initial?.columns ?? [])]);
 const sort = ref<DiscoverSort[]>((initial?.sort ?? []).map((entry) => ({ ...entry })));
+const columnWidths = ref<Record<string, number>>(sanitizeColumnWidths(initial?.columnWidths));
 
 // ---- cluster metadata -----------------------------------------------------
 let distributionPromise: Promise<ClusterDistribution> | null = null;
@@ -120,6 +122,7 @@ const state = computed<DiscoverState>(() => ({
   filters: cloneFilters(filters.value),
   columns: [...columns.value],
   sort: sort.value.map((entry) => ({ ...entry })),
+  columnWidths: { ...columnWidths.value },
 }));
 
 watch(state, (value) => emit("state-change", JSON.parse(JSON.stringify(value)) as DiscoverState), { deep: true });
@@ -389,6 +392,10 @@ function toggleColumn(field: string) {
   columns.value = columns.value.includes(field) ? columns.value.filter((column) => column !== field) : [...columns.value, field];
 }
 
+function onResizeColumn(key: string, width: number | null) {
+  columnWidths.value = withColumnWidth(columnWidths.value, key, width);
+}
+
 function onSort(field: string) {
   const current = activeSort.value[0];
   const direction = current?.field === field ? (current.direction === "desc" ? "asc" : "desc") : field === timeField.value ? "desc" : "asc";
@@ -527,7 +534,9 @@ defineExpose({ runSearch, state });
               :can-load-more="canLoadMore"
               :loading-more="loadingMore"
               :sample-limit-reached="sampleLimitReached"
+              :column-widths="columnWidths"
               @sort="onSort"
+              @resize-column="onResizeColumn"
               @toggle-column="toggleColumn"
               @add-filter="addValueFilter"
               @load-more="loadMore"
