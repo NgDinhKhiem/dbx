@@ -12,6 +12,7 @@ pub use dbx_core::connection::{
     gaussdb_uses_m_jdbc_driver, metadata_connection_config, prestosql_jdbc_config_for_endpoint,
     probe_connection_endpoint, redacted_connection_url_for_endpoint, AppState, MysqlMode, PoolKind,
 };
+use dbx_core::connection_secrets::{redact_connections_for_client, ClientConnectionInput};
 use dbx_core::database_capabilities;
 use dbx_core::db;
 use dbx_core::db::agent_driver::{AgentDriverClient, AgentMethod};
@@ -644,6 +645,45 @@ mod tests {
 
     #[cfg(feature = "mq-admin")]
     #[tokio::test]
+    async fn ui_saves_keep_stored_password_and_a_new_password_replaces_the_pool() {
+        use dbx_core::connection_secrets::redact_connection_for_client;
+        let dir = std::env::temp_dir().join(format!("dbx-tauri-conn-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new_with_plugin_dir(storage, dir.join("plugins"));
+        let mut initial = mq_config("mq-pw", "http://127.0.0.1:8080");
+        initial.save_password = true;
+        initial.password = "first-secret".to_string();
+        save_connection_configs(&state, std::slice::from_ref(&initial)).await.unwrap();
+        state
+            .update_connection_pools(|connections| {
+                connections.insert(initial.id.clone(), PoolKind::MessageQueue);
+            })
+            .await;
+
+        // The UI sends configurations back without secrets (blank + saved_secrets).
+        let redacted = redact_connection_for_client(&initial).unwrap();
+        assert_eq!(redacted["password"], serde_json::json!(""));
+        super::save_client_connection_configs(&state, vec![serde_json::from_value(redacted.clone()).unwrap()])
+            .await
+            .unwrap();
+        assert_eq!(state.configs.read().await["mq-pw"].password, "first-secret");
+        assert_eq!(state.storage.load_connection("mq-pw").await.unwrap().unwrap().password, "first-secret");
+        assert!(state.pool_handle(&initial.id).await.is_some(), "an unchanged connection keeps its pool");
+
+        // A newly typed password is saved, reaches the runtime and replaces the pool.
+        let mut changed = redacted;
+        changed["password"] = serde_json::json!("second-secret");
+        super::save_client_connection_configs(&state, vec![serde_json::from_value(changed).unwrap()]).await.unwrap();
+        assert_eq!(state.configs.read().await["mq-pw"].password, "second-secret");
+        assert_eq!(state.storage.load_connection("mq-pw").await.unwrap().unwrap().password, "second-secret");
+        assert!(state.pool_handle(&initial.id).await.is_none(), "a changed password drops the old pool");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(feature = "mq-admin")]
+    #[tokio::test]
     async fn save_connection_configs_updates_runtime_cache_and_drops_mq_adapter() {
         let dir = std::env::temp_dir().join(format!("dbx-tauri-conn-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -904,14 +944,29 @@ mod tests {
 }
 
 #[tauri::command]
-pub async fn save_connections(state: State<'_, Arc<AppState>>, configs: Vec<ConnectionConfig>) -> Result<(), String> {
-    let configs: Vec<ConnectionConfig> = configs.into_iter().map(|config| config.canonicalized()).collect();
-    save_connection_configs(state.inner(), &configs).await
+pub async fn save_connections(
+    state: State<'_, Arc<AppState>>,
+    configs: Vec<ClientConnectionInput>,
+) -> Result<(), String> {
+    save_client_connection_configs(state.inner(), configs).await
 }
 
-async fn save_connection_configs(state: &AppState, configs: &[ConnectionConfig]) -> Result<(), String> {
-    for config in configs {
-        if config.db_type == DatabaseType::Sqlite && !db::sqlite_worker::sqlite_ssh_worker_requested(config) {
+/// Saves configurations received from the UI. They carry no stored secrets
+/// (blank fields plus `saved_secrets`), so the stored values are merged back
+/// in before validation, persistence and the runtime/pool sync. Otherwise the
+/// runtime would keep a blank password and a changed password would never
+/// replace the live pool.
+async fn save_client_connection_configs(state: &AppState, inputs: Vec<ClientConnectionInput>) -> Result<(), String> {
+    let inputs: Vec<ClientConnectionInput> = inputs
+        .into_iter()
+        .map(|mut input| {
+            input.config = input.config.canonicalized();
+            input
+        })
+        .collect();
+    for input in &inputs {
+        let config = state.storage.resolve_client_connection(input).await?;
+        if config.db_type == DatabaseType::Sqlite && !db::sqlite_worker::sqlite_ssh_worker_requested(&config) {
             db::sqlite::validate_persistent_attachments(
                 &config.host,
                 &config.password,
@@ -919,12 +974,19 @@ async fn save_connection_configs(state: &AppState, configs: &[ConnectionConfig])
             )?;
         }
     }
-    state.storage.save_connections(configs).await?;
-    let sync = sync_connection_configs(state, configs).await;
+    let configs = state.storage.save_client_connections(&inputs).await?;
+    let sync = sync_connection_configs(state, &configs).await;
     remove_connection_pools_for_connection_ids(state, &sync.connection_pool_ids_to_drop).await;
     drop_nacos_adapters_for_connection_ids(state, &sync.nacos_adapter_ids_to_drop).await;
     drop_mq_adapters_for_connection_ids(state, &sync.mq_adapter_ids_to_drop).await;
     Ok(())
+}
+
+/// Saves full configurations (tests and internal callers) through the same
+/// path as the UI.
+#[cfg(test)]
+async fn save_connection_configs(state: &AppState, configs: &[ConnectionConfig]) -> Result<(), String> {
+    save_client_connection_configs(state, configs.iter().cloned().map(ClientConnectionInput::from).collect()).await
 }
 
 struct ConnectionConfigSync {
@@ -1011,8 +1073,9 @@ async fn remove_connection_pools_for_connection_ids(state: &AppState, connection
 }
 
 #[tauri::command]
-pub async fn load_connections(state: State<'_, Arc<AppState>>) -> Result<Vec<ConnectionConfig>, String> {
-    load_connection_configs(state.inner()).await
+pub async fn load_connections(state: State<'_, Arc<AppState>>) -> Result<Vec<serde_json::Value>, String> {
+    // The runtime keeps the full configurations; the UI gets them without secrets.
+    redact_connections_for_client(&load_connection_configs(state.inner()).await?)
 }
 
 async fn load_connection_configs(state: &AppState) -> Result<Vec<ConnectionConfig>, String> {
@@ -1150,13 +1213,15 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
 #[tauri::command]
 pub async fn test_connection_with_info(
     state: State<'_, Arc<AppState>>,
-    config: ConnectionConfig,
+    config: ClientConnectionInput,
 ) -> Result<ConnectionTestResult, String> {
+    let config = state.storage.resolve_client_connection(&config).await?;
     test_connection_with_info_inner(state.inner(), config).await
 }
 
 #[tauri::command]
-pub async fn test_ssh_tunnel(state: State<'_, Arc<AppState>>, config: ConnectionConfig) -> Result<String, String> {
+pub async fn test_ssh_tunnel(state: State<'_, Arc<AppState>>, config: ClientConnectionInput) -> Result<String, String> {
+    let config = state.storage.resolve_client_connection(&config).await?;
     state.test_connection_ssh_tunnel(&config.canonicalized()).await
 }
 
@@ -1711,9 +1776,10 @@ fn record_session_credential(state: &AppState, config: &ConnectionConfig, connec
 #[tauri::command]
 pub async fn connect_db(
     state: State<'_, Arc<AppState>>,
-    config: ConnectionConfig,
+    config: ClientConnectionInput,
     client_attempt: Option<u64>,
 ) -> Result<String, String> {
+    let config = state.storage.resolve_client_connection(&config).await?;
     let config = config.canonicalized();
     if config.db_type == DatabaseType::Sqlite && !db::sqlite_worker::sqlite_ssh_worker_requested(&config) {
         db::sqlite::validate_persistent_attachments(
@@ -2148,8 +2214,9 @@ pub async fn connect_db(
 #[tauri::command]
 pub async fn connection_final_proxy_port(
     state: State<'_, Arc<AppState>>,
-    config: ConnectionConfig,
+    config: ClientConnectionInput,
 ) -> Result<u16, String> {
+    let config = state.storage.resolve_client_connection(&config).await?;
     let runtime_config = config.canonicalized();
     if !runtime_config.has_effective_transport_layers() {
         return Err("Connection has no configured transport layers".to_string());

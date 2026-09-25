@@ -113,3 +113,19 @@ describe("connectionDatabaseInfo", () => {
     expect(isTauriCommandUnavailable("Database not found while invoking command test_connection_with_info", "test_connection_with_info")).toBe(false);
   });
 });
+
+describe("connection secret changes", () => {
+  it("detects typed or cleared secrets that fingerprints ignore", async () => {
+    const { hasSubmittedSecretChange, connectionConfigFingerprint } = await import("@/lib/connection/connectionDatabaseInfo");
+    const saved = { id: "c", name: "C", db_type: "postgres", host: "h", port: 5432, username: "u", password: "", saved_secrets: ["password"] } as unknown as import("@/types/database").ConnectionConfig;
+    expect(hasSubmittedSecretChange(saved)).toBe(false);
+    expect(hasSubmittedSecretChange({ ...saved, password: "new" })).toBe(true);
+    expect(hasSubmittedSecretChange({ ...saved, cleared_secrets: ["password"] } as never)).toBe(true);
+    expect(hasSubmittedSecretChange({ ...saved, transport_layers: [{ id: "l", type: "ssh", host: "j", port: 22, user: "r", password: "hop" }] } as never)).toBe(true);
+    // Re-submitting the value the previous copy already holds is not a change.
+    expect(hasSubmittedSecretChange({ ...saved, password: "same" }, { ...saved, password: "same" })).toBe(false);
+    expect(hasSubmittedSecretChange({ ...saved, password: "new" }, { ...saved, password: "old" })).toBe(true);
+    expect(connectionConfigFingerprint({ ...saved, password: "new" })).toBe(connectionConfigFingerprint(saved));
+    expect(connectionConfigFingerprint({ ...saved, password: "new" }, "C", { includeSecrets: true })).not.toBe(connectionConfigFingerprint(saved, "C", { includeSecrets: true }));
+  });
+});

@@ -2212,7 +2212,8 @@ function applySavedDatabaseInfo(config: ConnectionConfig) {
 
 function applySuccessfulConnectionTest(result: ConnectionTestResult, config: ConnectionConfig, sourceName: string) {
   testResult.value = { ok: true, ...result };
-  testedConfigFingerprint.value = connectionConfigFingerprint(config, sourceName);
+  // Both sides are drafts with typed values: a password edit after a test means the draft is untested.
+  testedConfigFingerprint.value = connectionConfigFingerprint(config, sourceName, { includeSecrets: true });
   testedConfigId.value = config.id;
   testedGeneratedName.value = config.name;
 }
@@ -3686,7 +3687,7 @@ const visibleTestDatabaseInfo = computed<DatabaseConnectionInfo | null>(() => {
   if (!result?.ok || !result.databaseInfo || !testedConfigFingerprint.value || !testedConfigId.value) return null;
   try {
     const current = connectionConfigForSubmit(testedConfigId.value, testedGeneratedName.value);
-    return connectionConfigFingerprint(current, form.value.name) === testedConfigFingerprint.value ? result.databaseInfo : null;
+    return connectionConfigFingerprint(current, form.value.name, { includeSecrets: true }) === testedConfigFingerprint.value ? result.databaseInfo : null;
   } catch {
     return null;
   }

@@ -114,9 +114,37 @@ function withoutSecrets(config: Record<string, unknown>): Record<string, unknown
   return copy;
 }
 
-export function connectionConfigFingerprint(config: ConnectionConfig, sourceName = config.name): string {
+/**
+ * Whether a config submitted by the UI changes a secret compared with the
+ * previous in-memory copy: a typed value that differs from what that copy
+ * holds (saved copies normally hold blanks) or an explicit clear.
+ */
+export function hasSubmittedSecretChange(config: ConnectionConfig, previous?: ConnectionConfig): boolean {
+  const next = config as unknown as Record<string, unknown>;
+  const before = (previous ?? {}) as unknown as Record<string, unknown>;
+  if (Array.isArray(next.cleared_secrets) && next.cleared_secrets.length > 0) return true;
+  const changed = (value: unknown, old: unknown) => typeof value === "string" && value.length > 0 && value !== old;
+  const valueFields = FINGERPRINT_SECRET_FIELDS.filter((field) => field === "password" || field === "redis_sentinel_password");
+  if (valueFields.some((field) => changed(next[field], before[field]))) return true;
+  const layers = Array.isArray(next.transport_layers) ? next.transport_layers : [];
+  const previousLayers = Array.isArray(before.transport_layers) ? before.transport_layers : [];
+  return layers.some((layer) => {
+    if (!layer || typeof layer !== "object") return false;
+    const current = layer as Record<string, unknown>;
+    const old = (previousLayers.find((candidate) => !!candidate && typeof candidate === "object" && (candidate as Record<string, unknown>).id === current.id) ?? {}) as Record<string, unknown>;
+    return FINGERPRINT_LAYER_SECRET_FIELDS.some((field) => changed(current[field], old[field]));
+  });
+}
+
+/**
+ * Identity of a connection's settings. Secrets are left out by default (see
+ * above); `includeSecrets` compares them too, for two drafts that both carry
+ * typed values (e.g. "was this exact draft tested?").
+ */
+export function connectionConfigFingerprint(config: ConnectionConfig, sourceName = config.name, options?: { includeSecrets?: boolean }): string {
   const { database_info: _databaseInfo, default_schema: _defaultSchema, note: _note, ...submittedConfig } = config;
-  const serialized = JSON.stringify(stableValue({ config: withoutSecrets(submittedConfig as Record<string, unknown>), sourceName }));
+  const comparable = options?.includeSecrets ? submittedConfig : withoutSecrets(submittedConfig as Record<string, unknown>);
+  const serialized = JSON.stringify(stableValue({ config: comparable, sourceName }));
   const first = fnv1a(serialized, 0x811c9dc5).toString(16).padStart(8, "0");
   const second = fnv1a(serialized, 0x9e3779b9).toString(16).padStart(8, "0");
   return `${first}${second}`;
