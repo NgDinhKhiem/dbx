@@ -26,6 +26,11 @@ pub enum SecretKeyPolicy {
     PlatformDefault,
     ManagedDataDir,
     ExternalOnly,
+    /// Per-user key file only (`~/Library/Application Support/dbx/secret.key`
+    /// on macOS): never reads or creates an OS credential-store entry, so
+    /// there are no Keychain prompts. The CLI and MCP server find the same
+    /// file first under `PlatformDefault`.
+    LocalKeyFile,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,10 +124,22 @@ impl SecretCodec {
                 }
             }
             SecretKeyPolicy::ExternalOnly => Err("MISSING_EXTERNAL_KEY".to_string()),
+            SecretKeyPolicy::LocalKeyFile => Self::resolve_local_key_file(
+                default_key_path().or_else(|| Some(managed_key_path(data_dir))),
+                allow_create,
+            ),
             SecretKeyPolicy::PlatformDefault => {
                 Self::resolve_platform_default(default_key_path(), allow_create, platform_keyring_codec)
             }
         }
+    }
+
+    /// Key file only: the OS credential store is never consulted.
+    fn resolve_local_key_file(
+        path: Option<std::path::PathBuf>,
+        allow_create: bool,
+    ) -> Result<SecretKeyResolution, String> {
+        Self::resolve_platform_default(path, allow_create, |_| None)
     }
 
     fn resolve_platform_default<F>(
@@ -615,5 +632,27 @@ mod tests {
         } else {
             std::env::remove_var(name);
         }
+    }
+
+    #[test]
+    fn local_key_file_policy_creates_and_reuses_a_file_without_the_credential_store() {
+        let dir = std::env::temp_dir().join(format!("dbx-local-key-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("dbx/secret.key");
+        assert_eq!(
+            SecretCodec::resolve_local_key_file(Some(path.clone()), false).err().as_deref(),
+            Some("KEY_PROVIDER_UNAVAILABLE")
+        );
+        let created = SecretCodec::resolve_local_key_file(Some(path.clone()), true).unwrap();
+        assert_eq!(created.source, SecretKeySource::ManagedDataDir);
+        assert!(path.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let reused = SecretCodec::resolve_local_key_file(Some(path.clone()), false).unwrap();
+        let envelope = created.codec.encrypt("connection", "password", "secret").unwrap();
+        assert_eq!(reused.codec.decrypt("connection", "password", &envelope).unwrap(), "secret");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -1474,7 +1474,10 @@ impl Storage {
             .as_ref()
             .err()
             .is_some_and(|error| matches!(error.as_str(), "MISSING_MANAGED_KEY" | "KEY_PROVIDER_UNAVAILABLE"))
-            && matches!(self.secret_key_policy, SecretKeyPolicy::PlatformDefault | SecretKeyPolicy::ManagedDataDir)
+            && matches!(
+                self.secret_key_policy,
+                SecretKeyPolicy::PlatformDefault | SecretKeyPolicy::ManagedDataDir | SecretKeyPolicy::LocalKeyFile
+            )
             && encrypted == 0
             && (database_plaintext_count > 0 || sync_credentials > 0 || files.iter().any(|file| file.exists));
         let mut key_error_code = key_probe.as_ref().err().cloned();
