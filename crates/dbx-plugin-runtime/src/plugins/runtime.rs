@@ -216,6 +216,7 @@ impl PluginSidecarSession {
         ensure_plugin_backend(&plugin)?;
         let transport = plugin.manifest.backend_entrypoint().map(|backend| backend.transport).unwrap_or_default();
         let app_version = app_version.into();
+        verify_backend_executable_integrity(&plugin).await?;
         let mut child = spawn_plugin_child(&plugin, &app_version, &env)?;
         let stdin = child.stdin.take().ok_or("Plugin stdin unavailable")?;
         let stdout = child.stdout.take().ok_or("Plugin stdout unavailable")?;
@@ -1055,6 +1056,12 @@ fn spawn_plugin_child(plugin: &InstalledPlugin, app_version: &str, env: &PluginR
         })?;
     ensure_executable_permission(executable_path)?;
     let mut command = crate::process::new_tokio_command(executable_path);
+    // Sidecars get a minimal environment: DBX's own process environment can
+    // carry secrets (DBX_SECRET_KEY, cloud/API credentials, tokens) that a
+    // third-party plugin must not inherit. Only OS plumbing is passed through;
+    // everything DBX intends a plugin to see is set explicitly below.
+    command.env_clear();
+    command.envs(sidecar_base_environment(std::env::vars_os()));
     command
         .current_dir(&plugin.path)
         .stdin(Stdio::piped())
@@ -1068,6 +1075,72 @@ fn spawn_plugin_child(plugin: &InstalledPlugin, app_version: &str, env: &PluginR
         .env("DBX_PLUGIN_PROTOCOL_VERSION", SUPPORTED_PLUGIN_PROTOCOL_VERSION.to_string());
     env.apply_to(&mut command);
     command.spawn().map_err(|error| format!("Failed to start plugin '{}': {error}", plugin.manifest.id))
+}
+
+/// Exact (case-insensitive, as Windows treats them) names inherited by sidecars.
+const SIDECAR_INHERITED_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LANGUAGE",
+    "TZ",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    // JVM-based sidecars (the JDBC plugin launcher) fall back to JAVA_HOME
+    // when the host does not pass DBX_JAVA_BIN.
+    "JAVA_HOME",
+    "SystemRoot",
+    "SystemDrive",
+    "windir",
+    "COMSPEC",
+    "PATHEXT",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "ProgramData",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+];
+/// Prefixes inherited by sidecars (locale categories and XDG base dirs).
+const SIDECAR_INHERITED_ENV_PREFIXES: &[&str] = &["LC_", "XDG_"];
+
+fn sidecar_inherits_env(name: &str) -> bool {
+    SIDECAR_INHERITED_ENV.iter().any(|allowed| allowed.eq_ignore_ascii_case(name))
+        || SIDECAR_INHERITED_ENV_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+}
+
+fn sidecar_base_environment(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    vars.into_iter().filter(|(name, _)| name.to_str().is_some_and(sidecar_inherits_env)).collect()
+}
+
+/// Re-hashes the sidecar executable against the installed checksum manifest
+/// right before launch, so a binary replaced on disk after installation is
+/// never started. Only the executable is hashed to keep startup cheap.
+async fn verify_backend_executable_integrity(plugin: &InstalledPlugin) -> Result<(), String> {
+    let Some(executable) = plugin.compatibility.backend_executable.clone() else {
+        return Ok(());
+    };
+    let package_dir = plugin.path.clone();
+    // Package installs record provenance and always ship checksums.json;
+    // legacy/unmanaged plugin directories predate it and are checked only
+    // when a manifest is present.
+    let required = plugin.provenance.is_some();
+    let plugin_id = plugin.manifest.id.clone();
+    tokio::task::spawn_blocking(move || {
+        super::installer::verify_installed_file_checksum(&package_dir, &executable, required)
+    })
+    .await
+    .map_err(|error| format!("Failed to verify plugin '{plugin_id}' backend: {error}"))?
+    .map_err(|error| format!("Refusing to start plugin '{plugin_id}': {error}"))
 }
 
 fn ensure_executable_permission(path: &Path) -> Result<(), String> {
@@ -1101,6 +1174,28 @@ mod tests {
             std::task::Poll::Ready(())
         })
         .await;
+    }
+
+    #[test]
+    fn sidecars_inherit_only_allowlisted_environment() {
+        let inherited = super::sidecar_base_environment(
+            [
+                ("PATH", "/usr/bin"),
+                ("HOME", "/home/u"),
+                ("LC_ALL", "C"),
+                ("XDG_CONFIG_HOME", "/home/u/.config"),
+                ("SystemRoot", "C:\\Windows"),
+                ("DBX_SECRET_KEY", "secret"),
+                ("AWS_SECRET_ACCESS_KEY", "secret"),
+                ("OPENAI_API_KEY", "secret"),
+                ("GITHUB_TOKEN", "secret"),
+            ]
+            .into_iter()
+            .map(|(name, value)| (name.into(), value.into())),
+        );
+        let names = inherited.iter().map(|(name, _)| name.to_str().unwrap().to_string()).collect::<Vec<_>>();
+        assert_eq!(names, ["PATH", "HOME", "LC_ALL", "XDG_CONFIG_HOME", "SystemRoot"]);
+        assert!(super::sidecar_inherits_env("Path"), "Windows spells PATH as Path");
     }
 
     #[tokio::test]

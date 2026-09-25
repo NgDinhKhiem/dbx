@@ -5,7 +5,7 @@ on:
     tags: ["agents-v*"]
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: agents-release
@@ -26,7 +26,7 @@ jobs:
       build_jre: ${{ steps.bump.outputs.build_jre }}
       reuse_jre: ${{ steps.bump.outputs.reuse_jre }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
       - name: Detect changes and bump versions
@@ -69,7 +69,7 @@ jobs:
         run: git diff --binary -- agents/versions.json > agent-version-bump.patch
 
       - name: Upload agent version patch
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: agent-version-bump
           path: agent-version-bump.patch
@@ -80,13 +80,13 @@ jobs:
     needs: bump-versions
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
           token: ${{ secrets.MCP_RELEASE_TOKEN }}
 
       - name: Download agent version patch
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: agent-version-bump
 
@@ -132,12 +132,12 @@ jobs:
     if: ${{ needs.bump-versions.outputs.java_modules != '[]' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
         with:
           distribution: temurin
           java-version: "21"
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
       - name: Build changed Java agents
         env:
           JAVA_MODULES: ${{ needs.bump-versions.outputs.java_modules }}
@@ -155,7 +155,7 @@ jobs:
         working-directory: agents
       - run: python3 scripts/validate_agent_jars.py
         working-directory: agents
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: agent-jars
           path: |
@@ -166,8 +166,8 @@ jobs:
     if: ${{ contains(fromJSON(needs.bump-versions.outputs.native_modules), 'oracle') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: "1.20.14"
       - name: Test Oracle native agent
@@ -197,7 +197,7 @@ jobs:
           ls -lh ../../../release-native
       # Go 1.20 is the last release that supports Windows 7; keep other targets on Go 1.22.
       - name: Set up Go for Windows 7-compatible Oracle agent
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: "1.20.14"
           cache-dependency-path: agents/drivers/oracle-go/go.sum
@@ -209,7 +209,7 @@ jobs:
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o "$output" .
           go version -m "$output" | tee /tmp/oracle-windows-x64-build-info.txt
           grep -q ': go1\.20\.14$' /tmp/oracle-windows-x64-build-info.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: oracle-native
           path: "release-native/dbx-agent-oracle-*"
@@ -219,8 +219,8 @@ jobs:
     if: ${{ contains(fromJSON(needs.bump-versions.outputs.native_modules), 'xugu') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: "1.20.14"
       - name: Test Xugu native agent
@@ -249,7 +249,7 @@ jobs:
             GONOSUMDB=gitee.com/XuguDB/go-xugu-driver CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags="-s -w" -o "$output" .
           done
           ls -lh ../../../release-native
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: xugu-native
           path: "release-native/dbx-agent-xugu-*"
@@ -259,8 +259,8 @@ jobs:
     if: ${{ contains(fromJSON(needs.bump-versions.outputs.native_modules), 'rabbitmq') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: "1.20.14"
       - name: Test RabbitMQ native agent
@@ -290,7 +290,7 @@ jobs:
           ls -lh ../../../release-native
       # Go 1.20 is the last release that supports Windows 7; keep other targets on Go 1.22.
       - name: Set up Go for Windows 7-compatible RabbitMQ agent
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: "1.20.14"
           cache-dependency-path: agents/drivers/rabbitmq/go.sum
@@ -302,7 +302,7 @@ jobs:
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o "$output" .
           go version -m "$output" | tee /tmp/rabbitmq-windows-x64-build-info.txt
           grep -q ': go1\.20\.14$' /tmp/rabbitmq-windows-x64-build-info.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: rabbitmq-native
           path: "release-native/dbx-agent-rabbitmq-*"
@@ -312,8 +312,8 @@ jobs:
     if: ${{ contains(fromJSON(needs.bump-versions.outputs.native_modules), 'rocketmq') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: "1.25.x"
       - name: Test RocketMQ native agent
@@ -342,7 +342,7 @@ jobs:
             CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags="-s -w" -o "$output" .
           done
           ls -lh ../../../release-native
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: rocketmq-native
           path: "release-native/dbx-agent-rocketmq-*"
@@ -352,8 +352,8 @@ jobs:
     if: ${{ contains(fromJSON(needs.bump-versions.outputs.native_modules), 'etcd') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: "1.26.x"
       - name: Test etcd native agent
@@ -382,7 +382,7 @@ jobs:
             CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags="-s -w" -o "$output" .
           done
           ls -lh ../../../release-native
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: etcd-native
           path: "release-native/dbx-agent-etcd-*"
@@ -392,8 +392,8 @@ jobs:
     if: ${{ contains(fromJSON(needs.bump-versions.outputs.native_modules), 'etcd2') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: "1.24.x"
       - name: Test etcd v2 native agent
@@ -422,7 +422,7 @@ jobs:
             CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags="-s -w" -o "$output" .
           done
           ls -lh ../../../release-native
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: etcd2-native
           path: "release-native/dbx-agent-etcd2-*"
@@ -432,8 +432,8 @@ jobs:
     if: ${{ contains(fromJSON(needs.bump-versions.outputs.native_modules), 'zookeeper') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: "1.25.x"
       - name: Test ZooKeeper native agent
@@ -462,7 +462,7 @@ jobs:
             CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags="-s -w" -o "$output" .
           done
           ls -lh ../../../release-native
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: zookeeper-native
           path: "release-native/dbx-agent-zookeeper-*"
@@ -472,8 +472,8 @@ jobs:
     if: ${{ contains(fromJSON(needs.bump-versions.outputs.native_modules), 'cassandra') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: "1.22.x"
       - name: Test Cassandra native agent
@@ -502,7 +502,7 @@ jobs:
             CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags="-s -w" -o "$output" .
           done
           ls -lh ../../../release-native
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cassandra-native
           path: "release-native/dbx-agent-cassandra-*"
@@ -512,8 +512,8 @@ jobs:
     if: ${{ contains(fromJSON(needs.bump-versions.outputs.native_modules), 'hive') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: "1.23.x"
       - name: Test Hive native agent
@@ -542,7 +542,7 @@ jobs:
             CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags="-s -w" -o "$output" .
           done
           ls -lh ../../../release-native
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: hive-native
           path: "release-native/dbx-agent-hive-*"
@@ -552,8 +552,8 @@ jobs:
     if: ${{ contains(fromJSON(needs.bump-versions.outputs.native_modules), 'argo') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: "1.23.x"
       - name: Test Argo native agent
@@ -582,7 +582,7 @@ jobs:
             CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags="-s -w" -o "$output" .
           done
           ls -lh ../../../release-native
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: argo-native
           path: "release-native/dbx-agent-argo-*"
@@ -592,8 +592,8 @@ jobs:
     if: ${{ contains(fromJSON(needs.bump-versions.outputs.native_modules), 'kingbase') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: "1.20.14"
       - name: Test Kingbase native agent
@@ -622,7 +622,7 @@ jobs:
             CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags="-s -w" -o "$output" .
           done
           ls -lh ../../../release-native
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: kingbase-native
           path: "release-native/dbx-agent-kingbase-*"
@@ -632,8 +632,8 @@ jobs:
     if: ${{ contains(fromJSON(needs.bump-versions.outputs.native_modules), 'vastbase') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: "1.22.x"
       - name: Test Vastbase native agent
@@ -662,7 +662,7 @@ jobs:
             CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags="-s -w" -o "$output" .
           done
           ls -lh ../../../release-native
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: vastbase-native
           path: "release-native/dbx-agent-vastbase-*"
@@ -672,8 +672,8 @@ jobs:
     if: ${{ contains(fromJSON(needs.bump-versions.outputs.native_modules), 'neo4j') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: "1.24.x"
       - name: Test Neo4j native agent
@@ -702,7 +702,7 @@ jobs:
             CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags="-s -w" -o "$output" .
           done
           ls -lh ../../../release-native
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: neo4j-native
           path: "release-native/dbx-agent-neo4j-*"
@@ -712,8 +712,8 @@ jobs:
     if: ${{ contains(fromJSON(needs.bump-versions.outputs.native_modules), 'iotdb') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: "1.25.x"
       - name: Test IoTDB native agent
@@ -742,7 +742,7 @@ jobs:
             CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags="-s -w" -o "$output" .
           done
           ls -lh ../../../release-native
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: iotdb-native
           path: "release-native/dbx-agent-iotdb-*"
@@ -788,18 +788,19 @@ jobs:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: ${{ secrets.SCCACHE_S3_BUCKET == '' && 'true' || 'false' }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
         if: runner.os != 'Linux' && matrix.win7 != true
         with:
+          toolchain: 1.97.1
           targets: ${{ matrix.target }}
       - name: Setup Rust for Windows 7
         if: matrix.win7 == true
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly
         with:
           toolchain: nightly-2026-07-22
           components: rust-src
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         if: runner.os == 'Windows'
         with:
           python-version: "3.13"
@@ -857,7 +858,7 @@ jobs:
               -e AWS_ACCESS_KEY_ID \
               -e AWS_SECRET_ACCESS_KEY \
               -e SCCACHE_IDLE_TIMEOUT \
-              -v "${{ github.workspace }}:/workspace" \
+              -v "${GITHUB_WORKSPACE}:/workspace" \
               -w /workspace/agents/drivers/duckdb \
               "${{ matrix.manylinux_image }}" \
               bash -lc '
@@ -912,7 +913,7 @@ jobs:
           if [ -n "${{ matrix.manylinux_image }}" ]; then
             docker run --rm \
               --user "$(id -u):$(id -g)" \
-              -v "${{ github.workspace }}/release-native:/driver:ro" \
+              -v "${GITHUB_WORKSPACE}/release-native:/driver:ro" \
               "${{ matrix.manylinux_image }}" \
               "/driver/dbx-agent-duckdb-${{ matrix.platform }}" < /dev/null
           fi
@@ -921,7 +922,7 @@ jobs:
         continue-on-error: true
         shell: bash
         run: ${SCCACHE_PATH} --show-stats
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: duckdb-native-${{ matrix.platform }}
           path: "release-native/dbx-agent-duckdb-*"
@@ -943,18 +944,19 @@ jobs:
             rustflags: "-C target-feature=+crt-static -C link-arg=-z -C link-arg=max-page-size=65536"
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.97.1
+        uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
         with:
+          toolchain: 1.97.1
           targets: ${{ matrix.target }}
 
       - name: Install cargo-zigbuild
         run: pip3 install cargo-zigbuild
 
       - name: Rust cache
-        uses: swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: "./ -> target"
           shared-key: sqlite-worker-${{ matrix.target }}
@@ -972,7 +974,7 @@ jobs:
             "target/${{ matrix.target }}/release/dbx-sqlite-worker" \
             "release-native/dbx-agent-sqlite-worker-${{ matrix.platform }}"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: sqlite-worker-native-${{ matrix.platform }}
           path: "release-native/dbx-agent-sqlite-worker-*"
@@ -1021,14 +1023,15 @@ jobs:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: ${{ secrets.SCCACHE_S3_BUCKET == '' && 'true' || 'false' }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
         if: runner.os != 'Linux' && matrix.win7 != true
         with:
+          toolchain: 1.97.1
           targets: ${{ matrix.target }}
       - name: Setup Rust for Windows 7
         if: matrix.win7 == true
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly
         with:
           toolchain: nightly-2026-07-22
           components: rust-src
@@ -1083,7 +1086,7 @@ jobs:
               -e AWS_ACCESS_KEY_ID \
               -e AWS_SECRET_ACCESS_KEY \
               -e SCCACHE_IDLE_TIMEOUT \
-              -v "${{ github.workspace }}:/workspace" \
+              -v "${GITHUB_WORKSPACE}:/workspace" \
               -w /workspace \
               "${{ matrix.manylinux_image }}" \
               bash -lc '
@@ -1132,7 +1135,7 @@ jobs:
           if [ -n "${{ matrix.manylinux_image }}" ]; then
             docker run --rm \
               --user "$(id -u):$(id -g)" \
-              -v "${{ github.workspace }}/release-native:/driver:ro" \
+              -v "${GITHUB_WORKSPACE}/release-native:/driver:ro" \
               "${{ matrix.manylinux_image }}" \
               "/driver/dbx-agent-tdengine-${{ matrix.platform }}" < /dev/null
           elif [ "${{ matrix.smoke }}" = "true" ]; then
@@ -1143,7 +1146,7 @@ jobs:
         continue-on-error: true
         shell: bash
         run: ${SCCACHE_PATH} --show-stats
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: tdengine-native-${{ matrix.platform }}
           path: "release-native/dbx-agent-tdengine-*"
@@ -1159,7 +1162,7 @@ jobs:
             java-version: "21"
             modules: "java.base,java.sql,java.sql.rowset,java.naming,java.management,java.desktop,java.security.jgss,java.security.sasl,jdk.security.auth,jdk.security.jgss,jdk.charsets,jdk.unsupported,java.scripting,java.compiler,jdk.crypto.ec"
     steps:
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
         with:
           distribution: temurin
           java-version: ${{ matrix.java-version }}
@@ -1219,7 +1222,7 @@ jobs:
           done
 
           ls -lh dbx-jre-*.tar.zst
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: jre-${{ matrix.jre-key }}
           path: "dbx-jre-*.tar.zst"
@@ -1230,7 +1233,7 @@ jobs:
     if: ${{ needs.bump-versions.outputs.reuse_modules != '[]' || needs.bump-versions.outputs.reuse_jre == 'true' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install artifact tools
         run: |
           sudo apt-get update
@@ -1250,20 +1253,22 @@ jobs:
             --modules "$REUSE_MODULES" \
             --reuse-jre "$REUSE_JRE" \
             --output reused-release
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: reused-agent-artifacts
           path: reused-release/*
           retention-days: 1
 
   release:
+    permissions:
+      contents: write
     needs: [bump-versions, commit-versions, build-agents, build-oracle-native, build-xugu-native, build-rabbitmq-native, build-rocketmq-native, build-etcd-native, build-etcd2-native, build-zookeeper-native, build-cassandra-native, build-hive-native, build-argo-native, build-kingbase-native, build-vastbase-native, build-neo4j-native, build-iotdb-native, build-duckdb-native, build-sqlite-worker-native, build-tdengine-native, build-jre, reuse-previous-assets]
     if: ${{ always() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
     runs-on: ubuntu-latest
     steps:
       - name: Create DBX bot release token
         id: release-token
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ vars.DBX_BOT_APP_ID }}
           private-key: ${{ secrets.DBX_BOT_PRIVATE_KEY }}
@@ -1274,16 +1279,16 @@ jobs:
           # requires the GitHub App's dedicated Workflows permission.
           permission-workflows: write
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           token: ${{ steps.release-token.outputs.token }}
           fetch-depth: 0
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
         with:
           distribution: temurin
           java-version: "21"
-      - uses: gradle/actions/setup-gradle@v4
-      - uses: actions/download-artifact@v4
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: artifacts
 
@@ -1513,6 +1518,22 @@ jobs:
           echo "=== final agent-registry.json ==="
           cat release/agent-registry.json
 
+      # Detached Ed25519 signature published next to the registry. Runs only when
+      # the AGENT_REGISTRY_SIGNING_KEY secret exists, so forks and unconfigured
+      # repositories keep publishing an unsigned registry.
+      - name: Sign agent-registry.json
+        env:
+          AGENT_REGISTRY_SIGNING_KEY: ${{ secrets.AGENT_REGISTRY_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          rm -f release/agent-registry.json.sig
+          if [ -z "${AGENT_REGISTRY_SIGNING_KEY}" ]; then
+            echo "::warning::AGENT_REGISTRY_SIGNING_KEY is not configured; publishing an unsigned agent-registry.json"
+            exit 0
+          fi
+          node scripts/sign-agent-registry.mjs release/agent-registry.json
+          test -s release/agent-registry.json.sig
+
       - name: Generate release notes
         env:
           MODULE_VERSIONS: ${{ needs.bump-versions.outputs.versions }}
@@ -1647,7 +1668,7 @@ jobs:
           cat RELEASE_NOTES.md
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           token: ${{ steps.release-token.outputs.token }}
           files: release/*
@@ -1658,6 +1679,10 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.release-token.outputs.token }}
         run: |
+          REGISTRY_FILES=(release/agent-registry.json)
+          if [ -f release/agent-registry.json.sig ]; then
+            REGISTRY_FILES+=(release/agent-registry.json.sig)
+          fi
           git tag -f agents-latest "$GITHUB_SHA"
           git push origin refs/tags/agents-latest --force
 
@@ -1667,16 +1692,18 @@ jobs:
             gh release view agents-latest --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' |
               while IFS= read -r asset; do
                 [ "$asset" = "agent-registry.json" ] && continue
+                # Keep the signature only when this run produced a fresh one.
+                [ "$asset" = "agent-registry.json.sig" ] && [ -f release/agent-registry.json.sig ] && continue
                 gh release delete-asset agents-latest "$asset" --repo "$GITHUB_REPOSITORY" --yes
               done
-            gh release upload agents-latest release/agent-registry.json --repo "$GITHUB_REPOSITORY" --clobber
+            gh release upload agents-latest "${REGISTRY_FILES[@]}" --repo "$GITHUB_REPOSITORY" --clobber
             gh release edit agents-latest \
               --repo "$GITHUB_REPOSITORY" \
               --title "Agents latest" \
               --notes "Moving entry point for the latest DBX agent registry. Artifacts are stored on the referenced versioned agents release." \
               --latest=false
           else
-            gh release create agents-latest release/agent-registry.json \
+            gh release create agents-latest "${REGISTRY_FILES[@]}" \
               --repo "$GITHUB_REPOSITORY" \
               --title "Agents latest" \
               --notes "Moving entry point for the latest DBX agent registry. Artifacts are stored on the referenced versioned agents release." \
@@ -1695,6 +1722,15 @@ jobs:
             "$R2_BUCKET/agents/agent-registry.json" \
             --endpoint-url "$R2_ENDPOINT"
           echo "Uploaded agent-registry.json"
+          if [ -f release/agent-registry.json.sig ]; then
+            aws s3 cp release/agent-registry.json.sig \
+              "$R2_BUCKET/agents/agent-registry.json.sig" \
+              --endpoint-url "$R2_ENDPOINT"
+            echo "Uploaded agent-registry.json.sig"
+          else
+            # Never leave a signature for an older registry next to an unsigned one.
+            aws s3 rm "$R2_BUCKET/agents/agent-registry.json.sig" --endpoint-url "$R2_ENDPOINT" || true
+          fi
 
           # Upload all single-driver packages concurrently.
           aws s3 cp release/ "$R2_BUCKET/agents/drivers/" \
@@ -1724,7 +1760,7 @@ jobs:
         tag: ["${{ github.ref_name }}", "agents-latest"]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Download GitHub release assets
         env:

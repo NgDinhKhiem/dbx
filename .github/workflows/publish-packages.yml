@@ -13,7 +13,7 @@ on:
         type: boolean
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   APP_NAME: dbx
@@ -27,8 +27,10 @@ jobs:
     steps:
       - name: Extract version from tag
         id: version
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
         run: |
-          TAG="${{ github.event.inputs.tag }}"
+          TAG="${INPUT_TAG}"
           TAG="$(echo "${TAG}" | xargs)"
           VERSION="${TAG#v}"
           if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
@@ -41,10 +43,12 @@ jobs:
       - name: Download release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STEP_VERSION_VERSION: ${{ steps.version.outputs.version }}
+          STEP_VERSION_TAG: ${{ steps.version.outputs.tag }}
         run: |
           mkdir -p artifacts
-          VERSION="${{ steps.version.outputs.version }}"
-          TAG="${{ steps.version.outputs.tag }}"
+          VERSION="${STEP_VERSION_VERSION}"
+          TAG="${STEP_VERSION_TAG}"
 
           ASSETS=(
             "${PRODUCT_NAME}_${VERSION}_arm64.dmg"
@@ -56,7 +60,7 @@ jobs:
           for ASSET in "${ASSETS[@]}"; do
             echo "::group::Downloading ${ASSET}"
             gh release download "${TAG}" \
-              --repo "${{ github.repository }}" \
+              --repo "${GITHUB_REPOSITORY}" \
               --pattern "${ASSET}" \
               --dir artifacts \
               --clobber
@@ -67,8 +71,10 @@ jobs:
 
       - name: Compute SHA256 hashes
         id: hashes
+        env:
+          STEP_VERSION_VERSION: ${{ steps.version.outputs.version }}
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
+          VERSION="${STEP_VERSION_VERSION}"
 
           compute_hash() {
             local file="$1" name="$2"
@@ -91,10 +97,13 @@ jobs:
       - name: Publish Homebrew Cask
         env:
           TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+          STEP_VERSION_VERSION: ${{ steps.version.outputs.version }}
+          STEP_HASHES_SHA_DMG_ARM64: ${{ steps.hashes.outputs.sha_dmg_arm64 }}
+          STEP_HASHES_SHA_DMG_X64: ${{ steps.hashes.outputs.sha_dmg_x64 }}
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          SHA_ARM64="${{ steps.hashes.outputs.sha_dmg_arm64 }}"
-          SHA_X64="${{ steps.hashes.outputs.sha_dmg_x64 }}"
+          VERSION="${STEP_VERSION_VERSION}"
+          SHA_ARM64="${STEP_HASHES_SHA_DMG_ARM64}"
+          SHA_X64="${STEP_HASHES_SHA_DMG_X64}"
 
           git clone --depth 1 \
             "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/${REPO_OWNER}/homebrew-tap.git" \
@@ -152,10 +161,13 @@ jobs:
       - name: Publish Scoop manifest
         env:
           TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+          STEP_VERSION_VERSION: ${{ steps.version.outputs.version }}
+          STEP_HASHES_SHA_EXE_X64: ${{ steps.hashes.outputs.sha_exe_x64 }}
+          STEP_HASHES_SHA_EXE_ARM64: ${{ steps.hashes.outputs.sha_exe_arm64 }}
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          SHA_EXE_X64="${{ steps.hashes.outputs.sha_exe_x64 }}"
-          SHA_EXE_ARM64="${{ steps.hashes.outputs.sha_exe_arm64 }}"
+          VERSION="${STEP_VERSION_VERSION}"
+          SHA_EXE_X64="${STEP_HASHES_SHA_EXE_X64}"
+          SHA_EXE_ARM64="${STEP_HASHES_SHA_EXE_ARM64}"
 
           git clone --depth 1 \
             "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/${REPO_OWNER}/scoop-bucket.git" \
@@ -222,18 +234,21 @@ jobs:
     steps:
       - name: Extract version from tag
         id: version
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
         run: |
-          TAG="${{ github.event.inputs.tag }}"
+          TAG="${INPUT_TAG}"
           TAG="$(echo "${TAG}" | xargs)"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Download release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STEP_VERSION_TAG: ${{ steps.version.outputs.tag }}
         run: |
           mkdir -p assets
-          gh release download "${{ steps.version.outputs.tag }}" \
-            --repo "${{ github.repository }}" \
+          gh release download "${STEP_VERSION_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
             --dir assets \
             --clobber
           ls -lh assets/
@@ -259,8 +274,10 @@ jobs:
           jq -r '.platforms | keys[]' "$LATEST_JSON"
 
       - name: Rewrite latest.json download URLs to R2 CDN
+        env:
+          STEP_VERSION_TAG: ${{ steps.version.outputs.tag }}
         run: |
-          TAG="${{ steps.version.outputs.tag }}"
+          TAG="${STEP_VERSION_TAG}"
           LATEST_JSON="assets/latest.json"
           if [ ! -f "$LATEST_JSON" ]; then
             echo "::warning::latest.json not found, skipping URL rewrite"
@@ -280,21 +297,26 @@ jobs:
 
       - name: Upload to R2 (versioned)
         run: |
-          aws s3 sync ./assets "s3://${{ secrets.R2_BUCKET_NAME }}/releases/${{ steps.version.outputs.tag }}/" \
-            --endpoint-url "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+          aws s3 sync ./assets "s3://${R2_BUCKET_NAME}/releases/${STEP_VERSION_TAG}/" \
+            --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          STEP_VERSION_TAG: ${{ steps.version.outputs.tag }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
 
       - name: Upload to R2 (latest)
         run: |
-          aws s3 sync ./assets "s3://${{ secrets.R2_BUCKET_NAME }}/releases/latest/" \
-            --endpoint-url "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com" \
+          aws s3 sync ./assets "s3://${R2_BUCKET_NAME}/releases/latest/" \
+            --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" \
             --cache-control "no-cache" \
             --delete
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
 
       - name: Keep latest five versioned releases in R2
         continue-on-error: true
@@ -385,20 +407,23 @@ jobs:
           CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
 
   promote-release:
+    permissions:
+      contents: write
     name: Promote to Release
     needs: [publish, upload-r2]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Promote prerelease to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
         run: |
-          TAG="${{ github.event.inputs.tag }}"
+          TAG="${INPUT_TAG}"
           gh release edit "${TAG}" \
-            --repo "${{ github.repository }}" \
+            --repo "${GITHUB_REPOSITORY}" \
             --prerelease=false \
             --latest
           echo "::notice::Release ${TAG} promoted from prerelease to latest release"
@@ -412,7 +437,7 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/github-release"
           gh release view "$TAG" \
-            --repo "${{ github.repository }}" \
+            --repo "${GITHUB_REPOSITORY}" \
             --json tagName,name,body,targetCommitish,isPrerelease,isDraft \
             > "$RUNNER_TEMP/github-release/release.json"
 
@@ -434,7 +459,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.event.inputs.tag }}
         run: |
-          RELEASE_JSON=$(gh release view "${TAG}" --repo "${{ github.repository }}" --json tagName,name,url,body)
+          RELEASE_JSON=$(gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json tagName,name,url,body)
           export RELEASE_TAG=$(echo "$RELEASE_JSON" | jq -r '.tagName')
           export RELEASE_URL=$(echo "$RELEASE_JSON" | jq -r '.url')
           export RELEASE_BODY=$(echo "$RELEASE_JSON" | jq -r '.body')

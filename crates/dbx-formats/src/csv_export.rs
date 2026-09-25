@@ -285,6 +285,64 @@ pub fn format_query_result_csv_with_quote_mode(
     format_csv_with_quote_mode(columns, rows, quote_mode)
 }
 
+/// UTF-8 byte order mark written before CSV/Markdown exports so spreadsheet
+/// applications detect the encoding.
+pub const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
+
+/// Stream the same output as [`format_query_result_csv_with_quote_mode`],
+/// prefixed with a UTF-8 BOM, into `writer` one row at a time. Unlike
+/// `format!("\u{FEFF}{csv}")` this never holds the whole document in memory.
+pub fn write_query_result_csv_with_bom<W: Write>(
+    writer: &mut W,
+    columns: &[String],
+    rows: &[Vec<Value>],
+    quote_mode: CsvQuoteMode,
+) -> std::io::Result<()> {
+    writer.write_all(UTF8_BOM)?;
+    let mut line = String::with_capacity(256);
+    for (index, column) in columns.iter().enumerate() {
+        if index > 0 {
+            line.push(',');
+        }
+        push_csv_field(&mut line, column, quote_mode);
+    }
+    line.push('\n');
+    writer.write_all(line.as_bytes())?;
+    for (row_index, row) in rows.iter().enumerate() {
+        line.clear();
+        if row_index > 0 {
+            line.push('\n');
+        }
+        push_query_result_csv_row_with_quote_mode(&mut line, row, quote_mode);
+        writer.write_all(line.as_bytes())?;
+    }
+    Ok(())
+}
+
+/// Write a query-result CSV (with UTF-8 BOM) directly to `path` through a
+/// buffered file writer.
+pub fn write_query_result_csv_file(
+    path: impl AsRef<std::path::Path>,
+    columns: &[String],
+    rows: &[Vec<Value>],
+    quote_mode: CsvQuoteMode,
+) -> Result<(), String> {
+    let file = std::fs::File::create(path).map_err(|err| err.to_string())?;
+    let mut writer = std::io::BufWriter::new(file);
+    write_query_result_csv_with_bom(&mut writer, columns, rows, quote_mode).map_err(|err| err.to_string())?;
+    writer.flush().map_err(|err| err.to_string())
+}
+
+/// Write `content` to `path` prefixed with a UTF-8 BOM without first copying
+/// it into a new `String`.
+pub fn write_text_file_with_utf8_bom(path: impl AsRef<std::path::Path>, content: &str) -> Result<(), String> {
+    let file = std::fs::File::create(path).map_err(|err| err.to_string())?;
+    let mut writer = std::io::BufWriter::new(file);
+    writer.write_all(UTF8_BOM).map_err(|err| err.to_string())?;
+    writer.write_all(content.as_bytes()).map_err(|err| err.to_string())?;
+    writer.flush().map_err(|err| err.to_string())
+}
+
 pub fn write_csv_text_row(
     writer: &mut impl Write,
     values: impl IntoIterator<Item = String>,
@@ -331,6 +389,34 @@ mod tests {
         CsvQuoteMode,
     };
     use serde_json::json;
+
+    #[test]
+    fn streamed_csv_with_bom_matches_formatted_csv() {
+        let columns = vec!["id".to_string(), "note \"x\"".to_string()];
+        let rows = vec![vec![json!(1), json!("a,b")], vec![json!(2), serde_json::Value::Null], vec![json!(3), json!("中文")]];
+        for mode in [CsvQuoteMode::All, CsvQuoteMode::Necessary] {
+            let mut streamed = Vec::new();
+            super::write_query_result_csv_with_bom(&mut streamed, &columns, &rows, mode).unwrap();
+            let expected = format!("\u{FEFF}{}", super::format_query_result_csv_with_quote_mode(&columns, &rows, mode));
+            assert_eq!(String::from_utf8(streamed).unwrap(), expected);
+        }
+
+        let mut empty = Vec::new();
+        super::write_query_result_csv_with_bom(&mut empty, &columns, &[], CsvQuoteMode::All).unwrap();
+        let expected = format!("\u{FEFF}{}", super::format_query_result_csv_with_quote_mode(&columns, &[], CsvQuoteMode::All));
+        assert_eq!(String::from_utf8(empty).unwrap(), expected);
+    }
+
+    #[test]
+    fn writes_text_file_with_single_utf8_bom() {
+        let dir = std::env::temp_dir().join(format!("dbx-bom-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.md");
+        super::write_text_file_with_utf8_bom(&path, "| a |\n").unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(bytes, b"\xEF\xBB\xBF| a |\n");
+    }
 
     #[test]
     fn formats_csv_with_header_and_escaped_values() {

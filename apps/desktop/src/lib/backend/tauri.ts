@@ -113,6 +113,7 @@ import type { AnnotationFile, SchemaSnapshot } from "@/docs/types";
 import type { CollectionInfo } from "@/types/database";
 import type { SidebarObjectKind } from "@/lib/database/databaseObjectCapabilities";
 import type { AiChatSelectionState, AiConfig, AiConfigItem, AiEffortCapability, AiEffortLevel, AiTestConnectionResult } from "@/types/ai";
+import { aiConfigIdForRequest } from "@/lib/ai/aiConfigSecrets";
 import type { QueryEditability } from "@/lib/sql/sqlAnalysis";
 import { isTerminalTransferProgress } from "@/lib/backend/transferProgress";
 import type {
@@ -382,14 +383,44 @@ export interface WebDavSyncSummary {
   appVersion?: string;
 }
 
+export interface SyncImportEndpointChange {
+  connectionId: string;
+  connectionName: string;
+  changes: Array<{ field: string; before: string; after: string }>;
+}
+
+/** What a cloud-sync import would change; nothing is applied until the user confirms `token`. */
+export interface SyncImportReview {
+  /** False when the snapshot has no verifiable integrity (no sync password available, or a legacy snapshot). */
+  authenticated: boolean;
+  token: string;
+  endpointChanges: SyncImportEndpointChange[];
+}
+
+export interface SyncImportConfirmation {
+  token: string;
+  /** true keeps local saved credentials of changed connections; false deletes them. */
+  keepLocalSecrets: boolean;
+}
+
+export interface SyncImportApplySummary {
+  encryptedSecretsPresent: boolean;
+  secretsApplied: boolean;
+  droppedSecretConnectionIds: string[];
+}
+
+export type SyncImportStatus = "applied" | "confirmationRequired";
+
 export interface WebDavDownloadResult {
+  status: SyncImportStatus;
   summary: WebDavSyncSummary;
+  /** Present when `status` is "confirmationRequired". */
+  review?: SyncImportReview;
+  /** Sanitized editor settings; present only when `status` is "applied". */
   editorSettings?: unknown;
-  desktopSettings: DesktopSettings;
-  applySummary: {
-    encryptedSecretsPresent: boolean;
-    secretsApplied: boolean;
-  };
+  /** Local desktop settings after import; present only when `status` is "applied". */
+  desktopSettings?: DesktopSettings;
+  applySummary?: SyncImportApplySummary;
 }
 
 export interface WebDavPasswordStatus {
@@ -426,10 +457,12 @@ export interface SnippetSyncSummary {
 }
 
 export interface SnippetDownloadResult {
+  status: SyncImportStatus;
   summary: SnippetSyncSummary;
+  review?: SyncImportReview;
   editorSettings?: unknown;
-  desktopSettings: DesktopSettings;
-  applySummary: WebDavDownloadResult["applySummary"];
+  desktopSettings?: DesktopSettings;
+  applySummary?: SyncImportApplySummary;
 }
 
 export interface SnippetTokenStatus {
@@ -556,8 +589,10 @@ export interface AiModelInfo {
   effortCapability?: AiEffortCapability;
 }
 
-export async function aiComplete(request: AiCompletionRequest): Promise<string> {
-  return invoke("ai_complete", { request });
+// AI configs reach the frontend with secrets redacted; `configId` lets the
+// backend fill blank secrets from the stored config with that id.
+export async function aiComplete(request: AiCompletionRequest, configId?: string): Promise<string> {
+  return invoke("ai_complete", { request, configId: aiConfigIdForRequest(request.config, configId) });
 }
 
 export interface AiStreamChunk {
@@ -569,7 +604,7 @@ export interface AiStreamChunk {
   error?: string;
 }
 
-export async function aiStream(sessionId: string, request: AiCompletionRequest, onChunk: (chunk: AiStreamChunk) => void): Promise<void> {
+export async function aiStream(sessionId: string, request: AiCompletionRequest, onChunk: (chunk: AiStreamChunk) => void, configId?: string): Promise<void> {
   const unlisten: UnlistenFn = await listen<AiStreamChunk>("ai-stream-chunk", (event) => {
     if (event.payload.session_id === sessionId) {
       onChunk(event.payload);
@@ -577,7 +612,7 @@ export async function aiStream(sessionId: string, request: AiCompletionRequest, 
     }
   });
   try {
-    await invoke("ai_stream", { sessionId, request });
+    await invoke("ai_stream", { sessionId, request, configId: aiConfigIdForRequest(request.config, configId) });
   } catch (e) {
     unlisten();
     throw e;
@@ -669,6 +704,7 @@ export async function aiAgentStream(
       confirmedDatabase,
       confirmedSchema,
       selectedDatabases,
+      configId: aiConfigIdForRequest(request.config),
     });
   } catch (e) {
     unlisten();
@@ -688,16 +724,16 @@ export async function loadAiProviderConfigs(): Promise<Record<string, AiConfig>>
   return invoke("load_ai_provider_configs");
 }
 
-export async function aiTestConnection(config: AiConfig): Promise<AiTestConnectionResult> {
-  return invoke("ai_test_connection", { config });
+export async function aiTestConnection(config: AiConfig, configId?: string): Promise<AiTestConnectionResult> {
+  return invoke("ai_test_connection", { config, configId: aiConfigIdForRequest(config, configId) });
 }
 
-export async function aiListModels(config: AiConfig): Promise<AiModelInfo[]> {
-  return invoke("ai_list_models", { config });
+export async function aiListModels(config: AiConfig, configId?: string): Promise<AiModelInfo[]> {
+  return invoke("ai_list_models", { config, configId: aiConfigIdForRequest(config, configId) });
 }
 
-export async function aiResolveModelEffort(config: AiConfig, modelId: string): Promise<AiEffortCapability> {
-  return invoke("ai_resolve_model_effort", { config, modelId });
+export async function aiResolveModelEffort(config: AiConfig, modelId: string, configId?: string): Promise<AiEffortCapability> {
+  return invoke("ai_resolve_model_effort", { config, modelId, configId: aiConfigIdForRequest(config, configId) });
 }
 
 export async function saveAiChatSelection(selection: AiChatSelectionState): Promise<void> {
@@ -1003,8 +1039,8 @@ export async function webdavSyncUpload(config: WebDavConfig, editorSettings?: un
   });
 }
 
-export async function webdavSyncDownload(config: WebDavConfig, secretsPassphrase?: string, restoreSecrets = true): Promise<WebDavDownloadResult> {
-  return invoke("webdav_sync_download", { config, secretsPassphrase, restoreSecrets });
+export async function webdavSyncDownload(config: WebDavConfig, secretsPassphrase?: string, restoreSecrets = true, confirmation?: SyncImportConfirmation | null): Promise<WebDavDownloadResult> {
+  return invoke("webdav_sync_download", { config, secretsPassphrase, restoreSecrets, confirmation: confirmation ?? null });
 }
 
 export async function snippetSyncTest(config: SnippetSyncConfig): Promise<void> {
@@ -1045,8 +1081,8 @@ export async function snippetSyncUpload(config: SnippetSyncConfig, editorSetting
   });
 }
 
-export async function snippetSyncDownload(config: SnippetSyncConfig, snippetPassphrase?: string, restoreSecrets = false, secretsPassphrase?: string): Promise<SnippetDownloadResult> {
-  return invoke("snippet_sync_download", { config, snippetPassphrase, restoreSecrets, secretsPassphrase });
+export async function snippetSyncDownload(config: SnippetSyncConfig, snippetPassphrase?: string, restoreSecrets = false, secretsPassphrase?: string, confirmation?: SyncImportConfirmation | null): Promise<SnippetDownloadResult> {
+  return invoke("snippet_sync_download", { config, snippetPassphrase, restoreSecrets, secretsPassphrase, confirmation: confirmation ?? null });
 }
 
 export async function loadPinnedTreeNodeIds(): Promise<string[]> {
@@ -1125,6 +1161,48 @@ export async function writeExternalSqlFile(path: string, content: string, option
 
 export async function saveExternalSqlFile(defaultFileName: string, content: string, filterExtension?: string): Promise<{ path: string; version: ExternalSqlFileVersion } | null> {
   return invoke("save_external_sql_file", { defaultFileName, content, filterExtension });
+}
+
+export interface PickExternalFilesOptions {
+  multiple?: boolean;
+  filterName?: string;
+  extensions?: string[];
+  title?: string;
+}
+
+/**
+ * Native file picker run by the backend. Only paths chosen here (or dropped,
+ * opened from the OS, or confirmed in a native prompt) are accepted by the
+ * external file commands, so pickers for those flows must use this instead of
+ * `@tauri-apps/plugin-dialog`'s `open`.
+ */
+export async function pickExternalFiles(options: PickExternalFilesOptions = {}): Promise<string[]> {
+  return invoke("pick_external_files", {
+    multiple: options.multiple ?? false,
+    filterName: options.filterName ?? null,
+    extensions: options.extensions ?? null,
+    title: options.title ?? null,
+  });
+}
+
+/** Native folder picker; the chosen folder is granted recursively. */
+export async function pickExternalDirectory(title?: string): Promise<string | null> {
+  return invoke("pick_external_directory", { title: title ?? null });
+}
+
+/** Native save dialog; the chosen path is granted for a following authorized write. */
+export async function pickExternalSavePath(defaultFileName?: string, extension?: string): Promise<string | null> {
+  return invoke("pick_external_save_path", { defaultFileName: defaultFileName ?? null, extension: extension ?? null });
+}
+
+/**
+ * Asks the user once, in a native dialog, to keep access to paths remembered
+ * by the frontend (e.g. SQL folders saved by older versions). Already granted
+ * paths never prompt. Resolves true when every path is accessible.
+ */
+export async function requestExternalPathAccess(paths: string[], directory: boolean): Promise<boolean> {
+  if (paths.length === 0) return true;
+  return invoke("request_external_path_access", { paths, directory });
 }
 
 export interface SqlFileEntry {
@@ -2423,9 +2501,23 @@ export async function readKeychainPasswords(services: string[]): Promise<[string
   return invoke("read_keychain_passwords", { services });
 }
 
+/**
+ * Decrypts a `dbx-encrypted` config file (version 1 PBKDF2 or version 2
+ * Argon2id) on the backend and returns the plaintext JSON. A wrong
+ * passphrase rejects with an error containing `wrong_passphrase`.
+ */
 export async function decryptConfig(payload: unknown, passphrase: string): Promise<string> {
-  const { decryptConfig: decryptConfigPayload } = await import("@/lib/backend/configCrypto");
-  return decryptConfigPayload(payload as any, passphrase);
+  return invoke("decrypt_config", { payload, passphrase });
+}
+
+/**
+ * Builds an encrypted (`dbx-encrypted` v2) connection export on the backend.
+ * `bundle` carries connections without secrets; the backend fills in stored
+ * secrets by connection / tunnel profile id and returns the file content.
+ * Passphrases shorter than 12 characters are rejected (`passphrase_too_short`).
+ */
+export async function exportConnectionsEncrypted(bundle: unknown, passphrase: string): Promise<string> {
+  return invoke("export_connections_encrypted", { bundle, passphrase });
 }
 
 export async function listPlugins(): Promise<InstalledPlugin[]> {
@@ -3325,9 +3417,16 @@ export async function redisPubSubPublish(connectionId: string, db: number, chann
   return invoke("redis_pubsub_publish", { connectionId, db, channel, message });
 }
 
+export function redisPubSubWebSocketUrl(endpoint: { port: number; token: string }, connectionId: string, monitor = false): string {
+  const params = new URLSearchParams({ connectionId, monitor: String(monitor), token: endpoint.token });
+  return `ws://127.0.0.1:${endpoint.port}/api/redis/pubsub/ws?${params.toString()}`;
+}
+
 export async function redisPubSubConnect(connectionId: string, monitor = false): Promise<WebSocket> {
-  const port = await invoke<number>("redis_pubsub_server_port");
-  return new WebSocket(`ws://127.0.0.1:${port}/api/redis/pubsub/ws?connectionId=${encodeURIComponent(connectionId)}&monitor=${monitor}`);
+  // The local PubSub server requires the per-launch token (and rejects
+  // non-app Origins), so other pages cannot attach to Redis connections.
+  const endpoint = await invoke<{ port: number; token: string }>("redis_pubsub_server_endpoint");
+  return new WebSocket(redisPubSubWebSocketUrl(endpoint, connectionId, monitor));
 }
 
 export async function redisSlowlogGet(connectionId: string, count: number, nodeHost?: string, nodePort?: number): Promise<RedisSlowlogEntry[]> {

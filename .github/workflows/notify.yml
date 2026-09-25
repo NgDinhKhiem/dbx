@@ -8,6 +8,10 @@ on:
   release:
     types: [published]
 
+# Least privilege: read-only by default; jobs that write request it explicitly.
+permissions:
+  contents: read
+
 jobs:
   notify:
     runs-on: ubuntu-latest

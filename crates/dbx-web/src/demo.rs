@@ -20,7 +20,7 @@ use axum::Json;
 use dbx_core::connection::{connection_configs_session_credentials_compatible, AppState};
 use dbx_core::models::connection::ConnectionConfig;
 
-use crate::auth::middleware_api_path_suffix;
+use crate::auth::nested_api_path;
 use crate::state::WebState;
 
 pub(crate) const DEMO_CONNECT_REJECTED: &str = "Demo mode only allows connecting to the pre-configured connections";
@@ -100,8 +100,8 @@ pub async fn demo_mode_gate(
     next: Next,
 ) -> Response {
     if state.demo_mode {
-        let suffix = middleware_api_path_suffix(request.uri().path(), &state.public_base_path);
-        if suffix.is_some_and(|suffix| is_demo_blocked(request.method(), suffix)) {
+        // Runs on the nested `/api` router: every path it sees is an API path.
+        if is_demo_blocked(request.method(), nested_api_path(request.uri().path())) {
             return (
                 StatusCode::FORBIDDEN,
                 Json(serde_json::json!({
@@ -336,20 +336,27 @@ mod tests {
             web_state.demo_mode = true;
             std::sync::Arc::new(web_state)
         };
-        let router = axum::Router::new()
-            .route("/api/plugins/install", post(|| async { "install" }))
-            .route("/api/connection/list", get(|| async { "connections" }))
-            .layer(axum::middleware::from_fn_with_state(state.clone(), super::demo_mode_gate));
+        let router = axum::Router::new().nest(
+            "/api",
+            axum::Router::new()
+                .route("/plugins/install", post(|| async { "install" }))
+                .route("/auth/setup", post(|| async { "setup" }))
+                .route("/auth/change-password", post(|| async { "change" }))
+                .route("/connection/list", get(|| async { "connections" }))
+                .layer(axum::middleware::from_fn_with_state(state.clone(), super::demo_mode_gate)),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let client = reqwest::Client::new();
 
-        let blocked = client.post(format!("http://{address}/api/plugins/install")).send().await.unwrap();
-        assert_eq!(blocked.status(), reqwest::StatusCode::FORBIDDEN);
-        let payload = blocked.json::<serde_json::Value>().await.unwrap();
-        assert_eq!(payload["code"], "DEMO_MODE_DISABLED");
-        assert_eq!(payload["message"], "This operation is disabled in demo mode");
+        for path in ["/api/plugins/install", "/api/auth/setup", "/api/auth/change-password"] {
+            let blocked = client.post(format!("http://{address}{path}")).send().await.unwrap();
+            assert_eq!(blocked.status(), reqwest::StatusCode::FORBIDDEN, "{path}");
+            let payload = blocked.json::<serde_json::Value>().await.unwrap();
+            assert_eq!(payload["code"], "DEMO_MODE_DISABLED");
+            assert_eq!(payload["message"], "This operation is disabled in demo mode");
+        }
 
         let allowed = client.get(format!("http://{address}/api/connection/list")).send().await.unwrap();
         assert_eq!(allowed.status(), reqwest::StatusCode::OK);
@@ -362,9 +369,12 @@ mod tests {
             dbx_core::storage::Storage::open_unmigrated(&directory.path().join("dbx.db")).await.unwrap(),
         ));
         let state = std::sync::Arc::new(crate::state::WebState::for_tests(app, directory.path().to_path_buf()));
-        let router = axum::Router::new()
-            .route("/api/plugins/install", post(|| async { "install" }))
-            .layer(axum::middleware::from_fn_with_state(state, super::demo_mode_gate));
+        let router = axum::Router::new().nest(
+            "/api",
+            axum::Router::new()
+                .route("/plugins/install", post(|| async { "install" }))
+                .layer(axum::middleware::from_fn_with_state(state, super::demo_mode_gate)),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });

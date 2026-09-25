@@ -12,8 +12,10 @@ const STARTUP_LOG_FILE: &str = "startup.log";
 const RUNTIME_RECOVERY_LOG_FILE: &str = "webview2-recovery.log";
 const STARTUP_LOG_DIR_ENV: &str = "DBX_STARTUP_LOG_DIR";
 const KEEP_STARTUP_LOG_ENV: &str = "DBX_KEEP_STARTUP_LOG";
-#[cfg(target_os = "windows")]
 const NO_SANDBOX_ENV: &str = "DBX_WEBVIEW2_NO_SANDBOX";
+/// Set only on a recovery child the user explicitly allowed to start once
+/// without the WebView2 sandbox. Never persisted.
+const NO_SANDBOX_ONCE_ENV: &str = "DBX_WEBVIEW2_NO_SANDBOX_ONCE";
 const RECOVERY_ATTEMPT_ENV: &str = "DBX_STARTUP_COMPAT_RECOVERY";
 const RECOVERY_PARENT_PID_ENV: &str = "DBX_STARTUP_COMPAT_PARENT_PID";
 const DISABLE_ENTERPRISE_COMPAT_ENV: &str = "DBX_DISABLE_ENTERPRISE_COMPAT";
@@ -38,6 +40,8 @@ static RECOVERY_ATTEMPT: AtomicBool = AtomicBool::new(false);
 static ENTERPRISE_COMPAT: AtomicBool = AtomicBool::new(false);
 static ENTERPRISE_COMPAT_DISABLED: AtomicBool = AtomicBool::new(false);
 static RUN_EVENT_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// True in the process started by the user-confirmed one-shot no-sandbox retry.
+static NO_SANDBOX_RETRY_ACTIVE: AtomicBool = AtomicBool::new(false);
 static FRONTEND_READY_SIGNAL: LazyLock<(Mutex<bool>, Condvar)> = LazyLock::new(|| (Mutex::new(false), Condvar::new()));
 
 fn env_flag(name: &str) -> bool {
@@ -82,8 +86,11 @@ fn compatibility_marker_path() -> Option<PathBuf> {
     compatibility_marker_path_from_appdata(std::env::var_os("APPDATA"))
 }
 
+/// The persisted compatibility mode keeps the WebView2 sandbox enabled: it only
+/// isolates the profile and disables GPU acceleration. Markers written by
+/// older versions (`...-no-sandbox-...`) no longer match and are removed.
 fn compatibility_marker_contents(version: &str) -> String {
-    format!("version={version}\nmode=isolated-profile-no-sandbox-disable-gpu\n")
+    format!("version={version}\nmode=isolated-profile-disable-gpu\n")
 }
 
 fn compatibility_marker_matches_version(path: &Path, version: &str) -> bool {
@@ -122,6 +129,13 @@ fn compatibility_profile_ready_record(profile_source: &str) -> String {
 
 fn configure_recovery_child(command: &mut std::process::Command, parent_pid: u32) {
     command.env(RECOVERY_ATTEMPT_ENV, "1").env(RECOVERY_PARENT_PID_ENV, parent_pid.to_string());
+    command.env_remove(NO_SANDBOX_ONCE_ENV);
+}
+
+/// One-shot relaunch without the sandbox, only after the user confirmed it.
+fn configure_no_sandbox_retry_child(command: &mut std::process::Command, parent_pid: u32) {
+    configure_recovery_child(command, parent_pid);
+    command.env(NO_SANDBOX_ONCE_ENV, "1");
 }
 
 #[cfg(target_os = "windows")]
@@ -320,8 +334,11 @@ fn append_webview2_argument_to_value(mut args: String, argument: &str) -> String
     args
 }
 
-fn webview2_compatibility_arguments(mut args: String, enterprise_compat: bool, manual_no_sandbox: bool) -> String {
-    if enterprise_compat || manual_no_sandbox {
+/// `no_sandbox` is only ever true for the explicit `DBX_WEBVIEW2_NO_SANDBOX`
+/// opt-in or a one-shot relaunch the user confirmed; automatic recovery and
+/// the persisted compatibility mode never disable the sandbox.
+fn webview2_compatibility_arguments(mut args: String, enterprise_compat: bool, no_sandbox: bool) -> String {
+    if no_sandbox {
         args = append_webview2_argument_to_value(args, "--no-sandbox");
     }
     if enterprise_compat {
@@ -332,7 +349,12 @@ fn webview2_compatibility_arguments(mut args: String, enterprise_compat: bool, m
 
 #[cfg(target_os = "windows")]
 fn configure_webview2_compatibility(enterprise_compat: bool) {
-    let manual_no_sandbox = env_flag(NO_SANDBOX_ENV);
+    // The one-shot flag must not leak into processes spawned later
+    // (e.g. updater restarts) and is only honored on a recovery child.
+    let no_sandbox_once = env_flag(NO_SANDBOX_ONCE_ENV) && env_flag(RECOVERY_ATTEMPT_ENV);
+    std::env::remove_var(NO_SANDBOX_ONCE_ENV);
+    NO_SANDBOX_RETRY_ACTIVE.store(no_sandbox_once, Ordering::Release);
+    let manual_no_sandbox = env_flag(NO_SANDBOX_ENV) || no_sandbox_once;
     if enterprise_compat {
         let (profile_path, profile_source) = compatibility_profile_path();
         match profile_path {
@@ -348,11 +370,20 @@ fn configure_webview2_compatibility(enterprise_compat: bool) {
     }
     if enterprise_compat || manual_no_sandbox {
         let args = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").unwrap_or_default();
+        // Drop a `--no-sandbox` inherited from the parent environment unless
+        // this launch explicitly allows it.
+        let args = if manual_no_sandbox {
+            args
+        } else {
+            args.split_whitespace().filter(|value| *value != "--no-sandbox").collect::<Vec<_>>().join(" ")
+        };
         std::env::set_var(
             "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
             webview2_compatibility_arguments(args, enterprise_compat, manual_no_sandbox),
         );
-        record(format!("WebView2 no-sandbox enabled enterprise_compat={enterprise_compat} manual={manual_no_sandbox}"));
+        record(format!(
+            "WebView2 compatibility arguments applied enterprise_compat={enterprise_compat} no_sandbox={manual_no_sandbox} one_shot={no_sandbox_once}"
+        ));
     }
     if enterprise_compat {
         record("WebView2 GPU acceleration disabled for enterprise compatibility recovery");
@@ -456,6 +487,26 @@ pub(crate) fn start_watchdog<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
             }
             persist_buffer();
             record("enterprise compatibility startup failed; automatic recovery stopped");
+            // Disabling the sandbox is a security trade-off, so it is never
+            // automatic: ask once, relaunch once, and never persist it.
+            let already_tried_without_sandbox =
+                env_flag(NO_SANDBOX_ENV) || NO_SANDBOX_RETRY_ACTIVE.load(Ordering::Acquire);
+            if !already_tried_without_sandbox && confirm_no_sandbox_retry() {
+                record("user approved a one-time relaunch without the WebView2 sandbox");
+                let restart_result = std::env::current_exe().and_then(|executable| {
+                    let mut command = std::process::Command::new(executable);
+                    command.args(std::env::args_os().skip(1));
+                    configure_no_sandbox_retry_child(&mut command, std::process::id());
+                    command.spawn()
+                });
+                match restart_result {
+                    Ok(child) => {
+                        record(format!("one-time no-sandbox process spawned pid={}", child.id()));
+                        std::process::exit(0);
+                    }
+                    Err(error) => record(format!("failed to spawn one-time no-sandbox process: {error}")),
+                }
+            }
             show_recovery_failure_message();
             std::process::exit(1);
         }
@@ -540,11 +591,11 @@ fn confirm_keep_compatibility_mode() -> bool {
     let locale = sys_locale::get_locale().unwrap_or_default().to_ascii_lowercase();
     let body = if locale.starts_with("zh") {
         format!(
-            "DBX 已通过企业环境兼容模式恢复主界面。\n\n该模式会为 WebView2 使用独立数据目录，并关闭沙箱和 GPU 加速，仅建议在标准模式无法显示窗口时保留。\n\n是否让当前 DBX 版本后续启动直接使用兼容模式？\n选择“否”后，下次启动会重新尝试标准模式。\n\n本次恢复日志：{log_path}"
+            "DBX 已通过企业环境兼容模式恢复主界面。\n\n该模式会为 WebView2 使用独立数据目录并关闭 GPU 加速（沙箱保持开启），仅建议在标准模式无法显示窗口时保留。\n\n是否让当前 DBX 版本后续启动直接使用兼容模式？\n选择“否”后，下次启动会重新尝试标准模式。\n\n本次恢复日志：{log_path}"
         )
     } else {
         format!(
-            "DBX restored the main window using enterprise environment compatibility mode.\n\nThis mode uses an isolated WebView2 data directory and disables the sandbox and GPU acceleration. Keep it only when the standard mode cannot display the window.\n\nUse compatibility mode directly for future launches of this DBX version?\nChoose No to retry standard mode on the next launch.\n\nRecovery log: {log_path}"
+            "DBX restored the main window using enterprise environment compatibility mode.\n\nThis mode uses an isolated WebView2 data directory and disables GPU acceleration (the sandbox stays enabled). Keep it only when the standard mode cannot display the window.\n\nUse compatibility mode directly for future launches of this DBX version?\nChoose No to retry standard mode on the next launch.\n\nRecovery log: {log_path}"
         )
     };
     let title = "DBX".encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>();
@@ -561,6 +612,35 @@ fn confirm_keep_compatibility_mode() -> bool {
 
 #[cfg(not(target_os = "windows"))]
 fn confirm_keep_compatibility_mode() -> bool {
+    false
+}
+
+#[cfg(target_os = "windows")]
+fn confirm_no_sandbox_retry() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_SETFOREGROUND, MB_YESNO,
+    };
+
+    let locale = sys_locale::get_locale().unwrap_or_default().to_ascii_lowercase();
+    let body = if locale.starts_with("zh") {
+        "DBX 在兼容模式下仍无法显示主窗口。\n\n可以尝试关闭 WebView2 沙箱后仅重新启动这一次。关闭沙箱会降低安全性：网页内容中的漏洞将不再被隔离。该设置不会被保存。\n\n是否在不使用沙箱的情况下重新启动一次？"
+    } else {
+        "DBX still could not show its main window in compatibility mode.\n\nYou can retry once with the WebView2 sandbox disabled. This lowers security: vulnerabilities in web content are no longer contained. The setting is not saved.\n\nRestart once without the sandbox?"
+    };
+    let title = "DBX".encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>();
+    let body = body.encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>();
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            body.as_ptr(),
+            title.as_ptr(),
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND,
+        ) == IDYES
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn confirm_no_sandbox_retry() -> bool {
     false
 }
 
@@ -586,9 +666,9 @@ fn show_recovery_failure_message() {}
 mod tests {
     use super::{
         compatibility_marker_contents, compatibility_marker_path_from_appdata, compatibility_profile_path_from_inputs,
-        compatibility_profile_ready_record, configure_recovery_child, resolve_compatibility_mode,
-        should_attempt_enterprise_recovery, startup_log_dir_from_inputs, webview2_compatibility_arguments,
-        RECOVERY_ATTEMPT_ENV, RECOVERY_PARENT_PID_ENV,
+        compatibility_profile_ready_record, configure_no_sandbox_retry_child, configure_recovery_child,
+        resolve_compatibility_mode, should_attempt_enterprise_recovery, startup_log_dir_from_inputs,
+        webview2_compatibility_arguments, NO_SANDBOX_ONCE_ENV, RECOVERY_ATTEMPT_ENV, RECOVERY_PARENT_PID_ENV,
     };
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -698,10 +778,8 @@ mod tests {
 
     #[test]
     fn compatibility_marker_is_scoped_to_the_current_version() {
-        assert_eq!(
-            compatibility_marker_contents("0.5.72"),
-            "version=0.5.72\nmode=isolated-profile-no-sandbox-disable-gpu\n"
-        );
+        assert_eq!(compatibility_marker_contents("0.5.72"), "version=0.5.72\nmode=isolated-profile-disable-gpu\n");
+        assert!(!compatibility_marker_contents("0.5.72").contains("no-sandbox"));
     }
 
     #[test]
@@ -714,12 +792,27 @@ mod tests {
             "--remote-debugging-port=9222 --no-sandbox"
         );
         assert_eq!(
-            webview2_compatibility_arguments(existing, true, false),
-            "--remote-debugging-port=9222 --no-sandbox --disable-gpu"
+            webview2_compatibility_arguments(existing.clone(), true, false),
+            "--remote-debugging-port=9222 --disable-gpu"
         );
         assert_eq!(
-            webview2_compatibility_arguments("--no-sandbox --disable-gpu".to_string(), true, false),
-            "--no-sandbox --disable-gpu"
+            webview2_compatibility_arguments(existing, true, true),
+            "--remote-debugging-port=9222 --no-sandbox --disable-gpu"
         );
+        assert_eq!(webview2_compatibility_arguments("--disable-gpu".to_string(), true, false), "--disable-gpu");
+    }
+
+    #[test]
+    fn only_the_confirmed_retry_child_runs_without_the_sandbox() {
+        let mut automatic = std::process::Command::new("dbx-test");
+        automatic.env(NO_SANDBOX_ONCE_ENV, "1");
+        configure_recovery_child(&mut automatic, 7);
+        assert!(automatic.get_envs().any(|(key, value)| key == NO_SANDBOX_ONCE_ENV && value.is_none()));
+
+        let mut confirmed = std::process::Command::new("dbx-test");
+        configure_no_sandbox_retry_child(&mut confirmed, 7);
+        let envs = confirmed.get_envs().collect::<Vec<_>>();
+        assert!(envs.iter().any(|(key, value)| *key == NO_SANDBOX_ONCE_ENV && value.is_some_and(|v| v == "1")));
+        assert!(envs.iter().any(|(key, value)| *key == RECOVERY_ATTEMPT_ENV && value.is_some_and(|v| v == "1")));
     }
 }

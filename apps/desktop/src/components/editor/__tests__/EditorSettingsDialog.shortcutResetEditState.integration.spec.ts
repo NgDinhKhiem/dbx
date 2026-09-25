@@ -70,7 +70,7 @@ vi.mock("@/stores/settingsStore", async (importOriginal) => {
       shortcuts: { ...actual.DEFAULT_EDITOR_SETTINGS.shortcuts, formatSql: "Ctrl+Alt+F" },
     },
     desktopSettings: actual.DEFAULT_DESKTOP_SETTINGS,
-    mcpGlobalPolicy: { configured: false, readOnly: false },
+    mcpGlobalPolicy: { configured: false, readOnly: true },
     aiConfigs: [],
     aiDefaultTemplatesByDbType: {},
     defaultAiMode: "ask",

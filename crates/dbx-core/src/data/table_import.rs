@@ -1055,26 +1055,116 @@ pub fn parse_delimited_bytes(bytes: &[u8], delimiter: u8, preview_limit: usize) 
     parse_delimited_bytes_with_options(bytes, TableImportSourceFormat::Delimited, &options, preview_limit)
 }
 
+/// Incremental state for a JSON import scan. Rows past `preview_limit` are
+/// parsed one at a time and dropped after their shape and keys are recorded,
+/// so memory stays bounded by the retained rows instead of the whole document.
+struct JsonImportScan {
+    preview_limit: usize,
+    retained: Vec<serde_json::Value>,
+    total_rows: usize,
+    all_objects: bool,
+    all_arrays: bool,
+    columns: Vec<String>,
+    seen_columns: HashSet<String>,
+    max_array_len: usize,
+}
+
+impl JsonImportScan {
+    fn new(preview_limit: usize) -> Self {
+        Self {
+            preview_limit,
+            retained: Vec::new(),
+            total_rows: 0,
+            all_objects: true,
+            all_arrays: true,
+            columns: Vec::new(),
+            seen_columns: HashSet::new(),
+            max_array_len: 0,
+        }
+    }
+
+    fn push(&mut self, item: serde_json::Value) {
+        self.total_rows += 1;
+        match &item {
+            serde_json::Value::Object(object) => {
+                self.all_arrays = false;
+                if self.all_objects {
+                    for key in object.keys() {
+                        if !self.seen_columns.contains(key.as_str()) {
+                            self.seen_columns.insert(key.clone());
+                            self.columns.push(key.clone());
+                        }
+                    }
+                }
+            }
+            serde_json::Value::Array(values) => {
+                self.all_objects = false;
+                self.max_array_len = self.max_array_len.max(values.len());
+            }
+            _ => {
+                self.all_objects = false;
+                self.all_arrays = false;
+            }
+        }
+        if self.retained.len() < self.preview_limit {
+            self.retained.push(item);
+        }
+    }
+}
+
+struct JsonImportVisitor<'a>(&'a mut JsonImportScan);
+
+impl<'de> serde::de::Visitor<'de> for JsonImportVisitor<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON object or array")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        while let Some(item) = seq.next_element::<serde_json::Value>()? {
+            self.0.push(item);
+        }
+        Ok(())
+    }
+
+    fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let item = serde_json::Value::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+        self.0.push(item);
+        Ok(())
+    }
+}
+
 pub fn parse_json_bytes_with_options(
     bytes: &[u8],
     options: &TableImportParseOptions,
     preview_limit: usize,
 ) -> Result<ParsedImportFile, String> {
     let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
-    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-    let items = match value {
-        serde_json::Value::Array(items) => items,
-        serde_json::Value::Object(_) => vec![value],
-        _ => return Err("JSON import must be an object or an array".to_string()),
-    };
-    if items.is_empty() {
+    let first_token = bytes.iter().copied().find(|byte| !byte.is_ascii_whitespace());
+    if !matches!(first_token, Some(b'[' | b'{')) {
+        // Scalars and malformed input: keep the parser's own error for invalid JSON.
+        serde_json::from_slice::<serde_json::Value>(bytes).map_err(|e| e.to_string())?;
+        return Err("JSON import must be an object or an array".to_string());
+    }
+
+    let mut scan = JsonImportScan::new(preview_limit);
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    serde::Deserializer::deserialize_any(&mut deserializer, JsonImportVisitor(&mut scan)).map_err(|e| e.to_string())?;
+    deserializer.end().map_err(|e| e.to_string())?;
+
+    let JsonImportScan { retained, total_rows, all_objects, all_arrays, columns, max_array_len, .. } = scan;
+    if total_rows == 0 {
         return Err("Import file has no rows".to_string());
     }
 
     let shape = options.json_shape.unwrap_or(TableImportJsonShape::Auto);
-    let all_objects = items.iter().all(|item| item.is_object());
-    let all_arrays = items.iter().all(|item| item.is_array());
-
     if shape == TableImportJsonShape::Objects && !all_objects {
         return Err("JSON import is configured for object rows, but at least one row is not an object".to_string());
     }
@@ -1083,50 +1173,38 @@ pub fn parse_json_bytes_with_options(
     }
 
     if all_objects {
-        let mut columns = Vec::new();
-        for item in &items {
-            if let Some(obj) = item.as_object() {
-                for key in obj.keys() {
-                    if !columns.contains(key) {
-                        columns.push(key.clone());
-                    }
-                }
-            }
-        }
         if columns.is_empty() {
             return Err("Import file has no columns".to_string());
         }
-        let rows = items
-            .iter()
-            .take(preview_limit)
-            .map(|item| {
-                let obj = item.as_object().expect("checked object JSON row");
-                columns
+        let rows = retained
+            .into_iter()
+            .map(|item| match item {
+                serde_json::Value::Object(mut object) => columns
                     .iter()
-                    .map(|column| obj.get(column).cloned().unwrap_or(serde_json::Value::Null))
-                    .collect::<Vec<_>>()
+                    .map(|column| object.remove(column).unwrap_or(serde_json::Value::Null))
+                    .collect::<Vec<_>>(),
+                _ => unreachable!("checked object JSON row"),
             })
             .collect::<Vec<_>>();
-        return Ok(ParsedImportFile { columns, rows, total_rows: items.len(), effective_encoding: None });
+        return Ok(ParsedImportFile { columns, rows, total_rows, effective_encoding: None });
     }
 
     if all_arrays {
-        let max_cols = items.iter().filter_map(|item| item.as_array().map(|row| row.len())).max().unwrap_or(0);
-        if max_cols == 0 {
+        if max_array_len == 0 {
             return Err("Import file has no columns".to_string());
         }
-        let columns = (0..max_cols).map(|index| format!("column_{}", index + 1)).collect::<Vec<_>>();
-        let rows = items
-            .iter()
-            .take(preview_limit)
-            .map(|item| {
-                let arr = item.as_array().expect("checked array JSON row");
-                (0..max_cols)
-                    .map(|index| arr.get(index).cloned().unwrap_or(serde_json::Value::Null))
-                    .collect::<Vec<_>>()
+        let columns = (0..max_array_len).map(|index| format!("column_{}", index + 1)).collect::<Vec<_>>();
+        let rows = retained
+            .into_iter()
+            .map(|item| match item {
+                serde_json::Value::Array(mut values) => {
+                    values.resize(max_array_len, serde_json::Value::Null);
+                    values
+                }
+                _ => unreachable!("checked array JSON row"),
             })
             .collect::<Vec<_>>();
-        return Ok(ParsedImportFile { columns, rows, total_rows: items.len(), effective_encoding: None });
+        return Ok(ParsedImportFile { columns, rows, total_rows, effective_encoding: None });
     }
 
     Err("JSON rows must all be objects or all be arrays; mixed row shapes are not supported".to_string())
@@ -3744,8 +3822,16 @@ async fn parse_import_file_with_options_and_text_columns(
             .map_err(|e| e.to_string())?
         }
         TableImportSourceFormat::Json => {
-            let bytes = tokio::fs::read(path).await.map_err(|e| e.to_string())?;
-            parse_json_bytes_with_options(&bytes, options, preview_limit)
+            // Reading and parsing up to MAX_NON_STREAMING_IMPORT_BYTES is CPU and
+            // blocking-IO heavy; keep it off the async worker threads.
+            let path = path.to_string();
+            let options = options.clone();
+            tokio::task::spawn_blocking(move || {
+                let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+                parse_json_bytes_with_options(&bytes, &options, preview_limit)
+            })
+            .await
+            .map_err(|e| e.to_string())?
         }
         TableImportSourceFormat::Sql => {
             // 大脚本走增量解析：只保留前 `preview_limit` 行，内存不随体积增长。
@@ -8774,6 +8860,42 @@ mod tests {
         assert_eq!(parsed.columns, vec!["id", "name"]);
         assert_eq!(parsed.total_rows, 1);
         assert_eq!(parsed.rows[0], vec![serde_json::json!(1), serde_json::json!("Ada")]);
+    }
+
+    #[test]
+    fn json_preview_keeps_only_limited_rows_but_counts_and_discovers_all_columns() {
+        let parsed = parse_json_bytes(br#"[{"id":1},{"id":2,"name":"Bob"},{"id":3,"active":false}]"#, 1).unwrap();
+
+        assert_eq!(parsed.columns, vec!["id", "name", "active"]);
+        assert_eq!(parsed.total_rows, 3);
+        assert_eq!(parsed.rows, vec![vec![serde_json::json!(1), serde_json::Value::Null, serde_json::Value::Null]]);
+    }
+
+    #[test]
+    fn parses_json_single_object_and_padded_array_rows() {
+        let parsed = parse_json_bytes(br#" {"id":1,"name":"Ada"} "#, 10).unwrap();
+        assert_eq!(parsed.columns, vec!["id", "name"]);
+        assert_eq!(parsed.total_rows, 1);
+
+        let parsed = parse_json_bytes(br#"[[1,"Ada"],[2]]"#, 10).unwrap();
+        assert_eq!(parsed.columns, vec!["column_1", "column_2"]);
+        assert_eq!(parsed.rows[1], vec![serde_json::json!(2), serde_json::Value::Null]);
+    }
+
+    #[test]
+    fn json_import_rejects_scalars_mixed_rows_empty_input_and_trailing_data() {
+        assert_eq!(parse_json_bytes(b"42", 10).unwrap_err(), "JSON import must be an object or an array");
+        assert!(parse_json_bytes(b"[]", 10).unwrap_err().contains("no rows"));
+        assert!(parse_json_bytes(br#"[{"id":1},[1]]"#, 10).unwrap_err().contains("mixed row shapes"));
+        assert!(parse_json_bytes(br#"[{"id":1}] x"#, 10).is_err());
+        assert!(parse_json_bytes(br#"[{"id":1}"#, 10).is_err());
+        assert!(parse_json_bytes(b"not json", 10).is_err());
+    }
+
+    #[test]
+    fn json_import_keeps_arbitrary_precision_numbers() {
+        let parsed = parse_json_bytes(br#"[{"big":123456789012345678901234567890}]"#, 10).unwrap();
+        assert_eq!(parsed.rows[0][0].to_string(), "123456789012345678901234567890");
     }
 
     #[test]

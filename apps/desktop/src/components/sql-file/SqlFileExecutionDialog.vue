@@ -21,7 +21,7 @@ import { supportsTransaction } from "@/lib/database/databaseFeatureSupport";
 import { formatError, isManualTransactionSessionExpired } from "@/lib/backend/errorUtils";
 import { fetchSqlFileTargetOptions } from "@/composables/useDatabaseOptions";
 import { requiresSqlFileTargetDatabaseSelection, supportsConnectionLevelDatabaseBootstrap } from "@/lib/connection/connectionLevelDatabaseBootstrap";
-import { beginManualTransaction, commitManualTransaction, rollbackManualTransaction, cancelSqlFileExecution, executeSqlFiles, inspectSqlFileTables, listenSqlFileProgress, previewSqlFile, type SqlFilePreview, type SqlFileProgress, type SqlFileStatus, type SqlFileTable } from "@/lib/backend/api";
+import { beginManualTransaction, commitManualTransaction, rollbackManualTransaction, cancelSqlFileExecution, executeSqlFiles, inspectSqlFileTables, listenSqlFileProgress, pickExternalFiles, previewSqlFile, type SqlFilePreview, type SqlFileProgress, type SqlFileStatus, type SqlFileTable } from "@/lib/backend/api";
 import { buildDisplayFileNames, tooltipText as computeTooltipText } from "./sqlFilePreviewLabel";
 import { parseSqlFilePathInput } from "./sqlFilePathInput";
 import SqlFileProgressIndicator from "./SqlFileProgressIndicator.vue";
@@ -508,12 +508,9 @@ async function selectFile() {
   }
   selectingFile.value = true;
   try {
-    const { open } = await import("@tauri-apps/plugin-dialog");
-    const selected = await open({
-      multiple: true,
-      filters: [{ name: "SQL package", extensions: ["sql", "gz", "zip"] }],
-    });
-    const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
+    // Backend picker: the chosen files are granted to preview/execute; a
+    // path typed into the input instead asks for consent in a native prompt.
+    const paths = await pickExternalFiles({ multiple: true, filterName: "SQL package", extensions: ["sql", "gz", "zip"] });
     if (paths.length > 0) {
       await loadPreviews(paths);
     }

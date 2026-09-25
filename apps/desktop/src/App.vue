@@ -2423,13 +2423,10 @@ async function openSqlFile() {
   let openedSqlPath: string | undefined;
   try {
     if (isTauriRuntime()) {
-      const { open } = await import("@tauri-apps/plugin-dialog");
-      const path = await open({
-        filters: [{ name: "SQL", extensions: ["sql"] }],
-        multiple: false,
-      });
+      // Backend picker: the chosen file is granted to the external SQL commands.
+      const [path] = await api.pickExternalFiles({ filterName: "SQL", extensions: ["sql"] });
       if (path) {
-        const sqlPath = path as string;
+        const sqlPath = path;
         openedSqlPath = sqlPath;
         const snapshot = await api.readExternalSqlFileSnapshot(sqlPath, externalSqlEditorMaxBytes(settingsStore.editorSettings.externalSqlEditorMaxMb));
         queryStore.updateSql(tab.id, snapshot.content);
@@ -2613,10 +2610,20 @@ async function openPendingConnectionLinks() {
   }
 }
 
+/** Native confirmation (awaited) for deep-link initiated actions. */
+async function confirmDeepLinkAction(message: string, title: string): Promise<boolean> {
+  if (!isTauriRuntime()) return window.confirm(message);
+  const { ask } = await import("@tauri-apps/plugin-dialog");
+  return ask(message, { title, kind: "warning" });
+}
+
 async function openAiConfigDeepLink(url: string) {
   try {
     const draft = parseAiConfigDeepLink(url);
     if (!draft) return;
+    // Deep links can be triggered by any web page; show the endpoint that
+    // would receive prompts and the API key before prefilling anything.
+    if (!(await confirmDeepLinkAction(t("ai.deepLinkConfirm", { name: draft.name, endpoint: draft.endpoint }), t("ai.deepLinkConfirmTitle")))) return;
     settingsAiConfigDraft.value = draft;
     settingsAiConfigRequestId.value += 1;
     openSettings("ai");

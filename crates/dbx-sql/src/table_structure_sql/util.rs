@@ -117,8 +117,65 @@ fn is_oracle_reserved_identifier(name: &str) -> bool {
         || ORACLE_RESERVED_WORDS_MISSING_FROM_SQLPARSER.iter().any(|keyword| keyword.eq_ignore_ascii_case(name))
 }
 
-pub(super) fn quote_string(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
+/// Dialects whose ordinary `'...'` literals treat a backslash as an escape character.
+pub(super) fn uses_backslash_string_escapes(dialect: StructureDialect) -> bool {
+    matches!(
+        dialect,
+        StructureDialect::Mysql
+            | StructureDialect::Doris
+            | StructureDialect::GaussdbM
+            | StructureDialect::ClickHouse
+            | StructureDialect::ManticoreSearch
+    )
+}
+
+/// Quote a string literal (comment, default, ...) for `dialect`.
+///
+/// MySQL-family dialects and ClickHouse double backslashes as well as quotes so a value such as
+/// `x\'; DROP TABLE t; -- ` cannot escape the closing delimiter, with or without MySQL's
+/// `NO_BACKSLASH_ESCAPES`. Manticore's SphinxQL lexer has no `''` escape, so it uses `\'`.
+pub(super) fn quote_string(dialect: StructureDialect, value: &str) -> String {
+    match dialect {
+        StructureDialect::ManticoreSearch => format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'")),
+        dialect if uses_backslash_string_escapes(dialect) => {
+            crate::value_literals::quote_backslash_escaped_string_literal(value)
+        }
+        _ => format!("'{}'", value.replace('\'', "''")),
+    }
+}
+
+/// Whether `value` is one complete `'...'` literal when backslashes are escape characters.
+fn is_backslash_escaped_sql_string_literal(value: &str) -> bool {
+    let trimmed = value.trim();
+    let Some(inner) = trimmed.strip_prefix('\'').and_then(|value| value.strip_suffix('\'')) else {
+        return false;
+    };
+    let mut chars = inner.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                if chars.next().is_none() {
+                    return false;
+                }
+            }
+            '\'' => {
+                if chars.next() != Some('\'') {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+/// Whether a user-supplied default is already a single string literal that can be emitted
+/// verbatim. For backslash-escaping dialects the literal must be a single token both with and
+/// without backslash escapes (MySQL `NO_BACKSLASH_ESCAPES`), otherwise a crafted value such as
+/// `'\''; DROP TABLE t; -- '` would close early under one of the two interpretations.
+fn is_verbatim_string_literal(dialect: StructureDialect, value: &str) -> bool {
+    is_sql_string_literal(value)
+        && (!uses_backslash_string_escapes(dialect) || is_backslash_escaped_sql_string_literal(value))
 }
 
 fn is_sql_string_literal(value: &str) -> bool {
@@ -375,7 +432,7 @@ pub(super) fn format_default_for_sql(dialect: StructureDialect, data_type: &str,
         if is_temporal_expression(default_value) {
             return mysql_temporal_default_with_column_precision(dialect, data_type, default_value);
         }
-        return quote_string(default_value);
+        return quote_string(dialect, default_value);
     }
     if is_string_type_for_default(dialect, base_type) {
         if dialect == StructureDialect::SqlServer
@@ -387,18 +444,18 @@ pub(super) fn format_default_for_sql(dialect: StructureDialect, data_type: &str,
             if default_value.contains('(') || default_value.contains(')') {
                 return default_value.to_string();
             }
-            return format!("N{}", quote_string(default_value));
+            return format!("N{}", quote_string(dialect, default_value));
         }
         // Only skip quoting for function-call expressions like `gen_random_uuid()`.
         // Simple identifiers like `CURRENT_TIMESTAMP` are not valid defaults for string columns.
-        if is_sql_string_literal(default_value)
+        if is_verbatim_string_literal(dialect, default_value)
             || (dialect == StructureDialect::Postgres && postgres_string_default_literal(default_value).is_some())
             || default_value.contains('(')
             || default_value.contains(')')
         {
             return default_value.to_string();
         }
-        return quote_string(default_value);
+        return quote_string(dialect, default_value);
     }
     default_value.to_string()
 }
@@ -459,5 +516,41 @@ mod tests {
             "CONCAT(N'a', N'b')"
         );
         assert_eq!(format_default_for_sql(StructureDialect::SqlServer, "varchar(50)", "中文"), "'中文'");
+    }
+
+    #[test]
+    fn mysql_family_string_literals_escape_backslashes_and_quotes() {
+        let payload = "x\\'; DROP TABLE users; -- ";
+        for dialect in [StructureDialect::Mysql, StructureDialect::Doris, StructureDialect::GaussdbM] {
+            let quoted = quote_string(dialect, payload);
+            assert_eq!(quoted, "'x\\\\''; DROP TABLE users; -- '");
+            assert!(crate::value_literals::mysql_literal_is_single_token(&quoted, true));
+            assert!(crate::value_literals::mysql_literal_is_single_token(&quoted, false));
+        }
+        assert_eq!(quote_string(StructureDialect::ClickHouse, "a\\b'c"), "'a\\\\b''c'");
+        assert_eq!(quote_string(StructureDialect::ManticoreSearch, "a\\b'c"), "'a\\\\b\\'c'");
+        assert_eq!(quote_string(StructureDialect::Postgres, "a\\b'c"), "'a\\b''c'");
+        assert_eq!(quote_string(StructureDialect::Oracle, "a\\b'c"), "'a\\b''c'");
+    }
+
+    #[test]
+    fn mysql_string_defaults_reject_backslash_breakout_literals() {
+        // A plain value is quoted with the injection-safe form.
+        assert_eq!(
+            format_default_for_sql(StructureDialect::Mysql, "varchar(20)", "x\\'; DROP TABLE t; -- "),
+            "'x\\\\''; DROP TABLE t; -- '"
+        );
+        // An already-quoted literal that is only a single token without backslash escapes is not
+        // emitted verbatim; it is re-quoted as a value instead.
+        let crafted = "'\\''; DROP TABLE t; -- '";
+        let formatted = format_default_for_sql(StructureDialect::Mysql, "varchar(20)", crafted);
+        assert_ne!(formatted, crafted);
+        assert!(crate::value_literals::mysql_literal_is_single_token(&formatted, true));
+        assert!(crate::value_literals::mysql_literal_is_single_token(&formatted, false));
+        // Unambiguous literals still pass through unchanged.
+        assert_eq!(format_default_for_sql(StructureDialect::Mysql, "varchar(20)", "'it''s'"), "'it''s'");
+        assert_eq!(format_default_for_sql(StructureDialect::Mysql, "varchar(20)", "'a\\nb'"), "'a\\nb'");
+        // Other dialects keep treating backslashes literally.
+        assert_eq!(format_default_for_sql(StructureDialect::Postgres, "text", "a\\b"), "'a\\b'");
     }
 }

@@ -655,14 +655,65 @@ export interface ResultCacheRuntimeConfig {
   fallbackEnabled: boolean;
 }
 
+/**
+ * Web mode defaults to the server-side runtime cache. The browser IndexedDB
+ * cache (unencrypted, up to 512 MB, kept for 30 days) would leave query results
+ * behind on shared browsers, so it is only used when a deployment opts in with
+ * `VITE_DBX_RESULT_CACHE_BACKEND=indexed-db`.
+ */
 export function resultCacheRuntimeConfig(tauriRuntime = isTauriRuntime(), environment = import.meta.env): ResultCacheRuntimeConfig {
   const configured = environment.VITE_DBX_RESULT_CACHE_BACKEND;
-  const primary = tauriRuntime || configured === "http" || configured === "runtime" ? "runtime" : "indexed-db";
+  const primary = !tauriRuntime && (configured === "indexed-db" || configured === "indexeddb") ? "indexed-db" : "runtime";
   return { primary, fallbackEnabled: environment.VITE_DBX_RESULT_CACHE_FALLBACK !== "false" };
 }
 
 export function resultCacheBackendOrder(tauriRuntime = isTauriRuntime(), config = resultCacheRuntimeConfig(tauriRuntime)): ResultCacheBackendName[] {
-  return config.primary === "runtime" ? ["runtime", "indexed-db"] : ["indexed-db", "runtime"];
+  if (config.primary === "indexed-db") return ["indexed-db", "runtime"];
+  // Desktop keeps the legacy IndexedDB store as a read/write fallback; the
+  // browser build never falls back to persisting results locally.
+  return tauriRuntime ? ["runtime", "indexed-db"] : ["runtime"];
+}
+
+let legacyBrowserCachePurge: Promise<void> | undefined;
+
+/** Drops a browser result cache left behind by builds that defaulted to IndexedDB. */
+function purgeLegacyBrowserResultCacheOnce(order: ResultCacheBackendName[]) {
+  if (isTauriRuntime() || order.includes("indexed-db") || legacyBrowserCachePurge) return;
+  legacyBrowserCachePurge = clearPersistedResultCache();
+}
+
+/**
+ * Deletes every result snapshot persisted in this browser (IndexedDB). Call on
+ * logout or when the session is found to be unauthenticated so query results
+ * do not outlive the session on a shared machine.
+ */
+export async function clearPersistedResultCache(): Promise<void> {
+  const idb = indexedDb();
+  const pending = dbPromise;
+  dbPromise = undefined;
+  if (pending) {
+    try {
+      (await pending)?.close();
+    } catch {
+      // The connection failed to open; nothing to close.
+    }
+  }
+  if (!idb) return;
+  await new Promise<void>((resolve) => {
+    try {
+      const request = idb.deleteDatabase(DB_NAME);
+      request.onsuccess = () => resolve();
+      request.onerror = () => {
+        console.warn("[DBX][tab-result-cache:clear:error]", request.error);
+        resolve();
+      };
+      // Another tab still holds the database open; deletion completes once it closes.
+      request.onblocked = () => resolve();
+    } catch (error) {
+      console.warn("[DBX][tab-result-cache:clear:error]", error);
+      resolve();
+    }
+  });
 }
 
 function availableResultCacheBackends(includeLegacyFallback = true): ResultCacheBackend[] {
@@ -672,6 +723,7 @@ function availableResultCacheBackends(includeLegacyFallback = true): ResultCache
   };
   const config = resultCacheRuntimeConfig();
   const order = resultCacheBackendOrder(isTauriRuntime(), config);
+  purgeLegacyBrowserResultCacheOnce(order);
   const selected = includeLegacyFallback || config.fallbackEnabled ? order : order.slice(0, 1);
   return selected.map((name) => byName[name]).filter((backend) => backend.available());
 }

@@ -41,6 +41,7 @@ import type { InstalledPlugin, PluginInstallResult, PluginRepository, PluginRepo
 import { useI18n } from "vue-i18n";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStorage";
 import { translateBackendError } from "@/i18n/backend-errors";
+import { allowUnsignedPluginsThisSession, clearLegacyUnsignedPluginOptIn } from "@/lib/plugins/pluginUnsignedSession";
 
 const props = defineProps<{
   focusTarget?: PluginCenterFocus | null;
@@ -66,7 +67,6 @@ const GithubIcon = defineComponent({
   },
 });
 
-const PLUGIN_ALLOW_UNSIGNED_STORAGE_KEY = "dbx-plugin-allow-unsigned";
 const MARKETPLACE_VIEW_MODE_STORAGE_KEY = "dbx-plugin-marketplace-view-mode";
 
 type TauriFileDropPayload = { type: "enter"; paths: string[]; position: { x: number; y: number } } | { type: "over"; position: { x: number; y: number } } | { type: "drop"; paths: string[]; position: { x: number; y: number } } | { type: "leave" };
@@ -94,15 +94,9 @@ const error = ref("");
 const selectedPluginId = ref("");
 const selectedContributionId = ref("");
 const selectedConnectionId = ref("");
-const allowUnsigned = ref(
-  ((): boolean => {
-    try {
-      return localStorage.getItem(PLUGIN_ALLOW_UNSIGNED_STORAGE_KEY) === "1";
-    } catch {
-      return false;
-    }
-  })(),
-);
+// Session-only: kept in memory and reset on restart, never persisted.
+const allowUnsigned = allowUnsignedPluginsThisSession;
+clearLegacyUnsignedPluginOptIn();
 const trustedKeyId = ref("");
 const trustedPublicKey = ref("");
 const repositoryId = ref("");
@@ -868,6 +862,25 @@ watch(
   },
   { deep: true },
 );
+/**
+ * Deep links can be fired by any web page, so the install needs an explicit,
+ * awaited confirmation that shows the package source. `window.confirm` is not
+ * reliable in the desktop webview (it may be unimplemented or return a
+ * Promise, which is always truthy), so desktop uses the native dialog.
+ */
+async function confirmDeepLinkInstall(url: string): Promise<boolean> {
+  let host = url;
+  try {
+    host = new URL(url).host;
+  } catch {
+    // parsePluginInstallDeepLink already validated the URL; keep the raw text.
+  }
+  const message = `${t("pluginPlatform.deepLinkInstallConfirm", { url })}\n\n${host}\n${url}${allowUnsigned.value ? `\n\n${t("pluginPlatform.allowUnsignedSessionWarning")}` : ""}`;
+  if (!isTauriRuntime()) return window.confirm(message);
+  const { ask } = await import("@tauri-apps/plugin-dialog");
+  return ask(message, { title: "DBX", kind: "warning" });
+}
+
 let lastHandledInstallRequestId = 0;
 watch(
   () => props.installUrlRequest,
@@ -877,19 +890,12 @@ watch(
     if (!request || request.id <= lastHandledInstallRequestId) return;
     lastHandledInstallRequestId = request.id;
     installUrl.value = request.url;
-    if (window.confirm(t("pluginPlatform.deepLinkInstallConfirm", { url: request.url }))) {
+    if (await confirmDeepLinkInstall(request.url)) {
       await installPluginFromUrl();
     }
   },
   { immediate: true },
 );
-watch(allowUnsigned, (value) => {
-  try {
-    localStorage.setItem(PLUGIN_ALLOW_UNSIGNED_STORAGE_KEY, value ? "1" : "0");
-  } catch {
-    // storage unavailable (private mode); the flag stays session-only
-  }
-});
 onMounted(() => {
   void refresh();
   window.addEventListener(COMPONENT_PLUGINS_UPDATED_EVENT, handleComponentPluginsUpdated);
@@ -1462,6 +1468,10 @@ onBeforeUnmount(() => {
                   <div class="mt-1 text-[11px] leading-5 text-muted-foreground">{{ t("pluginPlatform.allowUnsignedDevelopmentPackageDescription") }}</div>
                 </div>
                 <Switch id="allow-unsigned-plugin-package" v-model="allowUnsigned" size="sm" class="mt-0.5 shrink-0" />
+              </div>
+              <div v-if="allowUnsigned" data-allow-unsigned-warning class="flex gap-2.5 rounded-lg border border-destructive/40 bg-destructive/5 p-3 text-destructive">
+                <CircleAlert class="mt-0.5 size-4 shrink-0" />
+                <div class="text-xs leading-5">{{ t("pluginPlatform.allowUnsignedSessionWarning") }}</div>
               </div>
 
               <template v-if="showCustomRepositoryTrustSettings">

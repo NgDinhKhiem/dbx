@@ -29,8 +29,9 @@ fn ident(value: &str) -> Result<String, String> {
     }
     Ok(format!("`{}`", value.replace('`', "``")))
 }
+/// Injection-safe with and without `NO_BACKSLASH_ESCAPES`: `\\` plus `''`, never `\'`.
 fn literal(value: &str) -> String {
-    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+    crate::value_literals::quote_backslash_escaped_string_literal(value)
 }
 fn unit(value: &str) -> Result<&'static str, String> {
     match value.trim().to_ascii_uppercase().as_str() {
@@ -117,7 +118,14 @@ mod tests {
     }
     #[test]
     fn builds_every_event_with_escaped_values() {
-        assert_eq!(create_event_sql(&definition()).unwrap(), "CREATE EVENT `daily``sync` ON SCHEDULE EVERY 1 DAY STARTS '2026-01-01 00:00:00' ON COMPLETION PRESERVE DISABLE COMMENT 'owner\\'s job' DO CALL `refresh`();");
+        assert_eq!(create_event_sql(&definition()).unwrap(), "CREATE EVENT `daily``sync` ON SCHEDULE EVERY 1 DAY STARTS '2026-01-01 00:00:00' ON COMPLETION PRESERVE DISABLE COMMENT 'owner''s job' DO CALL `refresh`();");
+    }
+    #[test]
+    fn event_comment_cannot_break_out_of_its_literal() {
+        let mut def = definition();
+        def.comment = Some("x\\'; DROP TABLE users; -- ".into());
+        let sql = create_event_sql(&def).unwrap();
+        assert!(sql.contains(" COMMENT 'x\\\\''; DROP TABLE users; -- ' DO "), "{sql}");
     }
     #[test]
     fn validates_schedule_and_body() {

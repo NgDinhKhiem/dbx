@@ -51,14 +51,6 @@ const plugin: InstalledPlugin = {
 };
 const contribution: PluginWorkbenchContribution = { type: "workbench", id: "sample.main", label: "Sample" };
 
-function deferred() {
-  let resolve!: () => void;
-  const promise = new Promise<void>((resolvePromise) => {
-    resolve = resolvePromise;
-  });
-  return { promise, resolve };
-}
-
 async function flushWorkbenchLoad() {
   await nextTick();
   await new Promise((resolve) => setTimeout(resolve, 0));
@@ -87,61 +79,89 @@ describe("PluginWorkbenchHost initialization", () => {
     vi.unstubAllGlobals();
   });
 
+  const frameRevealed = () => root.querySelector(".pointer-events-none.opacity-0") !== null;
+
+  function frameNonce(frame: HTMLIFrameElement): string {
+    const nonce = /const channelNonce = "([0-9a-f]+)";/.exec(frame.getAttribute("srcdoc") ?? "")?.[1];
+    expect(nonce).toBeTruthy();
+    return nonce!;
+  }
+
+  async function currentFrame(previous?: HTMLIFrameElement): Promise<HTMLIFrameElement> {
+    await vi.waitFor(() => {
+      const frame = root.querySelector("iframe");
+      expect(frame).toBeInstanceOf(HTMLIFrameElement);
+      expect(frame).not.toBe(previous);
+    });
+    return root.querySelector("iframe")!;
+  }
+
+  /** happy-dom fires the srcdoc load on its own; synthesize it only when it did not. */
+  async function ensureFirstLoad(frame: HTMLIFrameElement) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    if (!frameRevealed()) frame.dispatchEvent(new Event("load"));
+    await vi.waitFor(() => expect(frameRevealed()).toBe(true));
+  }
+
   async function mountHost() {
     app = createApp(PluginWorkbenchHost, { plugin, contribution, context: { connectionId: "connection" } });
     app.mount(root);
     await flushWorkbenchLoad();
-    const frame = root.querySelector("iframe");
-    expect(frame).toBeInstanceOf(HTMLIFrameElement);
-    const target = frame!.contentWindow!;
+    const frame = await currentFrame();
+    await ensureFirstLoad(frame);
+    const target = frame.contentWindow!;
+    const nonce = frameNonce(frame);
     const postMessage = vi.spyOn(target, "postMessage").mockImplementation(() => {});
-    const ready = () => window.dispatchEvent(new MessageEvent("message", { source: target, data: { source: "dbx-plugin", version: 1, type: "ready" } }));
+    const ready = () => window.dispatchEvent(new MessageEvent("message", { source: target, data: { source: "dbx-plugin", version: 1, type: "ready", nonce } }));
     ready();
     await vi.waitFor(() => expect(mocks.repushPluginConnection).toHaveBeenCalled());
     await new Promise((resolve) => setTimeout(resolve, 0));
     mocks.repushPluginConnection.mockClear();
     postMessage.mockClear();
-    return { frame: frame!, postMessage, ready };
+    return { frame, postMessage, ready, target, nonce };
   }
 
-  it("runs reinit before one init when load precedes ready", async () => {
-    const firstReinit = deferred();
-    const { frame, postMessage, ready } = await mountHost();
-    mocks.repushPluginConnection.mockReturnValue(firstReinit.promise);
+  it("ignores plugin messages without the per-document channel nonce", async () => {
+    const { target, postMessage } = await mountHost();
 
-    frame.dispatchEvent(new Event("load"));
-    ready();
+    window.dispatchEvent(new MessageEvent("message", { source: target, data: { source: "dbx-plugin", version: 1, type: "request", id: "1", method: "host.getContext", params: {} } }));
+    window.dispatchEvent(new MessageEvent("message", { source: target, data: { source: "dbx-plugin", version: 1, type: "request", id: "2", method: "host.getContext", params: {}, nonce: "forged" } }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
-    expect(mocks.repushPluginConnection).toHaveBeenCalledTimes(1);
     expect(postMessage).not.toHaveBeenCalled();
-    firstReinit.resolve();
-    await vi.waitFor(() => expect(postMessage).toHaveBeenCalledTimes(1));
-    expect(postMessage.mock.calls[0]?.[0]).toMatchObject({ type: "init" });
-
-    const secondReinit = deferred();
-    mocks.repushPluginConnection.mockReturnValue(secondReinit.promise);
-    frame.dispatchEvent(new Event("load"));
-    ready();
-
-    expect(mocks.repushPluginConnection).toHaveBeenCalledTimes(2);
-    expect(postMessage).toHaveBeenCalledTimes(1);
-    secondReinit.resolve();
-    await vi.waitFor(() => expect(postMessage).toHaveBeenCalledTimes(2));
   });
 
-  it("runs reinit before one init when ready precedes load", async () => {
-    const reinit = deferred();
-    const { frame, postMessage, ready } = await mountHost();
-    mocks.repushPluginConnection.mockReturnValue(reinit.promise);
+  it("never re-initializes a frame that loads a second time and rebuilds a fresh document instead", async () => {
+    const { frame, postMessage, target, nonce } = await mountHost();
 
-    ready();
+    // A second load on the same element: the frame navigated away from its srcdoc.
     frame.dispatchEvent(new Event("load"));
+    window.dispatchEvent(new MessageEvent("message", { source: target, data: { source: "dbx-plugin", version: 1, type: "ready", nonce } }));
+    await flushWorkbenchLoad();
 
-    expect(mocks.repushPluginConnection).toHaveBeenCalledTimes(1);
+    // Nothing (init included) reaches whatever the old frame navigated to.
     expect(postMessage).not.toHaveBeenCalled();
-    reinit.resolve();
-    await vi.waitFor(() => expect(postMessage).toHaveBeenCalledTimes(1));
-    expect(postMessage.mock.calls[0]?.[0]).toMatchObject({ type: "init" });
+    const next = await currentFrame(frame);
+    expect(frameNonce(next)).not.toBe(nonce);
+  });
+
+  it("ends in an explicit reload state when the frame keeps navigating", async () => {
+    let { frame } = await mountHost();
+    for (let recovery = 0; recovery < 2; recovery += 1) {
+      frame.dispatchEvent(new Event("load"));
+      frame = await currentFrame(frame);
+      await ensureFirstLoad(frame);
+    }
+
+    frame.dispatchEvent(new Event("load"));
+    await flushWorkbenchLoad();
+
+    expect(root.querySelector("iframe")).toBeNull();
+    expect(root.querySelector("[data-plugin-navigation-blocked]")?.textContent).toContain("pluginPlatform.workbenchNavigationBlocked");
+
+    (root.querySelector("[data-plugin-reload]") as HTMLElement).click();
+    const reloaded = await currentFrame();
+    expect(reloaded).not.toBe(frame);
   });
 
   it("claims OS drops over its iframe and forwards opened handles to the plugin", async () => {

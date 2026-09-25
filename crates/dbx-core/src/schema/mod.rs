@@ -8609,6 +8609,28 @@ async fn pg_ddl_for_options(
     }
 }
 
+/// ClickHouse reads backquoted identifiers with backslash escapes, so both the backslash and the
+/// backtick are escaped; otherwise a table named ``x` FORMAT ...`` could end the identifier.
+fn clickhouse_show_create_table_sql(table: &str) -> String {
+    format!("SHOW CREATE TABLE `{}`", table.replace('\\', "\\\\").replace('`', "``"))
+}
+
+#[cfg(test)]
+mod clickhouse_show_create_table_tests {
+    use super::clickhouse_show_create_table_sql;
+
+    #[test]
+    fn escapes_backticks_and_backslashes() {
+        assert_eq!(clickhouse_show_create_table_sql("events"), "SHOW CREATE TABLE `events`");
+        assert_eq!(clickhouse_show_create_table_sql("a`b"), "SHOW CREATE TABLE `a``b`");
+        assert_eq!(
+            clickhouse_show_create_table_sql("x` UNION ALL SELECT 1 --"),
+            "SHOW CREATE TABLE `x`` UNION ALL SELECT 1 --`"
+        );
+        assert_eq!(clickhouse_show_create_table_sql("x\\`"), "SHOW CREATE TABLE `x\\\\```");
+    }
+}
+
 async fn get_table_ddl_once(
     state: &AppState,
     connection_id: &str,
@@ -8657,7 +8679,7 @@ async fn get_table_ddl_once(
             let result = db::clickhouse_driver::execute_query(
                 &client,
                 clickhouse_database,
-                &format!("SHOW CREATE TABLE `{table}`"),
+                &clickhouse_show_create_table_sql(table),
             )
             .await?;
             return result
@@ -9880,7 +9902,8 @@ pub async fn get_event_info_core(
     match pool {
         PoolKind::Mysql(pool, _) => db::mysql::get_event_info(&pool, database, name).await,
         PoolKind::ExternalDriver { config, session, .. } => {
-            let quote = |value: &str| format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"));
+            // `\\` plus `''` stays one literal with and without NO_BACKSLASH_ESCAPES.
+            let quote = dbx_sql::value_literals::quote_backslash_escaped_string_literal;
             let sql = format!("SELECT EVENT_SCHEMA, EVENT_NAME, DEFINER, TIME_ZONE, EVENT_TYPE, EXECUTE_AT, INTERVAL_VALUE, INTERVAL_FIELD, STARTS, ENDS, STATUS, ON_COMPLETION, EVENT_COMMENT, EVENT_DEFINITION, CREATED, LAST_ALTERED, LAST_EXECUTED FROM information_schema.EVENTS WHERE EVENT_SCHEMA = {} AND EVENT_NAME = {} LIMIT 1", quote(database), quote(name));
             let result: db::QueryResult = session.invoke_with_timeout("executeQuery", serde_json::json!({ "connection": config.as_ref(), "database": database, "schema": _schema, "sql": sql, "maxRows": 1 }), agent_metadata_timeout(Some(&config))).await?;
             let row = result.rows.first().ok_or_else(|| format!("MySQL event not found: {database}.{name}"))?;

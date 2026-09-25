@@ -4,7 +4,7 @@
 //! 编辑器 SQL、AI 工具、元数据请求以及池重建都能复用首次输入的密码，
 //! 无需反复弹窗。
 //!
-//! 与持久化 secret store（[`crate::connection_secrets::FileSecretStore`]）职责分离：
+//! 与持久化 secret store（SQLite `connection_secrets`，见 [`crate::storage::Storage`]）职责分离：
 //! 持久层保存"已保存密码"（save_password=true）；本仓库只保存"本次运行期临时密码"
 //! （save_password=false，进程退出即丢，绝不落盘）。
 //!

@@ -1,9 +1,13 @@
 import { readFileSync } from "node:fs";
 import ts from "typescript";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, afterEach, describe, expect, it, vi } from "vitest";
 import { acceptSelectedCompletionWithRetry, acceptSelectedOrFirstCompletion } from "@/lib/editor/queryEditorCompletionAcceptance";
 import { createQueryEditorEscapeHandler } from "@/lib/editor/queryEditorEscape";
 import { DEFAULT_SHORTCUT_SETTINGS, normalizeShortcutSettings, shortcutToCodeMirrorKey } from "@/lib/editor/shortcutRegistry";
+import { loadPinyin } from "@/lib/common/pinyin";
+
+// pinyin-pro is lazy-loaded in the app; load it up front so Han initials resolve synchronously.
+beforeAll(() => loadPinyin());
 
 const queryEditorSource = readFileSync(new URL("../../../components/editor/QueryEditor.vue", import.meta.url), "utf8");
 

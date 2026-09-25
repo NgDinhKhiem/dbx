@@ -2,10 +2,13 @@ services:
   dbx:
     image: t8y2/dbx
     ports:
-      - "4224:4224"
+      # Loopback only by default; set DBX_BIND=0.0.0.0 to listen on all
+      # interfaces (put a TLS reverse proxy in front when you do).
+      - "${DBX_BIND:-127.0.0.1}:4224:4224"
     environment:
-      # Change this before exposing DBX to a network.
-      - DBX_PASSWORD=changeme
+      # Required. Example: DBX_PASSWORD="$(openssl rand -base64 24)" docker compose up -d
+      # or put DBX_PASSWORD=<long random value> in a .env file next to this file.
+      - DBX_PASSWORD=${DBX_PASSWORD:?Set DBX_PASSWORD}
       # Uncomment when serving DBX behind a reverse-proxy subpath.
       # - DBX_PUBLIC_BASE_PATH=/dbx
     volumes:

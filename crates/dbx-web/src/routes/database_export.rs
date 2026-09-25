@@ -3,7 +3,6 @@ use std::sync::{
     Arc,
 };
 
-use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::sse::{Event, Sse};
@@ -16,7 +15,7 @@ use futures::stream::Stream;
 use serde::Deserialize;
 
 use crate::error::AppError;
-use crate::routes::export_download::attachment_content_disposition;
+use crate::routes::export_download::{attachment_content_disposition, TempFileStream};
 use crate::state::{WebExportFile, WebState};
 
 #[derive(Deserialize)]
@@ -172,9 +171,9 @@ pub async fn database_export_download(
         .remove(&export_id)
         .ok_or_else(|| AppError::from("Export file not found".to_string()))?;
 
-    let data = tokio::fs::read(&export_file.file_path).await.map_err(|e| AppError::from(e.to_string()))?;
-    // Clean up temp file
-    let _ = tokio::fs::remove_file(&export_file.file_path).await;
+    // Streamed from disk; the temp file is deleted when the body is dropped.
+    let (stream, length) =
+        TempFileStream::open(&export_file.file_path).await.map_err(|e| AppError::from(e.to_string()))?;
 
     let content_type = if export_file.format == "zip" {
         "application/zip"
@@ -186,7 +185,8 @@ pub async fn database_export_download(
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_LENGTH, length)
         .header(header::CONTENT_DISPOSITION, attachment_content_disposition(&export_file.download_filename))
-        .body(Body::from(data))
+        .body(stream.into_body())
         .map_err(|e| AppError::from(e.to_string()))
 }

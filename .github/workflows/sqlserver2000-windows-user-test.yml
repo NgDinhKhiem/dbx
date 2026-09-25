@@ -14,45 +14,46 @@ jobs:
       CARGO_INCREMENTAL: "0"
       RUSTFLAGS: -C debuginfo=line-tables-only -C target-feature=+crt-static
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22.13.0
           cache: pnpm
 
       - name: Setup Java
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
         with:
           distribution: temurin
           java-version: "21"
 
       - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
       - name: Setup Rust for standard Windows
-        uses: dtolnay/rust-toolchain@1.97.1
+        uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
         with:
+          toolchain: 1.97.1
           targets: x86_64-pc-windows-msvc
 
       - name: Check standard Windows dependency path
         run: cargo check --locked --package dbx --no-default-features --target x86_64-pc-windows-msvc
 
       - name: Setup Rust for Windows 7
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly
         with:
           toolchain: nightly-2026-07-22
           components: rust-src
 
       - name: Rust cache
-        uses: swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: "./ -> target"
           shared-key: sqlserver2000-windows-7-x64
@@ -124,7 +125,7 @@ jobs:
           ./.github/scripts/assert-win7-installer-content.ps1 -InstallerPath $installer.FullName
 
       - name: Upload installer
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: DBX-SQLServer2000-Windows-7-x64
           path: |

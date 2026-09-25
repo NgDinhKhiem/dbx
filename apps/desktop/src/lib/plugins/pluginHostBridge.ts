@@ -163,6 +163,15 @@ export class PluginHostBridge {
   /** Invoked once before each iframe load generation sends its init message. */
   onReinit?: () => Promise<void> | void;
 
+  /**
+   * Per-document channel nonce baked into the sandbox SDK (see
+   * `pluginSandboxDocument`). When set, only messages echoing it are accepted,
+   * so a page the iframe navigated to (which never saw the srcdoc) cannot drive
+   * the bridge even though it shares the iframe's WindowProxy. The nonce is
+   * never sent back to the frame.
+   */
+  channelNonce?: string;
+
   constructor(
     private readonly plugin: InstalledPlugin,
     private readonly contribution: PluginUiContribution,
@@ -178,9 +187,11 @@ export class PluginHostBridge {
   }
 
   handleWindowMessage(event: MessageEvent): boolean {
+    if (this.disposed) return false;
     const target = this.targetWindow();
     if (!target || event.source !== target || !isRecord(event.data)) return false;
     if (event.data.source !== PLUGIN_MESSAGE_SOURCE || event.data.version !== BRIDGE_VERSION) return false;
+    if (this.channelNonce !== undefined && event.data.nonce !== this.channelNonce) return false;
     if (event.data.type === "ready") {
       // Feature flags the SDK advertises at boot; unknown flags are ignored so
       // host/plugin can evolve independently.
@@ -603,6 +614,11 @@ export interface PluginSandboxOptions {
    * hosts without the plugin asset protocol (the web host).
    */
   baseUrl?: string;
+  /**
+   * Opaque per-document nonce embedded in the SDK and attached to every
+   * plugin-to-host message. Pair it with `PluginHostBridge.channelNonce`.
+   */
+  channelNonce?: string;
 }
 
 export function pluginSandboxDocument(html: string, permissions?: readonly string[], theme?: PluginBridgeTheme, options?: PluginSandboxOptions): string {
@@ -613,7 +629,7 @@ export function pluginSandboxDocument(html: string, permissions?: readonly strin
   // <base> must precede every relative URL the document resolves (inlined CSS
   // url(), dynamic import specifiers), so it leads the injection.
   const base = options?.baseUrl && assetSource ? `<base href="${escapeHtmlAttribute(options.baseUrl)}">` : "";
-  const sdk = `<script>${pluginSdkSource(theme)}</script>`;
+  const sdk = `<script>${pluginSdkSource(theme, options?.channelNonce)}</script>`;
   const uiKit = `<style>${pluginUiKitCss()}</style>`;
   // Placed after the uiKit so the boot `color-scheme` wins the cascade: the
   // bridge init message (and the SDK's applyTheme) only runs once the iframe
@@ -738,7 +754,7 @@ body {
 `.trim();
 }
 
-export function pluginSdkSource(initialTheme?: PluginBridgeTheme): string {
+export function pluginSdkSource(initialTheme?: PluginBridgeTheme, channelNonce?: string): string {
   const safeTokens = Object.fromEntries(Object.entries(initialTheme?.tokens || {}).filter(([name, value]) => /^--[a-z0-9-]+$/i.test(name) && typeof value === "string" && !!value.trim() && /^[^"{}<>;]*$/.test(value)));
   const safeInitialTheme = initialTheme && (initialTheme.appearance === "dark" || initialTheme.appearance === "light") ? { appearance: initialTheme.appearance, tokens: safeTokens } : null;
   const serializedInitialTheme = JSON.stringify(safeInitialTheme)
@@ -746,7 +762,13 @@ export function pluginSdkSource(initialTheme?: PluginBridgeTheme): string {
     .replace(/>/g, "\\u003e")
     .replace(/\u2028/g, "\\u2028")
     .replace(/\u2029/g, "\\u2029");
+  const serializedChannelNonce = JSON.stringify(typeof channelNonce === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(channelNonce) ? channelNonce : null);
   return `(() => {
+    const channelNonce = ${serializedChannelNonce};
+    const toHost = (message, transfer) => {
+      if (channelNonce) message.nonce = channelNonce;
+      if (transfer) parent.postMessage(message, '*', transfer); else parent.postMessage(message, '*');
+    };
     const pending = new Map();
     const listeners = { event: new Set(), binary: new Set(), init: new Set(), context: new Set(), filedrop: new Set(), dragstate: new Set(), close: new Set() };
     let sequence = 0;
@@ -787,9 +809,9 @@ export function pluginSdkSource(initialTheme?: PluginBridgeTheme): string {
       const message = { source: '${PLUGIN_MESSAGE_SOURCE}', version: ${BRIDGE_VERSION}, type: 'request', id, method, params: toPlain(params) };
       if (options.transfer) {
         message.data = options.transfer;
-        parent.postMessage(message, '*', [options.transfer]);
+        toHost(message, [options.transfer]);
       } else {
-        parent.postMessage(message, '*');
+        toHost(message);
       }
     });
     const decode = (value) => Uint8Array.from(atob(value), (character) => character.charCodeAt(0));
@@ -973,7 +995,7 @@ export function pluginSdkSource(initialTheme?: PluginBridgeTheme): string {
         const notifyClose = (listener) => Promise.resolve().then(listener).catch(() => undefined);
         Promise.allSettled([...listeners.close].map(notifyClose)).finally(() => {
           const workbenchId = context && typeof context.workbenchId === 'string' ? context.workbenchId : '';
-          parent.postMessage({ source: '${PLUGIN_MESSAGE_SOURCE}', version: ${BRIDGE_VERSION}, type: 'workbench/close-ack', workbenchId }, '*');
+          toHost({ source: '${PLUGIN_MESSAGE_SOURCE}', version: ${BRIDGE_VERSION}, type: 'workbench/close-ack', workbenchId });
         });
       }
     });
@@ -982,9 +1004,9 @@ export function pluginSdkSource(initialTheme?: PluginBridgeTheme): string {
       if (key !== 'w' || (!event.metaKey && !event.ctrlKey) || event.altKey || event.shiftKey || event.isComposing) return;
       event.preventDefault();
       event.stopPropagation();
-      parent.postMessage({ source: '${PLUGIN_MESSAGE_SOURCE}', version: ${BRIDGE_VERSION}, type: 'shortcut', shortcut: 'closeTab' }, '*');
+      toHost({ source: '${PLUGIN_MESSAGE_SOURCE}', version: ${BRIDGE_VERSION}, type: 'shortcut', shortcut: 'closeTab' });
     }, true);
-    parent.postMessage({ source: '${PLUGIN_MESSAGE_SOURCE}', version: ${BRIDGE_VERSION}, type: 'ready', features: ['workbench.close'] }, '*');
+    toHost({ source: '${PLUGIN_MESSAGE_SOURCE}', version: ${BRIDGE_VERSION}, type: 'ready', features: ['workbench.close'] });
   })();`;
 }
 

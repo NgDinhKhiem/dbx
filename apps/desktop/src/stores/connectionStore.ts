@@ -177,6 +177,7 @@ import { normalizeRedisKeyTemplates } from "@/lib/redis/redisKeyTemplates";
 import { appendAgentDriverUpdateHint, connectionUsesSsh, hasAgentDriverUpdate, hasInstalledAgentVersion, type AgentDriverInstallState } from "@/lib/connection/agentDriverInstallHint";
 import { appendConnectionErrorHints, isMysqlMissingPasswordFailure, isSqliteMissingEncryptionPasswordFailure } from "@/lib/connection/connectionErrorHints";
 import { connectionNeedsPasswordPrompt, pluginConnectionNeedsPasswordPrompt } from "@/lib/connection/connectionPassword";
+import { presentSecretPaths, redactSavedConnection } from "@/lib/connection/savedSecrets";
 import { createFrontendPluginRegistry } from "@/lib/plugins/frontendPlugin";
 import { appendVisibleDatabaseSelection } from "@/lib/connection/connectionVisibleDatabases";
 import { buildXuguTypeMemberNodes, isXuguTypeMemberContainer } from "@/lib/sidebar/xuguTypeMembers";
@@ -3742,6 +3743,8 @@ export const useConnectionStore = defineStore("connection", () => {
           ...entry.config,
           id: uuid(),
           name: `${entry.config.name} (Copy)`,
+          // The copy has no stored secrets yet; let the backend reuse the source's.
+          secrets_from_connection_id: entry.config.id,
         },
         targetGroupId === undefined ? entry.sourceGroupId : targetGroupId,
       );
@@ -8955,6 +8958,24 @@ export const useConnectionStore = defineStore("connection", () => {
 
   async function persistConnections(nextConnections: ConnectionConfig[] = connections.value) {
     await api.saveConnections(nextConnections.filter((connection) => connection.one_time !== true));
+    scrubPersistedConnectionSecrets(nextConnections);
+  }
+
+  /**
+   * After a successful save the backend owns every typed secret, so replace the
+   * persisted entries with redacted copies: plaintext does not linger in the
+   * store and one-shot `cleared_secrets` / `secrets_from_connection_id` are not
+   * resent on later saves. One-time connections are never persisted, so they
+   * keep their in-memory secrets. Entries without secret state keep their
+   * identity.
+   */
+  function scrubPersistedConnectionSecrets(list: ConnectionConfig[]) {
+    for (let index = 0; index < list.length; index++) {
+      const connection = list[index];
+      if (!connection || connection.one_time === true) continue;
+      if (!connection.cleared_secrets?.length && connection.secrets_from_connection_id === undefined && presentSecretPaths(connection).length === 0) continue;
+      list[index] = redactSavedConnection(connection);
+    }
   }
 
   function sameIds(left: string[], right: string[]) {
@@ -9377,12 +9398,16 @@ export const useConnectionStore = defineStore("connection", () => {
       queryTimeoutSecs: () => settingsStore.editorSettings.globalQueryTimeoutSecs,
     });
     const exportData = buildConnectionConfigBundle(exportedConnections, sidebarLayout.value, tunnelProfileStore.profiles, selectedConnectionIds);
-    const json = JSON.stringify(exportData);
     let content: string;
     if (protection.mode === "encrypted") {
-      const { encryptConfig } = await import("@/lib/backend/configCrypto");
-      const payload = await encryptConfig(json, protection.passphrase);
-      content = JSON.stringify(payload, null, 2);
+      // Connections in memory carry no secrets; the backend fills in the stored
+      // ones by id and returns the finished `dbx-encrypted` v2 file content.
+      const { normalizeConfigCryptoError } = await import("@/lib/backend/configCrypto");
+      try {
+        content = await api.exportConnectionsEncrypted(exportData, protection.passphrase);
+      } catch (error) {
+        throw normalizeConfigCryptoError(error);
+      }
     } else {
       const scrubbedData = {
         ...exportData,

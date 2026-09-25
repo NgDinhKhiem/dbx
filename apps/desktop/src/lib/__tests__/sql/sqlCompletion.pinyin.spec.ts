@@ -1,8 +1,11 @@
-import { describe, expect, it } from "vitest";
-import { containsHan, matchesPinyinInitials, orderedSubsequenceSpan, pinyinAwareMatchScore, pinyinFirstLetters } from "@/lib/common/pinyin";
+import { beforeAll, describe, expect, it } from "vitest";
+import { containsHan, matchesPinyinInitials, orderedSubsequenceSpan, pinyinAwareMatchScore, pinyinFirstLetters, loadPinyin } from "@/lib/common/pinyin";
 import { completionMatchRanges } from "@/lib/common/completionMatch";
 import { buildSqlCompletionItems } from "@/lib/sql/sqlCompletion";
 import { identifierMatchScore, matchesIdentifierSearch } from "@/lib/sql/identifierSearch";
+
+// pinyin-pro is lazy-loaded in the app; load it up front so Han initials resolve synchronously.
+beforeAll(() => loadPinyin());
 
 describe("identifier search", () => {
   it("matches camel-case initials and ranks them above loose fuzzy matches", () => {

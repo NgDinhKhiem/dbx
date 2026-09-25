@@ -7,6 +7,7 @@ import PasswordInput from "@/components/ui/PasswordInput.vue";
 import { Label } from "@/components/ui/label";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { getRememberedExportPassphrase } from "@/lib/backend/exportPassphraseSession";
+import { MIN_EXPORT_PASSPHRASE_LENGTH } from "@/lib/backend/configCrypto";
 
 const props = defineProps<{
   open: boolean;
@@ -62,8 +63,10 @@ function confirm() {
     error.value = t("configExport.passphraseMismatch");
     return;
   }
-  if (props.mode === "export" && passphrase.value.length < 4) {
-    error.value = t("configExport.passphraseTooShort");
+  // Only new exports enforce the minimum; existing files decrypt with whatever
+  // passphrase they were created with.
+  if (props.mode === "export" && passphrase.value.length < MIN_EXPORT_PASSPHRASE_LENGTH) {
+    error.value = t("configExport.passphraseTooShortMin", { min: MIN_EXPORT_PASSPHRASE_LENGTH });
     return;
   }
   emit("confirm", passphrase.value);
@@ -91,6 +94,7 @@ const displayError = computed(() => error.value || props.externalError || "");
         <div class="grid gap-2">
           <Label>{{ t("configExport.passphrase") }}</Label>
           <PasswordInput ref="passphraseInput" v-model="passphrase" :placeholder="t('configExport.passphrasePlaceholder')" :toggle-tab-index="-1" :disabled="busy" @keydown.enter="mode === 'import' ? confirm() : undefined" />
+          <p v-if="mode === 'export'" class="text-xs text-muted-foreground">{{ t("configExport.passphraseMinLengthHint", { min: MIN_EXPORT_PASSPHRASE_LENGTH }) }}</p>
         </div>
 
         <div v-if="mode === 'export'" class="grid gap-2">

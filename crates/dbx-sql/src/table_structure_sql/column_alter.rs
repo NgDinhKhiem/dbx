@@ -484,8 +484,11 @@ fn build_postgres_like_existing_column_sql(
         ));
     }
     if clean(&column.comment) != original_comment(column) {
-        let comment_value =
-            if clean(&column.comment).is_empty() { "NULL".to_string() } else { quote_string(&clean(&column.comment)) };
+        let comment_value = if clean(&column.comment).is_empty() {
+            "NULL".to_string()
+        } else {
+            quote_string(StructureDialect::Postgres, &clean(&column.comment))
+        };
         statements.push(format!(
             "COMMENT ON COLUMN {table}.{} IS {comment_value};",
             quote_ident(StructureDialect::Postgres, current_name)
@@ -571,8 +574,11 @@ pub(super) fn build_oracle_like_existing_column_sql(
         statements.push(format!("ALTER TABLE {table} MODIFY ({});", parts.join(" ")));
     }
     if clean(&column.comment) != original_comment(column) {
-        let comment_value =
-            if clean(&column.comment).is_empty() { "NULL".to_string() } else { quote_string(&clean(&column.comment)) };
+        let comment_value = if clean(&column.comment).is_empty() {
+            "NULL".to_string()
+        } else {
+            quote_string(dialect, &clean(&column.comment))
+        };
         statements
             .push(format!("COMMENT ON COLUMN {table}.{} IS {comment_value};", quote_ident(dialect, &current_name)));
     }
@@ -689,8 +695,11 @@ pub(super) fn build_oscar_existing_column_sql(
     }
 
     if clean(&column.comment) != original_comment(column) {
-        let comment_value =
-            if clean(&column.comment).is_empty() { "NULL".to_string() } else { quote_string(&clean(&column.comment)) };
+        let comment_value = if clean(&column.comment).is_empty() {
+            "NULL".to_string()
+        } else {
+            quote_string(dialect, &clean(&column.comment))
+        };
         statements
             .push(format!("COMMENT ON COLUMN {table}.{} IS {comment_value};", quote_ident(dialect, &current_name)));
     }
@@ -906,8 +915,11 @@ pub(super) fn build_h2_existing_column_sql(table: &str, column: &EditableStructu
         ));
     }
     if clean(&column.comment) != original_comment(column) {
-        let comment_value =
-            if clean(&column.comment).is_empty() { "NULL".to_string() } else { quote_string(&clean(&column.comment)) };
+        let comment_value = if clean(&column.comment).is_empty() {
+            "NULL".to_string()
+        } else {
+            quote_string(StructureDialect::H2, &clean(&column.comment))
+        };
         statements.push(format!(
             "COMMENT ON COLUMN {table}.{} IS {comment_value};",
             quote_ident(StructureDialect::H2, &current_name)
@@ -972,7 +984,7 @@ pub(super) fn build_clickhouse_existing_column_sql(
         statements.push(format!(
             "ALTER TABLE {table} COMMENT COLUMN {} {};",
             quote_ident(StructureDialect::ClickHouse, &current_name),
-            quote_string(&clean(&column.comment))
+            quote_string(StructureDialect::ClickHouse, &clean(&column.comment))
         ));
     }
     statements

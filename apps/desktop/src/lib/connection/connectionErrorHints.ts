@@ -1,4 +1,5 @@
 import type { ConnectionConfig } from "@/types/database";
+import { hasSavedSecret } from "@/lib/connection/savedSecrets";
 
 type Translate = (key: string) => string;
 
@@ -68,12 +69,12 @@ function isMysqlTlsLikeFailure(message: string): boolean {
 }
 
 export function isMysqlMissingPasswordFailure(config: ConnectionConfig, message: string): boolean {
-  if (config.db_type !== "mysql" || config.password) return false;
+  if (config.db_type !== "mysql" || config.password || hasSavedSecret(config, "password")) return false;
   return /access denied for user[\s\S]*using password:\s*no/i.test(message);
 }
 
 export function isSqliteMissingEncryptionPasswordFailure(config: ConnectionConfig, message: string): boolean {
-  if (config.db_type !== "sqlite" || config.password) return false;
+  if (config.db_type !== "sqlite" || config.password || hasSavedSecret(config, "password")) return false;
   return /Selected file is not a valid SQLite database file/i.test(message);
 }
 

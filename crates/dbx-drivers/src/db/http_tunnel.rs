@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{timeout, Duration};
 use uuid::Uuid;
 
@@ -14,6 +14,10 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const TCP_READ_BUFFER_SIZE: usize = 16 * 1024;
 const HTTP_READ_WAIT_MS: u64 = 1_000;
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// Tunnel URL query parameter that explicitly allows a plain `http://` script
+/// on a non-loopback host (e.g. `http://10.0.0.5/dbx_tunnel.php?allow_insecure_http=1`).
+/// It is consumed by DBX and not forwarded to the script.
+const ALLOW_INSECURE_HTTP_PARAM: &str = "allow_insecure_http";
 
 #[derive(Default)]
 pub struct HttpTunnelManager {
@@ -114,21 +118,54 @@ impl HttpTunnelEndpoint {
 }
 
 async fn http_tunnel_forward_loop(listener: TcpListener, endpoint: Arc<HttpTunnelEndpoint>) {
+    // Bridge tasks (including their HTTP read polling) are owned by this
+    // JoinSet: `stop_tunnel` aborts this task, dropping the set aborts them.
+    let mut bridges = JoinSet::new();
     loop {
-        let (inbound, _) = match listener.accept().await {
-            Ok(pair) => pair,
-            Err(_) => break,
-        };
-        let endpoint = endpoint.clone();
-        tokio::spawn(async move {
-            let _ = bridge_tcp_to_http_script(inbound, endpoint).await;
-        });
+        tokio::select! {
+            accepted = listener.accept() => {
+                let Ok((inbound, _)) = accepted else {
+                    break;
+                };
+                let endpoint = endpoint.clone();
+                bridges.spawn(async move {
+                    let _ = bridge_tcp_to_http_script(inbound, endpoint).await;
+                });
+            }
+            Some(_) = bridges.join_next(), if !bridges.is_empty() => {}
+        }
+    }
+    // A listener failure stops new connections but keeps established ones.
+    while bridges.join_next().await.is_some() {}
+}
+
+/// Closes the script-side session (best effort) when a bridge is aborted by
+/// `stop_tunnel` before it could close the session itself.
+struct AbortedSessionCloser {
+    endpoint: Arc<HttpTunnelEndpoint>,
+    session: String,
+    armed: bool,
+}
+
+impl Drop for AbortedSessionCloser {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let endpoint = self.endpoint.clone();
+        let session = std::mem::take(&mut self.session);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = close_session(&endpoint, &session).await;
+            });
+        }
     }
 }
 
 async fn bridge_tcp_to_http_script(mut inbound: TcpStream, endpoint: Arc<HttpTunnelEndpoint>) -> Result<(), String> {
     let session = Uuid::new_v4().simple().to_string();
     open_session(&endpoint, &session).await?;
+    let mut closer = AbortedSessionCloser { endpoint: endpoint.clone(), session: session.clone(), armed: true };
 
     let (mut tcp_reader, mut tcp_writer) = inbound.split();
     let tcp_to_http = async {
@@ -155,6 +192,7 @@ async fn bridge_tcp_to_http_script(mut inbound: TcpStream, endpoint: Arc<HttpTun
         result = tcp_to_http => result,
         result = http_to_tcp => result,
     };
+    closer.armed = false;
     let _ = close_session(&endpoint, &session).await;
     result
 }
@@ -260,6 +298,7 @@ fn script_url(
     wait_ms: Option<u64>,
 ) -> Result<Url, String> {
     let mut url = validate_script_url(tunnel_url)?;
+    strip_insecure_http_opt_in(&mut url);
     url.query_pairs_mut().append_pair("dbx_action", action).append_pair("dbx_session", session);
     if let Some((host, port)) = target {
         url.query_pairs_mut().append_pair("dbx_target_host", host).append_pair("dbx_target_port", &port.to_string());
@@ -281,8 +320,46 @@ fn validate_script_url(tunnel_url: &str) -> Result<Url, String> {
     }
     let url = Url::parse(trimmed).map_err(|e| format!("HTTP tunnel script URL is invalid: {e}"))?;
     match url.scheme() {
-        "http" | "https" => Ok(url),
+        "https" => Ok(url),
+        // Plain HTTP sends the tunnel token and the database wire protocol in
+        // cleartext, so it is only accepted for loopback or with an explicit opt-in.
+        "http" if is_loopback_url(&url) || insecure_http_opted_in(&url) => Ok(url),
+        "http" => Err(format!(
+            "HTTP tunnel script URL uses plain http:// for a non-local host, which would send the tunnel token and all database traffic unencrypted. \
+             Use an https:// URL, or append ?{ALLOW_INSECURE_HTTP_PARAM}=1 to the tunnel URL to allow plain HTTP explicitly (only on a trusted network)."
+        )),
         other => Err(format!("Unsupported HTTP tunnel script URL scheme: {other}")),
+    }
+}
+
+fn is_loopback_url(url: &Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host.to_ascii_lowercase().ends_with(".localhost")
+        || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+fn insecure_http_opted_in(url: &Url) -> bool {
+    url.query_pairs().any(|(key, value)| {
+        key == ALLOW_INSECURE_HTTP_PARAM && matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+    })
+}
+
+fn strip_insecure_http_opt_in(url: &mut Url) {
+    if !url.query_pairs().any(|(key, _)| key == ALLOW_INSECURE_HTTP_PARAM) {
+        return;
+    }
+    let kept = url
+        .query_pairs()
+        .filter(|(key, _)| key != ALLOW_INSECURE_HTTP_PARAM)
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    url.set_query(None);
+    if !kept.is_empty() {
+        url.query_pairs_mut().extend_pairs(kept);
     }
 }
 
@@ -326,6 +403,33 @@ mod tests {
     }
 
     #[test]
+    fn plain_http_is_rejected_for_remote_hosts_without_an_explicit_opt_in() {
+        let err = validate_script_url("http://gateway.example.com/dbx_tunnel.php").unwrap_err();
+        assert!(err.contains("unencrypted") && err.contains("allow_insecure_http=1"), "{err}");
+        assert!(validate_script_url("http://10.0.0.5/dbx_tunnel.php?allow_insecure_http=0").is_err());
+
+        assert!(validate_script_url("https://gateway.example.com/dbx_tunnel.php").is_ok());
+        assert!(validate_script_url("http://127.0.0.1:8080/dbx_tunnel.php").is_ok());
+        assert!(validate_script_url("http://[::1]/dbx_tunnel.php").is_ok());
+        assert!(validate_script_url("http://localhost/dbx_tunnel.php").is_ok());
+        assert!(validate_script_url("http://10.0.0.5/dbx_tunnel.php?allow_insecure_http=1").is_ok());
+    }
+
+    #[test]
+    fn insecure_http_opt_in_is_not_forwarded_to_the_script() {
+        let url = script_url(
+            "http://10.0.0.5/dbx_tunnel.php?keep=1&allow_insecure_http=1",
+            "read",
+            "session-1",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(url.as_str(), "http://10.0.0.5/dbx_tunnel.php?keep=1&dbx_action=read&dbx_session=session-1");
+    }
+
+    #[test]
     fn script_url_rejects_non_http_schemes() {
         let err = validate_script_url("file:///tmp/tunnel.php").unwrap_err();
 
@@ -357,6 +461,29 @@ mod tests {
         timeout(Duration::from_secs(2), close_notification).await.expect("HTTP tunnel session was not closed");
 
         manager.stop_tunnel("test").await;
+        script.handle.abort();
+    }
+
+    #[tokio::test]
+    async fn stop_tunnel_aborts_established_bridges_and_closes_their_sessions() {
+        let script = MockScript::start().await;
+        let manager = HttpTunnelManager::new();
+        let local_port = manager.start_tunnel("test", &script.url, "secret", 5, "mysql.internal", 3306).await.unwrap();
+        let mut client = TcpStream::connect(("127.0.0.1", local_port)).await.unwrap();
+        client.write_all(b"ping").await.unwrap();
+        let mut response = [0_u8; 4];
+        timeout(Duration::from_secs(5), client.read_exact(&mut response)).await.unwrap().unwrap();
+        assert_eq!(&response, b"ping");
+
+        let close_notification = script.closed.notified();
+        manager.stop_tunnel("test").await;
+
+        let mut buf = [0_u8; 1];
+        let read = timeout(Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .expect("the bridge must be torn down when the tunnel stops");
+        assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+        timeout(Duration::from_secs(2), close_notification).await.expect("aborted bridge should close its session");
         script.handle.abort();
     }
 

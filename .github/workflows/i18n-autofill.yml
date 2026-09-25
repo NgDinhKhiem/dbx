@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout trusted base script
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ github.event.pull_request.base.sha }}
 
@@ -33,12 +33,14 @@ jobs:
         run: cp .github/scripts/i18n-autofill.mjs "$RUNNER_TEMP/i18n-autofill.mjs"
 
       - name: Checkout pull request branch
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           ref: ${{ github.event.pull_request.head.sha }}
-          token: ${{ secrets.I18N_BOT_TOKEN || secrets.GITHUB_TOKEN }}
           fetch-depth: 0
+          # Never leave a write-capable credential in .git/config of a fork
+          # checkout; the push step supplies the bot token for that one command.
+          persist-credentials: false
           # The workflow executes the trusted base-branch script copied above;
           # fork contents are only parsed as translation data, never executed.
           allow-unsafe-pr-checkout: true
@@ -47,11 +49,11 @@ jobs:
         env:
           BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
-          git remote add base "https://github.com/${{ github.repository }}.git"
+          git remote add base "https://github.com/${GITHUB_REPOSITORY}.git"
           git fetch --no-tags --depth=1 base "${BASE_REF}"
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22.13.0
 
@@ -67,6 +69,8 @@ jobs:
         id: patch
         env:
           PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          PUSH_TOKEN: ${{ secrets.I18N_BOT_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           if git diff --quiet -- apps/desktop/src/i18n/locales; then
             echo "No i18n autofill changes to commit"
@@ -78,7 +82,14 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add apps/desktop/src/i18n/locales
           git commit -m "chore(i18n): autofill new translations"
-          if git push origin "HEAD:${PR_HEAD_REF}"; then
+          # Credentials are scoped to this single push via environment-provided git
+          # config (not argv, not .git/config), against an explicit PR head URL.
+          AUTH_HEADER="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$PUSH_TOKEN" | base64 -w0)"
+          echo "::add-mask::${AUTH_HEADER#AUTHORIZATION: basic }"
+          if GIT_CONFIG_COUNT=1 \
+            GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" \
+            GIT_CONFIG_VALUE_0="$AUTH_HEADER" \
+            git push "https://github.com/${PR_HEAD_REPO}.git" "HEAD:${PR_HEAD_REF}"; then
             echo "push_failed=false" >> "$GITHUB_OUTPUT"
           else
             echo "push_failed=true" >> "$GITHUB_OUTPUT"

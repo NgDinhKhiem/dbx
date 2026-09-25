@@ -1,11 +1,16 @@
 # syntax=docker/dockerfile:1
 
+# Base images are pinned by multi-arch index digest (tag kept for readability);
+# Renovate's docker manager keeps tag + digest up to date.
+
 # Stage 1: Build frontend (native, no emulation)
-FROM --platform=$BUILDPLATFORM node:22-slim AS frontend
+FROM --platform=$BUILDPLATFORM node:22-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c AS frontend
 WORKDIR /app
-RUN npm i -g pnpm
+ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 # Keep the workspace package available because Vite resolves it directly from source.
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+# Install exactly the pnpm version pinned by "packageManager" in package.json.
+RUN corepack enable && corepack install
 COPY packages/mongo-shell/ packages/mongo-shell/
 RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
     pnpm install --frozen-lockfile
@@ -19,15 +24,18 @@ COPY crates/dbx-core/assets/database-drivers.manifest.json crates/dbx-core/asset
 RUN pnpm build
 
 # Stage 2: Cross-compile Rust backend for the requested platform (native, no emulation)
-FROM --platform=$BUILDPLATFORM rust:1-bookworm AS backend
+FROM --platform=$BUILDPLATFORM rust:1-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e AS backend
 ARG TARGETARCH
+# Pinned build tools (bump together; cargo-zigbuild is installed with --locked).
+ARG ZIGLANG_VERSION=0.16.0
+ARG CARGO_ZIGBUILD_VERSION=0.23.4
 WORKDIR /app
 RUN dpkg --add-architecture arm64 \
     && apt-get update && apt-get install -y --no-install-recommends \
     build-essential cmake pkg-config perl python3-pip gcc-aarch64-linux-gnu \
     libfontconfig-dev:arm64 libfreetype-dev:arm64 \
-    && pip3 install --break-system-packages ziglang \
-    && cargo install cargo-zigbuild \
+    && pip3 install --break-system-packages --no-cache-dir "ziglang==${ZIGLANG_VERSION}" \
+    && cargo install --locked --version "${CARGO_ZIGBUILD_VERSION}" cargo-zigbuild \
     && rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
     && rm -rf /var/lib/apt/lists/*
 
@@ -101,7 +109,7 @@ RUN case "$TARGETARCH" in \
     cp "/app/target/$rust_target/release/dbx-web" "/out/linux/$TARGETARCH/"
 
 # Stage 3: Final image
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
 ARG TARGETPLATFORM
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -111,11 +119,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 \
     openjdk-17-jre-headless \
     && rm -rf /var/lib/apt/lists/*
+# Unprivileged runtime user. The container still starts as root so the
+# entrypoint can hand volumes created by older (root) images to this user;
+# it then drops privileges with setpriv (util-linux, already in the base image).
+RUN groupadd --system --gid 10001 dbx \
+    && useradd --system --uid 10001 --gid dbx --home-dir /home/dbx --create-home --shell /usr/sbin/nologin dbx \
+    && mkdir -p /app/data /app/backups \
+    && chown dbx:dbx /app/data /app/backups \
+    && chmod 0750 /app/data /app/backups
 COPY --from=backend /out/${TARGETPLATFORM}/dbx-web /usr/local/bin/
 COPY --from=frontend /app/dist /app/static
+COPY --chmod=0755 deploy/docker-entrypoint.sh /usr/local/bin/dbx-entrypoint
+COPY --chmod=0755 deploy/docker-healthcheck.sh /usr/local/bin/dbx-healthcheck
 ENV DBX_STATIC_DIR=/app/static
 ENV DBX_DATA_DIR=/app/data
 ENV DBX_BACKUP_ROOT=/app/backups
 ENV DBX_JAVA_BIN=/usr/bin/java
+# dbx-web defaults to 127.0.0.1; inside a container it must listen on all
+# interfaces so the published port works. Restrict exposure on the host side
+# (e.g. "127.0.0.1:4224:4224" in compose) instead.
+ENV DBX_HOST=0.0.0.0
 EXPOSE 4224
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD ["/usr/local/bin/dbx-healthcheck"]
+ENTRYPOINT ["/usr/local/bin/dbx-entrypoint"]
 CMD ["dbx-web"]

@@ -15,7 +15,7 @@ Set a strong access password and start DBX:
 docker run -d \
   --pull=always \
   --name dbx \
-  -p 4224:4224 \
+  -p 127.0.0.1:4224:4224 \
   -e DBX_PASSWORD='change-this-password' \
   -v dbx-data:/app/data \
   --restart unless-stopped \
@@ -23,6 +23,8 @@ docker run -d \
 ```
 
 Open `http://localhost:4224` and sign in with the value of `DBX_PASSWORD`.
+
+The examples publish the port on `127.0.0.1` only. To reach DBX from other machines, put a TLS reverse proxy in front of it, or publish on all interfaces (`-p 4224:4224`) on a trusted network. If no password is configured, DBX prints a one-time setup token in the container logs (`docker logs dbx`) that is required to set the first password.
 
 The image supports `linux/amd64` and `linux/arm64`.
 
@@ -34,9 +36,11 @@ services:
     image: t8y2/dbx:latest
     pull_policy: always
     environment:
-      DBX_PASSWORD: change-this-password
+      # Required; compose refuses to start without it (set it in .env).
+      DBX_PASSWORD: ${DBX_PASSWORD:?Set DBX_PASSWORD}
     ports:
-      - "4224:4224"
+      # Loopback by default; DBX_BIND=0.0.0.0 publishes on all interfaces.
+      - "${DBX_BIND:-127.0.0.1}:4224:4224"
     volumes:
       - dbx-data:/app/data
     restart: unless-stopped
@@ -61,11 +65,15 @@ docker compose up -d --pull always
 | `DBX_SECRET_KEY_FILE` | Not set | Optional external key file. Takes precedence over the managed data-directory key. |
 | `DBX_SECRET_KEY` | Not set | Optional key supplied by a secret manager. Used when no key file is configured. |
 | `DBX_PORT` | `4224` | HTTP port inside the container. |
+| `DBX_HOST` | `0.0.0.0` (image) | Listen address inside the container. The image sets `0.0.0.0` so the published port works; restrict exposure with the host-side port mapping. |
+| `DBX_RUN_AS_ROOT` | Not set | The container starts as root only to hand `/app/data` and `/app/backups` to the unprivileged `dbx` user (uid/gid 10001), then drops privileges. Set to `1` to keep running as root, e.g. when a mounted secret is readable only by root. |
 | `DBX_PUBLIC_BASE_PATH` | `/` | URL prefix for reverse-proxy deployments, for example `/dbx`. |
 | `DBX_WEB_MCP_TOKEN` | Not set | Enables native Streamable HTTP MCP with this bearer token. Keep it secret. |
 | `DBX_WEB_MCP_TOKEN_FILE` | Not set | Read the native MCP bearer token from a file, for example a mounted Docker secret. Cannot be combined with `DBX_WEB_MCP_TOKEN`. |
 | `DBX_WEB_MCP_ALLOWED_HOSTS` | Not set | Required when native MCP is enabled. Comma-separated public Host authorities, including ports when present. |
 | `DBX_WEB_MCP_ALLOWED_ORIGINS` | Not set | Comma-separated browser Origins allowed to call native MCP. Optional for non-browser MCP clients. |
+
+DBX runs as the unprivileged user `dbx` (uid/gid 10001). Volumes created by older, root-based images are re-owned automatically on start. When you start the container with `--user`, make sure the data directory is writable by that user. The image has a `HEALTHCHECK` that probes `/api/auth/check`.
 
 Persist `/app/data` with a named volume or bind mount. DBX creates `/app/data/.dbx/secret.key` on the first sensitive write or data migration. Back up this file together with `/app/data/dbx.db`; losing it makes existing encrypted credentials unreadable. A key stored in the same volume does not protect against disclosure of the entire volume.
 

@@ -64,7 +64,9 @@ function configSignature(config: AiConfigItem): string {
     qoderCliPath: config.qoderCliPath ?? null,
     connectionFingerprint: fingerprint(
       JSON.stringify({
+        // Secrets arrive redacted; the saved-secret markers change when a key is stored or cleared.
         apiKey: config.apiKey,
+        savedSecrets: [...(config.savedSecrets ?? [])].sort(),
         endpoint: config.endpoint,
         proxyUrl: config.proxyUrl ?? "",
         codexCliEnv: sortedRecord(config.codexCliEnv),
@@ -83,8 +85,9 @@ function fresh(loadedAt: number | undefined): boolean {
   return typeof loadedAt === "number" && Date.now() - loadedAt < CATALOG_TTL_MS;
 }
 
+/** Keeps `id` so the backend can resolve the stored (redacted) secrets by config id. */
 function configPayload(config: AiConfigItem, modelId = config.model): AiConfigItem {
-  return { ...config, model: modelId, runtimeEffort: null };
+  return { ...config, id: config.id, model: modelId, runtimeEffort: null };
 }
 
 async function loadModels(config: AiConfigItem, force = false): Promise<AiModelInfo[]> {
@@ -101,7 +104,7 @@ async function loadModels(config: AiConfigItem, force = false): Promise<AiModelI
   const previousModels = current?.signature === signature ? current.models : [];
   catalogs.set(config.id, { status: "loading", models: previousModels, signature });
   const request = api
-    .aiListModels(configPayload(config))
+    .aiListModels(configPayload(config), config.id)
     .then((models) => {
       const seen = new Set<string>();
       const uniqueModels = models.filter((model) => {
@@ -154,7 +157,7 @@ async function resolveEffort(config: AiConfigItem, modelId: string, force = fals
   const previousCapability = current?.signature === signature ? current.capability : undefined;
   effortCatalogs.set(key, { status: "loading", capability: previousCapability, signature });
   const request = api
-    .aiResolveModelEffort(configPayload(config, modelId), modelId)
+    .aiResolveModelEffort(configPayload(config, modelId), modelId, config.id)
     .then((capability) => {
       if (effortCatalogs.get(key)?.signature === signature) {
         effortCatalogs.set(key, { status: "ready", capability, signature, loadedAt: Date.now() });

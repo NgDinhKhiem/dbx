@@ -25,6 +25,8 @@ npm install -g @dbx-app/cli
 npm install -g @dbx-app/mcp-server
 ```
 
+`mcp/web-deployment.mcp.json` and `web-api/automation.sh` read the DBX Web password from the `DBX_WEB_PASSWORD` environment variable (`${DBX_WEB_PASSWORD}` is expanded by Claude Code; Cursor uses `${env:DBX_WEB_PASSWORD}`). Never commit a real password to these files. `docker/docker-compose.yml` likewise requires `DBX_PASSWORD` to be set and publishes DBX on `127.0.0.1` unless you set `DBX_BIND`.
+
 MCP connection access and execution permissions are configured centrally in **DBX Settings → MCP**. The client examples intentionally contain no permission or connection-scope environment variables.
 
 ## Suggested Learning Path

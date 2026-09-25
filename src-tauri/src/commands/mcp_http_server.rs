@@ -61,6 +61,30 @@ pub struct McpHttpServerStatus {
     pub recent_logs: Vec<String>,
 }
 
+/// Writes a secret file that is never readable by other local users: on Unix
+/// it is created with mode 0600 (no window where the default umask applies)
+/// and an existing file is re-restricted before the new content is written.
+pub(crate) fn write_private_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        // `mode` only applies when the file is created; tighten a file left by
+        // an older version before writing the secret into it.
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(contents)?;
+    file.sync_all()
+}
+
 impl McpHttpServerState {
     pub fn new(data_dir: PathBuf) -> Self {
         Self {
@@ -97,13 +121,8 @@ impl McpHttpServerState {
 
         fs::create_dir_all(&self.data_dir).map_err(|error| format!("failed to create MCP token directory: {error}"))?;
         let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-        fs::write(&path, &token).map_err(|error| format!("failed to save MCP HTTP token: {error}"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-                .map_err(|error| format!("failed to protect MCP HTTP token: {error}"))?;
-        }
+        write_private_file(&path, token.as_bytes())
+            .map_err(|error| format!("failed to save MCP HTTP token: {error}"))?;
         Ok(token)
     }
 
@@ -460,8 +479,26 @@ fn spawn_health_supervisor(state: Arc<AppState>, service: Arc<McpHttpServerState
 
 #[cfg(test)]
 mod tests {
-    use super::{endpoint_for_settings, McpHttpServerState};
+    use super::{endpoint_for_settings, write_private_file, McpHttpServerState};
     use dbx_core::storage::McpHttpServerSettings;
+
+    #[cfg(unix)]
+    #[test]
+    fn private_files_are_owner_only_even_when_they_already_existed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("fresh-token");
+        write_private_file(&fresh, b"secret").unwrap();
+        assert_eq!(std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"secret");
+
+        let existing = dir.path().join("existing-token");
+        std::fs::write(&existing, b"old").unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private_file(&existing, b"new").unwrap();
+        assert_eq!(std::fs::metadata(&existing).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read(&existing).unwrap(), b"new");
+    }
 
     #[test]
     fn endpoint_uses_a_client_reachable_authority() {

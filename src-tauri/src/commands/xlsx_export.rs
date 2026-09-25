@@ -1,5 +1,5 @@
 use dbx_core::xlsx_export::{
-    build_xlsx_workbook_multi_with_auto_filter, build_xlsx_workbook_with_auto_filter, XlsxWorksheetData,
+    write_xlsx_workbook_file_with_auto_filter, write_xlsx_workbook_multi_file_with_auto_filter, XlsxWorksheetData,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -52,12 +52,12 @@ pub async fn export_query_result_xlsx(request: QueryResultXlsxExportRequest) -> 
         if !data.numeric_column_right_align {
             data.numeric_column_right_align = false;
         }
-        let workbook = build_xlsx_workbook_with_auto_filter(
+        write_xlsx_workbook_file_with_auto_filter(
+            &request.file_path,
             &data,
             request.auto_filter.unwrap_or(true),
             request.date_time_format.as_deref(),
-        )?;
-        std::fs::write(&request.file_path, workbook).map_err(|err| err.to_string())
+        )
     })
     .await
     .map_err(|err| err.to_string())?
@@ -66,12 +66,12 @@ pub async fn export_query_result_xlsx(request: QueryResultXlsxExportRequest) -> 
 #[tauri::command]
 pub async fn export_query_results_xlsx(request: QueryResultsXlsxExportRequest) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let workbook = build_xlsx_workbook_multi_with_auto_filter(
+        write_xlsx_workbook_multi_file_with_auto_filter(
+            &request.file_path,
             &request.worksheets,
             request.auto_filter.unwrap_or(true),
             request.date_time_format.as_deref(),
-        )?;
-        std::fs::write(&request.file_path, workbook).map_err(|err| err.to_string())
+        )
     })
     .await
     .map_err(|err| err.to_string())?

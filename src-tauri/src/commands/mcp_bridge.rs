@@ -13,6 +13,7 @@ use dbx_core::storage::{McpDatabaseScope, McpGlobalPolicy};
 
 const BIND_ADDR: &str = "127.0.0.1:0";
 const MCP_BRIDGE_PORT_FILE: &str = "mcp-bridge-port";
+const MCP_BRIDGE_TOKEN_FILE: &str = "mcp-bridge-token";
 const MCP_EXECUTE_AND_SHOW_SQL_ONLY: &str =
     "UNSUPPORTED_OPERATION: MCP execute-and-show only supports SQL connections.";
 
@@ -197,6 +198,168 @@ pub struct McpExecuteQueryEvent {
     pub results: Vec<dbx_core::db::QueryResult>,
 }
 
+/// Upper bound for the request line plus headers.
+const MAX_BRIDGE_HEADER_BYTES: usize = 16 * 1024;
+/// Upper bound for a JSON request body (SQL text, Mongo documents).
+const MAX_BRIDGE_BODY_BYTES: usize = 16 * 1024 * 1024;
+const BRIDGE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Exact `POST <path>` routes; anything else is 404.
+const BRIDGE_ROUTES: &[&str] = &[
+    "/open-table",
+    "/call-plugin-tool",
+    "/list-plugin-connections",
+    "/data/list-tables",
+    "/data/describe-table",
+    "/data/mongo/list-collections",
+    "/data/mongo/count-documents",
+    "/data/mongo/find-documents",
+    "/data/mongo/server-version",
+    "/data/mongo/collection-stats",
+    "/data/mongo/aggregate-documents",
+    "/data/mongo/distinct",
+    "/data/mongo/create-index",
+    "/data/mongo/drop-indexes",
+    "/data/mongo/drop-collection",
+    "/data/mongo/insert-documents",
+    "/data/mongo/update-documents",
+    "/data/mongo/delete-documents",
+    "/data/redis/execute-command",
+    "/data/execute-query",
+    "/execute-query",
+    "/reload-connections",
+];
+
+#[derive(Debug)]
+struct BridgeRequest {
+    method: String,
+    path: String,
+    headers: Vec<(String, String)>,
+    body: String,
+}
+
+impl BridgeRequest {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers.iter().find(|(key, _)| key.eq_ignore_ascii_case(name)).map(|(_, value)| value.as_str())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct BridgeRejection {
+    status: &'static str,
+    message: &'static str,
+}
+
+impl BridgeRejection {
+    const fn new(status: &'static str, message: &'static str) -> Self {
+        Self { status, message }
+    }
+}
+
+fn find_header_end(buffer: &[u8]) -> Option<usize> {
+    buffer.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+/// Minimal HTTP/1.1 request reader: parses the request line and headers and
+/// reads exactly `Content-Length` body bytes (the old single `read` could
+/// truncate large bodies).
+async fn read_bridge_request<S>(stream: &mut S) -> Result<BridgeRequest, BridgeRejection>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let mut buffer = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 8192];
+    let header_end = loop {
+        if let Some(end) = find_header_end(&buffer) {
+            break end;
+        }
+        if buffer.len() > MAX_BRIDGE_HEADER_BYTES {
+            return Err(BridgeRejection::new("431 Request Header Fields Too Large", "Request headers are too large."));
+        }
+        let read = stream.read(&mut chunk).await.map_err(|_| BridgeRejection::new("400 Bad Request", "Bad request."))?;
+        if read == 0 {
+            return Err(BridgeRejection::new("400 Bad Request", "Incomplete request."));
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    };
+    let head = std::str::from_utf8(&buffer[..header_end])
+        .map_err(|_| BridgeRejection::new("400 Bad Request", "Request headers must be UTF-8."))?;
+    let mut lines = head.split("\r\n");
+    let mut request_line = lines.next().unwrap_or_default().split(' ');
+    let method = request_line.next().unwrap_or_default().to_string();
+    let path = request_line.next().unwrap_or_default().to_string();
+    if method.is_empty() || !path.starts_with('/') || !request_line.next().is_some_and(|v| v.starts_with("HTTP/1.")) {
+        return Err(BridgeRejection::new("400 Bad Request", "Malformed request line."));
+    }
+    let mut headers = Vec::new();
+    for line in lines {
+        let (name, value) =
+            line.split_once(':').ok_or_else(|| BridgeRejection::new("400 Bad Request", "Malformed header."))?;
+        headers.push((name.trim().to_string(), value.trim().to_string()));
+    }
+    let content_length = match headers.iter().find(|(name, _)| name.eq_ignore_ascii_case("content-length")) {
+        Some((_, value)) => {
+            value.parse::<usize>().map_err(|_| BridgeRejection::new("400 Bad Request", "Invalid Content-Length."))?
+        }
+        None => 0,
+    };
+    if headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("transfer-encoding")) {
+        return Err(BridgeRejection::new("411 Length Required", "Chunked requests are not supported."));
+    }
+    if content_length > MAX_BRIDGE_BODY_BYTES {
+        return Err(BridgeRejection::new("413 Payload Too Large", "Request body is too large."));
+    }
+    let mut body = buffer.split_off(header_end + 4);
+    while body.len() < content_length {
+        let read = stream.read(&mut chunk).await.map_err(|_| BridgeRejection::new("400 Bad Request", "Bad request."))?;
+        if read == 0 {
+            return Err(BridgeRejection::new("400 Bad Request", "Incomplete request body."));
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
+    body.truncate(content_length);
+    let body = String::from_utf8(body).map_err(|_| BridgeRejection::new("400 Bad Request", "Body must be UTF-8."))?;
+    Ok(BridgeRequest { method, path, headers, body })
+}
+
+/// The bridge executes SQL, Mongo writes and Redis commands, so every request
+/// must prove it comes from a local DBX client (`dbx-mcp`/`dbx` CLI) that can
+/// read the per-launch token file:
+/// * no `Origin` header: browsers always send one on cross-origin POSTs,
+///   including `no-cors` text/plain requests;
+/// * `Host` must be the loopback listener (blocks DNS rebinding);
+/// * `Authorization: Bearer <token>` compared in constant time;
+/// * `Content-Type: application/json` and an exact `POST` route.
+fn authorize_bridge_request(request: &BridgeRequest, token: &str, port: u16) -> Result<(), BridgeRejection> {
+    if request.header("origin").is_some() {
+        return Err(BridgeRejection::new("403 Forbidden", "Browser requests are not allowed."));
+    }
+    let host = request.header("host").unwrap_or_default().to_ascii_lowercase();
+    if host != format!("127.0.0.1:{port}") && host != format!("localhost:{port}") {
+        return Err(BridgeRejection::new("403 Forbidden", "Invalid Host header."));
+    }
+    let presented = request
+        .header("authorization")
+        .and_then(|value| value.strip_prefix("Bearer ").or_else(|| value.strip_prefix("bearer ")))
+        .map(str::trim)
+        .unwrap_or_default();
+    if token.is_empty() || !super::local_auth::constant_time_eq(token, presented) {
+        return Err(BridgeRejection::new("401 Unauthorized", "Missing or invalid DBX bridge token."));
+    }
+    if request.method != "POST" {
+        return Err(BridgeRejection::new("405 Method Not Allowed", "Only POST is supported."));
+    }
+    if !BRIDGE_ROUTES.contains(&request.path.as_str()) {
+        return Err(BridgeRejection::new("404 Not Found", "Unknown bridge route."));
+    }
+    let content_type = request.header("content-type").unwrap_or_default();
+    let media_type = content_type.split(';').next().unwrap_or_default().trim();
+    if !media_type.eq_ignore_ascii_case("application/json") {
+        return Err(BridgeRejection::new("415 Unsupported Media Type", "Content-Type must be application/json."));
+    }
+    Ok(())
+}
+
 pub fn start(app_handle: AppHandle, state: Arc<AppState>, data_dir: PathBuf) {
     tauri::async_runtime::spawn(async move {
         let listener = match TcpListener::bind(BIND_ADDR).await {
@@ -209,6 +372,13 @@ pub fn start(app_handle: AppHandle, state: Arc<AppState>, data_dir: PathBuf) {
         log::info!("MCP bridge listening on {BIND_ADDR}");
         let actual_port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
         log::info!("MCP bridge assigned port {actual_port}");
+        let token: Arc<str> = Arc::from(super::local_auth::random_token());
+        // The token is written before the port so a client that sees the new
+        // port also finds the matching token.
+        if let Err(err) = write_token_file(&data_dir, &token) {
+            log::warn!("MCP bridge failed to write token file in {}: {err}", data_dir.display());
+            return;
+        }
         // Publish into DBX's resolved data dir so DBX_DATA_DIR and portable mode share the same discovery file.
         if let Err(err) = write_port_file(&data_dir, actual_port) {
             log::warn!("MCP bridge failed to write port file in {}: {err}", data_dir.display());
@@ -220,63 +390,53 @@ pub fn start(app_handle: AppHandle, state: Arc<AppState>, data_dir: PathBuf) {
             };
             let app = app_handle.clone();
             let st = state.clone();
+            let token = token.clone();
             tokio::spawn(async move {
-                let mut buf = vec![0u8; 65536];
-                let n = match stream.read(&mut buf).await {
-                    Ok(n) if n > 0 => n,
-                    _ => return,
+                let read = tokio::time::timeout(BRIDGE_REQUEST_TIMEOUT, read_bridge_request(&mut stream)).await;
+                let request = match read {
+                    Ok(Ok(request)) => request,
+                    Ok(Err(rejection)) => {
+                        respond_error(&mut stream, rejection.status, rejection.message).await;
+                        return;
+                    }
+                    Err(_) => return,
                 };
-                let request = String::from_utf8_lossy(&buf[..n]);
-                let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
-                let first_line = request.lines().next().unwrap_or("");
-
-                if first_line.starts_with("POST /open-table") {
-                    handle_open_table(&app, &st, body, &mut stream).await;
-                } else if first_line.starts_with("POST /call-plugin-tool") {
-                    handle_call_plugin_tool(&app, &st, body, &mut stream).await;
-                } else if first_line.starts_with("POST /list-plugin-connections") {
-                    handle_list_plugin_connections(&st, body, &mut stream).await;
-                } else if first_line.starts_with("POST /data/list-tables") {
-                    handle_list_tables_data(&st, body, &mut stream).await;
-                } else if first_line.starts_with("POST /data/describe-table") {
-                    handle_describe_table_data(&st, body, &mut stream).await;
-                } else if first_line.starts_with("POST /data/mongo/list-collections") {
-                    handle_mongo_list_collections_data(&st, body, &mut stream).await;
-                } else if first_line.starts_with("POST /data/mongo/count-documents") {
-                    handle_mongo_count_documents_data(&st, body, &mut stream).await;
-                } else if first_line.starts_with("POST /data/mongo/find-documents") {
-                    handle_mongo_find_documents_data(&st, body, &mut stream).await;
-                } else if first_line.starts_with("POST /data/mongo/server-version") {
-                    handle_mongo_server_version_data(&st, body, &mut stream).await;
-                } else if first_line.starts_with("POST /data/mongo/collection-stats") {
-                    handle_mongo_collection_stats_data(&st, body, &mut stream).await;
-                } else if first_line.starts_with("POST /data/mongo/aggregate-documents") {
-                    handle_mongo_aggregate_documents_data(&st, body, &mut stream).await;
-                } else if first_line.starts_with("POST /data/mongo/distinct") {
-                    handle_mongo_distinct_data(&st, body, &mut stream).await;
-                } else if first_line.starts_with("POST /data/mongo/create-index") {
-                    handle_mongo_create_index_data(&st, body, &mut stream).await;
-                } else if first_line.starts_with("POST /data/mongo/drop-indexes") {
-                    handle_mongo_drop_indexes_data(&st, body, &mut stream).await;
-                } else if first_line.starts_with("POST /data/mongo/drop-collection") {
-                    handle_mongo_drop_collection_data(&st, body, &mut stream).await;
-                } else if first_line.starts_with("POST /data/mongo/insert-documents") {
-                    handle_mongo_insert_documents_data(&st, body, &mut stream).await;
-                } else if first_line.starts_with("POST /data/mongo/update-documents") {
-                    handle_mongo_update_documents_data(&st, body, &mut stream).await;
-                } else if first_line.starts_with("POST /data/mongo/delete-documents") {
-                    handle_mongo_delete_documents_data(&st, body, &mut stream).await;
-                } else if first_line.starts_with("POST /data/redis/execute-command") {
-                    handle_redis_execute_command_data(&st, body, &mut stream).await;
-                } else if first_line.starts_with("POST /data/execute-query") {
-                    handle_execute_query_data(&st, body, &mut stream).await;
-                } else if first_line.starts_with("POST /execute-query") {
-                    handle_execute_query(&app, &st, body, &mut stream).await;
-                } else if first_line.starts_with("POST /reload-connections") {
-                    let _ = app.emit("mcp-reload-connections", ());
-                    respond(&mut stream, "200 OK", "ok").await;
-                } else {
-                    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").await;
+                if let Err(rejection) = authorize_bridge_request(&request, &token, actual_port) {
+                    respond_error(&mut stream, rejection.status, rejection.message).await;
+                    return;
+                }
+                let body = request.body.as_str();
+                match request.path.as_str() {
+                    "/open-table" => handle_open_table(&app, &st, body, &mut stream).await,
+                    "/call-plugin-tool" => handle_call_plugin_tool(&app, &st, body, &mut stream).await,
+                    "/list-plugin-connections" => handle_list_plugin_connections(&st, body, &mut stream).await,
+                    "/data/list-tables" => handle_list_tables_data(&st, body, &mut stream).await,
+                    "/data/describe-table" => handle_describe_table_data(&st, body, &mut stream).await,
+                    "/data/mongo/list-collections" => handle_mongo_list_collections_data(&st, body, &mut stream).await,
+                    "/data/mongo/count-documents" => handle_mongo_count_documents_data(&st, body, &mut stream).await,
+                    "/data/mongo/find-documents" => handle_mongo_find_documents_data(&st, body, &mut stream).await,
+                    "/data/mongo/server-version" => handle_mongo_server_version_data(&st, body, &mut stream).await,
+                    "/data/mongo/collection-stats" => handle_mongo_collection_stats_data(&st, body, &mut stream).await,
+                    "/data/mongo/aggregate-documents" => {
+                        handle_mongo_aggregate_documents_data(&st, body, &mut stream).await
+                    }
+                    "/data/mongo/distinct" => handle_mongo_distinct_data(&st, body, &mut stream).await,
+                    "/data/mongo/create-index" => handle_mongo_create_index_data(&st, body, &mut stream).await,
+                    "/data/mongo/drop-indexes" => handle_mongo_drop_indexes_data(&st, body, &mut stream).await,
+                    "/data/mongo/drop-collection" => handle_mongo_drop_collection_data(&st, body, &mut stream).await,
+                    "/data/mongo/insert-documents" => handle_mongo_insert_documents_data(&st, body, &mut stream).await,
+                    "/data/mongo/update-documents" => handle_mongo_update_documents_data(&st, body, &mut stream).await,
+                    "/data/mongo/delete-documents" => handle_mongo_delete_documents_data(&st, body, &mut stream).await,
+                    "/data/redis/execute-command" => handle_redis_execute_command_data(&st, body, &mut stream).await,
+                    "/data/execute-query" => handle_execute_query_data(&st, body, &mut stream).await,
+                    "/execute-query" => handle_execute_query(&app, &st, body, &mut stream).await,
+                    "/reload-connections" => {
+                        let _ = app.emit("mcp-reload-connections", ());
+                        respond(&mut stream, "200 OK", "ok").await;
+                    }
+                    _ => {
+                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").await;
+                    }
                 }
             });
         }
@@ -286,7 +446,16 @@ pub fn start(app_handle: AppHandle, state: Arc<AppState>, data_dir: PathBuf) {
 fn write_port_file(data_dir: &Path, actual_port: u16) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(data_dir)?;
     let path = data_dir.join(MCP_BRIDGE_PORT_FILE);
-    std::fs::write(&path, actual_port.to_string())?;
+    super::mcp_http_server::write_private_file(&path, actual_port.to_string().as_bytes())?;
+    Ok(path)
+}
+
+/// Per-launch bearer token for the bridge, next to the (unchanged) port file.
+/// Created owner-only (0600) on Unix; lives in the per-user data directory.
+fn write_token_file(data_dir: &Path, token: &str) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(data_dir)?;
+    let path = data_dir.join(MCP_BRIDGE_TOKEN_FILE);
+    super::mcp_http_server::write_private_file(&path, token.as_bytes())?;
     Ok(path)
 }
 
@@ -295,6 +464,100 @@ fn find_config_by_name<'a>(
     name: &str,
 ) -> Option<&'a crate::models::connection::ConnectionConfig> {
     configs.iter().find(|c| c.name.eq_ignore_ascii_case(name))
+}
+
+#[cfg(test)]
+mod bridge_auth_tests {
+    use super::{authorize_bridge_request, read_bridge_request, write_token_file, BridgeRequest};
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn request(headers: &[(&str, &str)]) -> BridgeRequest {
+        BridgeRequest {
+            method: "POST".to_string(),
+            path: "/data/execute-query".to_string(),
+            headers: headers.iter().map(|(name, value)| (name.to_string(), value.to_string())).collect(),
+            body: "{}".to_string(),
+        }
+    }
+
+    fn valid_headers() -> Vec<(&'static str, String)> {
+        vec![
+            ("Host", "127.0.0.1:4100".to_string()),
+            ("Authorization", format!("Bearer {TOKEN}")),
+            ("Content-Type", "application/json".to_string()),
+        ]
+    }
+
+    fn with(headers: Vec<(&'static str, String)>) -> BridgeRequest {
+        let refs = headers.iter().map(|(name, value)| (*name, value.as_str())).collect::<Vec<_>>();
+        request(&refs)
+    }
+
+    #[test]
+    fn accepts_authenticated_local_json_posts() {
+        assert!(authorize_bridge_request(&with(valid_headers()), TOKEN, 4100).is_ok());
+        let mut headers = valid_headers();
+        headers[0].1 = "localhost:4100".to_string();
+        headers[2].1 = "application/json; charset=utf-8".to_string();
+        assert!(authorize_bridge_request(&with(headers), TOKEN, 4100).is_ok());
+    }
+
+    #[test]
+    fn rejects_browser_origin_bad_host_token_type_and_route() {
+        let mut headers = valid_headers();
+        headers.push(("Origin", "https://evil.example".to_string()));
+        assert_eq!(authorize_bridge_request(&with(headers), TOKEN, 4100).unwrap_err().status, "403 Forbidden");
+
+        let mut headers = valid_headers();
+        headers[0].1 = "evil.example:4100".to_string();
+        assert_eq!(authorize_bridge_request(&with(headers), TOKEN, 4100).unwrap_err().status, "403 Forbidden");
+
+        let mut headers = valid_headers();
+        headers[1].1 = "Bearer wrong".to_string();
+        assert_eq!(authorize_bridge_request(&with(headers), TOKEN, 4100).unwrap_err().status, "401 Unauthorized");
+        let headers = valid_headers().into_iter().filter(|(name, _)| *name != "Authorization").collect();
+        assert_eq!(authorize_bridge_request(&with(headers), TOKEN, 4100).unwrap_err().status, "401 Unauthorized");
+
+        let mut headers = valid_headers();
+        headers[2].1 = "text/plain".to_string();
+        assert!(authorize_bridge_request(&with(headers), TOKEN, 4100).unwrap_err().status.starts_with("415"));
+
+        let mut prefixed = with(valid_headers());
+        prefixed.path = "/data/execute-query-anything".to_string();
+        assert!(authorize_bridge_request(&prefixed, TOKEN, 4100).unwrap_err().status.starts_with("404"));
+        let mut get = with(valid_headers());
+        get.method = "GET".to_string();
+        assert!(authorize_bridge_request(&get, TOKEN, 4100).unwrap_err().status.starts_with("405"));
+    }
+
+    #[tokio::test]
+    async fn reads_body_by_content_length_across_reads() {
+        let body = format!("{{\"sql\":\"{}\"}}", "x".repeat(100_000));
+        let raw = format!(
+            "POST /data/execute-query HTTP/1.1\r\nHost: 127.0.0.1:1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mut reader = std::io::Cursor::new(raw.into_bytes());
+        let parsed = read_bridge_request(&mut reader).await.unwrap();
+        assert_eq!(parsed.method, "POST");
+        assert_eq!(parsed.path, "/data/execute-query");
+        assert_eq!(parsed.header("content-type"), Some("application/json"));
+        assert_eq!(parsed.body, body);
+
+        let mut truncated = std::io::Cursor::new(b"POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\nabc".to_vec());
+        assert!(read_bridge_request(&mut truncated).await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_token_file(dir.path(), TOKEN).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), TOKEN);
+        assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
 }
 
 #[cfg(test)]

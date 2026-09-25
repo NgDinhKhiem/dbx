@@ -4,7 +4,9 @@ on:
   issue_comment:
     types: [created]
 
-# 用 PROJECT_AUTOMATION_TOKEN（owner PAT）调 DELETE，GITHUB_TOKEN 本身无需写权限
+# 删除操作使用 DBX bot GitHub App 的短期安装令牌（仅 issues/pull-requests 写权限），
+# 且只在检测命中后才签发；不再向任意评论者触发的 job 暴露 owner PAT。
+# GITHUB_TOKEN 本身无需写权限。
 permissions:
   contents: read
 
@@ -14,15 +16,14 @@ jobs:
     # 跳过机器人与仓库 owner，避免误删维护者的正当评论
     if: ${{ github.event.comment.user.type != 'Bot' && github.event.comment.user.login != github.repository_owner }}
     env:
-      # owner PAT：GITHUB_TOKEN 非 admin 删不掉别人的评论，必须用 owner 令牌
-      GH_TOKEN: ${{ secrets.PROJECT_AUTOMATION_TOKEN }}
       COMMENT_ID: ${{ github.event.comment.id }}
       COMMENT_BODY: ${{ github.event.comment.body }}
       COMMENT_USER: ${{ github.event.comment.user.login }}
       ISSUE_URL: ${{ github.event.issue.html_url }}
       REPO: ${{ github.repository }}
     steps:
-      - name: Delete comment containing malicious attachment link
+      - name: Detect malicious attachment link
+        id: detect
         run: |
           set -euo pipefail
 
@@ -33,9 +34,31 @@ jobs:
           # 如需扩展扩展名，修改下方两处列表即可。
           if ! printf '%s' "$COMMENT_BODY" | grep -qiP 'https?://(?!(?:github\.com|[^/]*\.githubusercontent\.com)/)[^[:space:]<>"]+\.zip([?#][^[:space:]<>"]*)?|\[[^\]]*\.(zip|7z|exe|scr)\]\((?!(?:https?:)?//(?:github\.com|[^/]*\.githubusercontent\.com)/)[^)]*\)'; then
             echo "No malicious attachment link detected, skipping"
+            echo "malicious=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           echo "Detected malicious attachment link in comment by @$COMMENT_USER on $ISSUE_URL — deleting"
+          echo "malicious=true" >> "$GITHUB_OUTPUT"
+
+      - name: Create DBX bot token
+        id: app-token
+        if: steps.detect.outputs.malicious == 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.DBX_BOT_APP_ID }}
+          private-key: ${{ secrets.DBX_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: dbx
+          # 删除 issue 评论需要 issues 写权限，PR 对话评论需要 pull-requests 写权限。
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Delete comment containing malicious attachment link
+        if: steps.detect.outputs.malicious == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
           # 物理删除评论，内容对所有人不可见。DELETE 返回 204 无响应体。
           gh api -X DELETE "repos/${REPO}/issues/comments/${COMMENT_ID}"

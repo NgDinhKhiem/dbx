@@ -362,6 +362,16 @@ struct ConnectionLifecycle {
     cancellation: CancellationToken,
 }
 
+/// Process-wide source of connection attempt numbers. Unique numbers (rather
+/// than a per-connection counter) make it safe to drop a connection's attempt
+/// entry: a restarted sequence could otherwise hand a new attempt the number
+/// an in-flight attempt still holds.
+static NEXT_CONNECTION_ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_connection_attempt_number() -> u64 {
+    NEXT_CONNECTION_ATTEMPT.fetch_add(1, Ordering::Relaxed)
+}
+
 struct SharedResourceBudget {
     capacity: usize,
     semaphore: Arc<Semaphore>,
@@ -374,6 +384,10 @@ pub struct AppState {
     draining_pools: Arc<std::sync::Mutex<HashMap<String, watch::Sender<bool>>>>,
     connection_attempts: RwLock<HashMap<String, ConnectionAttemptState>>,
     connection_lifecycles: std::sync::Mutex<HashMap<String, ConnectionLifecycle>>,
+    /// In-flight pool builds, keyed by pool key and connection attempt, so
+    /// concurrent cold requests share one build instead of each opening a full
+    /// pool and closing all but the last published one.
+    pool_creations: PoolCreationMap,
     shared_resource_budgets: std::sync::Mutex<HashMap<String, SharedResourceBudget>>,
     pub configs: RwLock<HashMap<String, ConnectionConfig>>,
     pub running_queries: RunningQueries,
@@ -490,6 +504,57 @@ fn metadata_gate_key(
         client_session_id.map(str::trim).filter(|session| !session.is_empty()).unwrap_or_default()
     };
     format!("{connection_id}\0{}\0{}", database.unwrap_or_default(), session)
+}
+
+type PoolCreationKey = (String, Option<u64>);
+type PoolCreationResult = Option<Result<String, String>>;
+type PoolCreationMap = Arc<std::sync::Mutex<HashMap<PoolCreationKey, watch::Sender<PoolCreationResult>>>>;
+
+enum PoolCreationTurn {
+    /// This caller builds the pool and reports the outcome through the guard.
+    Leader(PoolCreationLeader),
+    /// Another caller is building the same pool; wait for its outcome.
+    Follower(watch::Receiver<PoolCreationResult>),
+}
+
+/// Leadership of one in-flight pool build. Dropping it (success, error or a
+/// cancelled future) removes the in-flight entry; followers that did not get a
+/// result see the channel close and retry on their own.
+struct PoolCreationLeader {
+    key: PoolCreationKey,
+    creations: PoolCreationMap,
+    signal: watch::Sender<PoolCreationResult>,
+}
+
+impl PoolCreationLeader {
+    fn finish(self, result: &Result<String, String>) {
+        self.signal.send_replace(Some(result.clone()));
+    }
+}
+
+impl Drop for PoolCreationLeader {
+    fn drop(&mut self) {
+        let mut creations = self.creations.lock().unwrap_or_else(|error| error.into_inner());
+        if creations.get(&self.key).is_some_and(|signal| signal.same_channel(&self.signal)) {
+            creations.remove(&self.key);
+        }
+    }
+}
+
+fn begin_pool_creation(creations: &PoolCreationMap, pool_key: &str, connection_attempt: Option<u64>) -> PoolCreationTurn {
+    let key = (pool_key.to_string(), connection_attempt);
+    let mut map = creations.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(signal) = map.get(&key) {
+        return PoolCreationTurn::Follower(signal.subscribe());
+    }
+    let (signal, _) = watch::channel(None);
+    map.insert(key.clone(), signal.clone());
+    PoolCreationTurn::Leader(PoolCreationLeader { key, creations: creations.clone(), signal })
+}
+
+/// Wait for the leader's outcome; `None` means the leader was dropped first.
+async fn wait_for_pool_creation(mut receiver: watch::Receiver<PoolCreationResult>) -> PoolCreationResult {
+    receiver.wait_for(Option::is_some).await.ok().and_then(|result| result.clone())
 }
 
 struct PoolDrainGuard {
@@ -1338,6 +1403,26 @@ impl AppState {
         previous.cancel();
     }
 
+    /// Invalidate and drop the lifecycle entry of a connection whose pools are
+    /// being removed. Stale snapshots stay invalid: their cancellation token is
+    /// cancelled here and a missing entry is never "current". The next snapshot
+    /// starts a fresh entry, so the map only holds live connections.
+    fn forget_connection_lifecycle(&self, connection_id: &str) {
+        let previous = self.connection_lifecycles.lock().unwrap_or_else(|error| error.into_inner()).remove(connection_id);
+        if let Some(previous) = previous {
+            previous.cancellation.cancel();
+        }
+    }
+
+    /// Drop all per-connection bookkeeping for a connection that was deleted.
+    /// Call after its config is removed and its pools are dropped. Attempt
+    /// numbers are unique process-wide, so an in-flight attempt of the deleted
+    /// connection can never match a later attempt that reuses the same id.
+    pub async fn forget_connection_state(&self, connection_id: &str) {
+        self.connection_attempts.write().await.remove(connection_id);
+        self.forget_connection_lifecycle(connection_id);
+    }
+
     fn invalidate_all_connection_lifecycles(&self) {
         let previous = {
             let mut lifecycles = self.connection_lifecycles.lock().unwrap_or_else(|error| error.into_inner());
@@ -1578,6 +1663,7 @@ impl AppState {
             draining_pools: Arc::new(std::sync::Mutex::new(HashMap::new())),
             connection_attempts: RwLock::new(HashMap::new()),
             connection_lifecycles: std::sync::Mutex::new(HashMap::new()),
+            pool_creations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             shared_resource_budgets: std::sync::Mutex::new(HashMap::new()),
             configs: RwLock::new(HashMap::new()),
             running_queries: RunningQueries::default(),
@@ -2004,8 +2090,8 @@ impl AppState {
         connection_id: &str,
         client_attempt: Option<u64>,
     ) -> u64 {
+        let next = next_connection_attempt_number();
         let mut attempts = self.connection_attempts.write().await;
-        let next = attempts.get(connection_id).map(|state| state.server_attempt).unwrap_or(0).wrapping_add(1);
         attempts.insert(connection_id.to_string(), ConnectionAttemptState { server_attempt: next, client_attempt });
         next
     }
@@ -2028,7 +2114,7 @@ impl AppState {
         }
         attempts.insert(
             connection_id.to_string(),
-            ConnectionAttemptState { server_attempt: current.server_attempt.wrapping_add(1), client_attempt: None },
+            ConnectionAttemptState { server_attempt: next_connection_attempt_number(), client_attempt: None },
         );
         true
     }
@@ -2487,33 +2573,81 @@ impl AppState {
         let base_pool_key = base_pool_key_for_with_catalog(db_type, connection_id, database, catalog, false);
         let pool_key = pool_key_for_session_role(Some(&config), base_pool_key.clone(), client_session_id, session_role);
 
-        loop {
-            self.wait_for_pool_drain(&pool_key).await;
-            if self.pool_handle(&pool_key).await.is_some() {
-                if self.remove_pool_if_duckdb_isolation_mismatch(&pool_key).await {
-                    // Recreate below using the current DuckDB isolation mode.
-                } else if self.pool_credential_owner_mismatch(&config, &pool_key).await {
-                    // 创建该 no-save 池的是另一个登录会话：销毁旧池，用当前会话的
-                    // 凭据重建，避免跨会话复用他人输入的临时密码。
-                    self.remove_stale_connection_pool(&pool_key).await;
+        'reuse_or_create: loop {
+            loop {
+                self.wait_for_pool_drain(&pool_key).await;
+                if self.pool_handle(&pool_key).await.is_some() {
+                    if self.remove_pool_if_duckdb_isolation_mismatch(&pool_key).await {
+                        // Recreate below using the current DuckDB isolation mode.
+                    } else if self.pool_credential_owner_mismatch(&config, &pool_key).await {
+                        // 创建该 no-save 池的是另一个登录会话：销毁旧池，用当前会话的
+                        // 凭据重建，避免跨会话复用他人输入的临时密码。
+                        self.remove_stale_connection_pool(&pool_key).await;
+                        break;
+                    } else if !validate_existing_pool || !self.remove_stale_connection_pool(&pool_key).await {
+                        self.touch_pool_activity(&pool_key).await;
+                        return Ok(pool_key);
+                    }
                     break;
-                } else if !validate_existing_pool || !self.remove_stale_connection_pool(&pool_key).await {
-                    self.touch_pool_activity(&pool_key).await;
-                    return Ok(pool_key);
+                }
+                // A reclaim may have removed the pool after the first drain check. Wait
+                // for its confirmed close or rollback before deciding to create a new one.
+                self.wait_for_pool_drain(&pool_key).await;
+                if self.pool_handle(&pool_key).await.is_some() {
+                    continue;
                 }
                 break;
             }
-            // A reclaim may have removed the pool after the first drain check. Wait
-            // for its confirmed close or rollback before deciding to create a new one.
-            self.wait_for_pool_drain(&pool_key).await;
-            if self.pool_handle(&pool_key).await.is_some() {
-                continue;
-            }
-            break;
-        }
 
-        let mut db_config = database_connection_config_with_catalog(&config, database, catalog);
-        self.apply_session_credential(&config, &mut db_config, connection_id);
+            // Single-flight: concurrent cold requests for the same pool key and
+            // attempt wait for one build instead of each creating a full pool.
+            let leader = match begin_pool_creation(&self.pool_creations, &pool_key, connection_attempt) {
+                PoolCreationTurn::Follower(receiver) => match wait_for_pool_creation(receiver).await {
+                    Some(result) => return result,
+                    // The leader was cancelled before finishing: start over.
+                    None => continue 'reuse_or_create,
+                },
+                PoolCreationTurn::Leader(leader) => leader,
+            };
+            // A previous leader may have published the pool between our reuse
+            // check and taking leadership; reuse it instead of replacing it.
+            if self.pool_handle(&pool_key).await.is_some() {
+                drop(leader);
+                continue 'reuse_or_create;
+            }
+            let result = self
+                .create_pool_for_session(
+                    &config,
+                    connection_id,
+                    database,
+                    catalog,
+                    client_session_id,
+                    session_role,
+                    connection_attempt,
+                    &base_pool_key,
+                    pool_key.clone(),
+                )
+                .await;
+            leader.finish(&result);
+            return result;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_pool_for_session(
+        &self,
+        config: &ConnectionConfig,
+        connection_id: &str,
+        database: Option<&str>,
+        catalog: Option<&str>,
+        client_session_id: Option<&str>,
+        session_role: AgentSessionRole,
+        connection_attempt: Option<u64>,
+        base_pool_key: &str,
+        pool_key: String,
+    ) -> Result<String, String> {
+        let mut db_config = database_connection_config_with_catalog(config, database, catalog);
+        self.apply_session_credential(config, &mut db_config, connection_id);
 
         validate_h2_file_connection(&db_config)?;
         self.ensure_current_connection_attempt(connection_id, connection_attempt).await?;
@@ -2541,7 +2675,7 @@ impl AppState {
         let pool = match db_config.db_type {
             DatabaseType::Mysql => {
                 let (pool, mode) = connect_mysql_metadata_pool(
-                    &config,
+                    config,
                     &db_config,
                     &host,
                     port,
@@ -2626,8 +2760,23 @@ impl AppState {
                         extensions,
                     )
                     .await?;
-                    for attached in &db_config.attached_databases {
-                        db::sqlite::attach_database(&pool, &attached.name, &expand_tilde(&attached.path))?;
+                    let attachments = db_config
+                        .attached_databases
+                        .iter()
+                        .map(|attached| (attached.name.clone(), expand_tilde(&attached.path)))
+                        .collect::<Vec<_>>();
+                    if !attachments.is_empty() {
+                        // ATTACH takes the connection lock and opens files; keep
+                        // that blocking work off the async runtime.
+                        let attach_pool = pool.clone();
+                        tokio::task::spawn_blocking(move || {
+                            for (name, path) in &attachments {
+                                db::sqlite::attach_database(&attach_pool, name, path)?;
+                            }
+                            Ok::<(), String>(())
+                        })
+                        .await
+                        .map_err(|error| format!("SQLite attach task failed: {error}"))??;
                     }
                     PoolKind::Sqlite(pool)
                 }
@@ -2895,7 +3044,7 @@ impl AppState {
                 PoolKind::VictoriaMetrics(client)
             }
             DatabaseType::Nacos => {
-                let admin_config = self.nacos_admin_config_for_connection(connection_id, &config).await?;
+                let admin_config = self.nacos_admin_config_for_connection(connection_id, config).await?;
                 let adapter = self.nacos_registry.build_transient_config(admin_config).await?;
                 adapter.test_connection().await?;
                 PoolKind::Nacos
@@ -2934,7 +3083,7 @@ impl AppState {
                     if initial_result.as_ref().is_err_and(|err| {
                         normalize_client_session_id(client_session_id).is_some()
                             && is_connection_slot_exhausted_error(err)
-                    }) && self.reclaim_idle_base_pool_for_session(connection_id, &base_pool_key).await
+                    }) && self.reclaim_idle_base_pool_for_session(connection_id, base_pool_key).await
                     {
                         log::warn!(
                             "Reclaimed an idle metadata pool for '{connection_id}' after the database rejected a new Agent session due to exhausted connection slots"
@@ -3136,7 +3285,7 @@ impl AppState {
                 // MQ admin connections don't hold a data query pool. We just test
                 // connectivity via the mq_registry and insert a marker so this
                 // connection_id is recognized as valid.
-                let mqc = self.mq_admin_config_for_connection(connection_id, &config).await?;
+                let mqc = self.mq_admin_config_for_connection(connection_id, config).await?;
                 let agent_launch = crate::mq::service::resolve_mq_agent_launch_spec(&mqc, self);
                 // Temporary "__test_*" probes must not retain agents in the registry.
                 // reconnect fast-path caching only applies to durable connection ids;
@@ -3179,7 +3328,7 @@ impl AppState {
             }
             #[cfg(feature = "mq-admin")]
             DatabaseType::Mqtt => {
-                let mqtt_config = crate::mqtt::types::MqttConnectionConfig::from_connection(&config)?;
+                let mqtt_config = crate::mqtt::types::MqttConnectionConfig::from_connection(config)?;
                 let client = crate::mqtt::client::MqttClient::connect(mqtt_config).await?;
                 PoolKind::Mqtt(client)
             }
@@ -5557,7 +5706,7 @@ impl AppState {
     }
 
     pub async fn remove_connection_pools(&self, connection_id: &str) {
-        self.invalidate_connection_lifecycle(connection_id);
+        self.forget_connection_lifecycle(connection_id);
         self.rollback_manual_transaction_sessions(connection_id).await;
         let removed = self.drain_connection_pools(connection_id).await;
         self.clear_metadata_gates_for_connection(connection_id).await;
@@ -5573,7 +5722,7 @@ impl AppState {
     /// user disconnect still goes through remove_connection_pools* and does
     /// send connection/disconnect.
     pub async fn drop_connection_pools_without_close(&self, connection_id: &str) {
-        self.invalidate_connection_lifecycle(connection_id);
+        self.forget_connection_lifecycle(connection_id);
         self.rollback_manual_transaction_sessions(connection_id).await;
         let removed = self.drain_connection_pools(connection_id).await;
         self.clear_metadata_gates_for_connection(connection_id).await;
@@ -5581,7 +5730,7 @@ impl AppState {
     }
 
     pub async fn remove_connection_pools_detached(&self, connection_id: &str) {
-        self.invalidate_connection_lifecycle(connection_id);
+        self.forget_connection_lifecycle(connection_id);
         self.rollback_manual_transaction_sessions(connection_id).await;
         let removed = self.drain_connection_pools(connection_id).await;
         self.clear_metadata_gates_for_connection(connection_id).await;
@@ -7718,6 +7867,62 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
         (AppState::new(storage), dir)
+    }
+
+    #[tokio::test]
+    async fn concurrent_pool_creation_shares_the_leader_result() {
+        let creations: PoolCreationMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let PoolCreationTurn::Leader(leader) = begin_pool_creation(&creations, "conn:db", Some(7)) else {
+            panic!("first caller must lead");
+        };
+        let followers = (0..3)
+            .map(|_| match begin_pool_creation(&creations, "conn:db", Some(7)) {
+                PoolCreationTurn::Follower(receiver) => tokio::spawn(wait_for_pool_creation(receiver)),
+                PoolCreationTurn::Leader(_) => panic!("concurrent caller must follow"),
+            })
+            .collect::<Vec<_>>();
+        // A different attempt is not merged with the in-flight build.
+        assert!(matches!(begin_pool_creation(&creations, "conn:db", Some(8)), PoolCreationTurn::Leader(_)));
+
+        leader.finish(&Ok("conn:db".to_string()));
+        for follower in followers {
+            assert_eq!(follower.await.unwrap(), Some(Ok("conn:db".to_string())));
+        }
+        assert!(creations.lock().unwrap().is_empty());
+        assert!(matches!(begin_pool_creation(&creations, "conn:db", Some(7)), PoolCreationTurn::Leader(_)));
+    }
+
+    #[tokio::test]
+    async fn dropped_pool_creation_leader_releases_followers_to_retry() {
+        let creations: PoolCreationMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let PoolCreationTurn::Leader(leader) = begin_pool_creation(&creations, "conn:db", None) else {
+            panic!("first caller must lead");
+        };
+        let PoolCreationTurn::Follower(receiver) = begin_pool_creation(&creations, "conn:db", None) else {
+            panic!("second caller must follow");
+        };
+        drop(leader);
+        assert_eq!(wait_for_pool_creation(receiver).await, None);
+        assert!(creations.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn forgetting_connection_state_clears_attempt_and_lifecycle_maps() {
+        let (state, dir) = test_app_state().await;
+        let first = state.begin_connection_attempt("conn").await;
+        let snapshot = state.connection_lifecycle_snapshot("conn");
+        state.remove_connection_pools("conn").await;
+        assert!(snapshot.cancellation().is_cancelled());
+        assert!(!state.connection_lifecycles.lock().unwrap().contains_key("conn"));
+        // Pool removal keeps the attempt: connect flows remove old pools mid-attempt.
+        assert!(state.ensure_current_connection_attempt("conn", Some(first)).await.is_ok());
+
+        state.forget_connection_state("conn").await;
+        assert!(!state.connection_attempts.read().await.contains_key("conn"));
+        assert!(state.ensure_current_connection_attempt("conn", Some(first)).await.is_err());
+        let second = state.begin_connection_attempt("conn").await;
+        assert_ne!(first, second, "attempt numbers are never reused");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

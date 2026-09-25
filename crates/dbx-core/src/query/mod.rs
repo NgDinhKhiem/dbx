@@ -1922,9 +1922,13 @@ async fn do_execute_typed(
             // awaitable future leaves the pooled connection occupied. Interrupt
             // the native statement as soon as the shared cancellation registry
             // receives the request so the same client session can run again.
+            // The interrupter is lock-free: taking the connection mutex here
+            // would block this async worker behind any running statement.
+            // Timeouts and dropped futures interrupt the statement inside
+            // `execute_query_with_max_rows` itself.
             if let Some(execution_id) = options.execution_id.as_deref() {
-                if let Ok(interrupt) = p.with_connection(|conn| Ok(conn.get_interrupt_handle())) {
-                    state.running_queries.register_interrupt(execution_id, move || interrupt.interrupt());
+                if let Some(interrupt) = p.interrupter() {
+                    state.running_queries.register_interrupt(execution_id, interrupt);
                 }
             }
             wait_for_query_opt(cancel_token, query_timeout, db::sqlite::execute_query_with_max_rows(&p, sql, max_rows))

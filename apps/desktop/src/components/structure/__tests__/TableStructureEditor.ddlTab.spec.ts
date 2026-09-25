@@ -277,7 +277,7 @@ vi.mock("@/stores/settingsStore", () => ({
 }));
 vi.mock("@/composables/useTheme", () => ({ useTheme: () => ({ isDark: { value: false }, themePalette: { value: "pearl" } }) }));
 vi.mock("@/composables/useToast", () => ({ useToast: () => ({ toast: mocks.toast }) }));
-vi.mock("@/lib/sql/sqlHighlighter", () => ({ createShikiSqlHighlighter: vi.fn(async () => (sql: string) => sql) }));
+vi.mock("@/lib/sql/sqlHighlighter", () => ({ createShikiSqlHighlighter: vi.fn(async () => (sql: string) => sql), escapeHtml: (sql: string) => sql.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") }));
 vi.mock("@/lib/sql/sqlFormatter", () => ({
   formatSqlForDisplay: vi.fn(async (sql: string) => sql),
   sqlFormatDialectForDbType: vi.fn(() => "mysql"),

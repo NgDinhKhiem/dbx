@@ -12,7 +12,7 @@ import { useToast } from "@/composables/useToast";
 import { databaseOptionsForConnection, fetchNamespaceOptionsForConnection } from "@/composables/useDatabaseOptions";
 import { isSchemaAware } from "@/lib/database/databaseCapabilities";
 import { copyToClipboard } from "@/lib/common/clipboard";
-import { inferCompareKeyColumns, normalizeKeyColumns, sameKeyColumns, type CompareKeyColumnOption, type DataCompareCellValue, type DataCompareSyncPlan } from "@/lib/dataGrid/dataCompare";
+import { dataCompareTruncationNotice, inferCompareKeyColumns, normalizeKeyColumns, sameKeyColumns, type CompareKeyColumnOption, type DataCompareCellValue, type DataCompareSyncPlan } from "@/lib/dataGrid/dataCompare";
 import {
   buildDataCompareSyncPlanTables,
   emptyDataCompareSyncPlan,
@@ -33,7 +33,7 @@ import { executeWithProductionSqlGuard } from "@/lib/database/productionExecutio
 import { supportsTransaction } from "@/lib/database/databaseFeatureSupport";
 import { formatError, isManualTransactionSessionExpired } from "@/lib/backend/errorUtils";
 import TableMultiSelect from "@/components/diff/TableMultiSelect.vue";
-import { ArrowLeftRight, CheckSquare, ChevronDown, ChevronRight, Copy, GitCompareArrows, Loader2, Play, RotateCcw, Square } from "@lucide/vue";
+import { AlertTriangle, ArrowLeftRight, CheckSquare, ChevronDown, ChevronRight, Copy, GitCompareArrows, Loader2, Play, RotateCcw, Square } from "@lucide/vue";
 
 const PREVIEW_LIMIT_OPTIONS = [50, 100, 200, 500];
 const SYNC_EXECUTE_BATCH_SIZE = 500;
@@ -70,6 +70,8 @@ const targetTables = ref<string[]>([]);
 
 const detailPreviewLimit = ref(String(PREVIEW_LIMIT_OPTIONS[1]));
 const batchResults = ref<DataCompareTableResult[]>([]);
+// Tables whose compare stopped at the full-compare row limit; their sync SQL is incomplete.
+const truncatedBatchResults = computed(() => batchResults.value.filter((item) => item.status !== "error" && dataCompareTruncationNotice(item)));
 const syncPlan = ref<DataCompareSyncPlan>(emptyDataCompareSyncPlan());
 const comparing = ref(false);
 const planningSync = ref(false);
@@ -1310,6 +1312,11 @@ onBeforeUnmount(() => {
               </div>
             </div>
 
+            <div v-if="truncatedBatchResults.length" data-data-compare-truncated-banner class="flex items-start gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
+              <AlertTriangle class="mt-0.5 h-4 w-4 shrink-0" />
+              <span>{{ t("dataCompare.truncatedBanner", { count: truncatedBatchResults.length }) }}</span>
+            </div>
+
             <div class="rounded-lg border overflow-hidden">
               <div class="max-h-64 overflow-auto">
                 <table class="w-full text-xs">
@@ -1344,11 +1351,15 @@ onBeforeUnmount(() => {
                           </div>
                           <div class="mt-1">
                             {{
-                              t("dataCompare.rowCounts", {
+                              t(dataCompareTruncationNotice(item) ? "dataCompare.rowCountsTruncated" : "dataCompare.rowCounts", {
                                 source: item.sourceRowCount,
                                 target: item.targetRowCount,
                               })
                             }}
+                          </div>
+                          <div v-if="dataCompareTruncationNotice(item)" data-data-compare-truncated class="mt-1 flex items-start gap-1 text-amber-700 dark:text-amber-300">
+                            <AlertTriangle class="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                            <span>{{ t(dataCompareTruncationNotice(item) === "missingTargetTooLarge" ? "dataCompare.truncatedMissingTarget" : "dataCompare.truncatedPartial") }}</span>
                           </div>
                           <div class="mt-1">
                             {{ t("dataCompare.keyColumnsInline", { columns: item.keyColumns.join(", ") }) }}

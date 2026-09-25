@@ -82,19 +82,23 @@ fn parse_statements(sql: &str, dialect_key: &str) -> Result<Vec<Statement>, Stri
     .map_err(|error| format!("Failed to parse the statement: {error}"))
 }
 
+/// Quote an identifier (or alias) with the delimiter the source statement used, escaping the
+/// delimiter by doubling it so a name containing the quote character cannot end the identifier.
 fn quote_identifier(name: &str, quote: Option<&str>, dialect_key: &str) -> String {
-    if let Some(value) = quote {
-        if value == "`" || value == "\"" || value == "'" {
-            return format!("{value}{name}{value}");
-        }
-        if value == "[" {
-            return format!("[{name}]");
-        }
+    let delimiter = match quote {
+        Some(value @ ("`" | "\"" | "'")) => value,
+        Some("[") => return format!("[{}]", name.replace(']', "]]")),
+        _ if dialect_key == "mysql" => "`",
+        _ => "\"",
+    };
+    let mut escaped = name.to_string();
+    // ClickHouse reads every quoted name with backslash escapes, and MySQL reads `'...'` and (without
+    // ANSI_QUOTES) `"..."` that way, so a trailing backslash could otherwise escape the delimiter.
+    if dialect_key == "clickhouse" || (dialect_key == "mysql" && delimiter != "`") {
+        escaped = escaped.replace('\\', "\\\\");
     }
-    match dialect_key {
-        "mysql" => format!("`{name}`"),
-        _ => format!("\"{name}\""),
-    }
+    let escaped = escaped.replace(delimiter, &delimiter.repeat(2));
+    format!("{delimiter}{escaped}{delimiter}")
 }
 
 /// 从赋值目标里取出列名（`t.a` → `a`）。
@@ -411,6 +415,23 @@ fn delete_table_ref(delete: &sqlparser::ast::Delete) -> DmlChangePreviewTableRef
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quote_identifier_doubles_the_delimiter() {
+        assert_eq!(quote_identifier("a\"b", None, "postgres"), "\"a\"\"b\"");
+        assert_eq!(quote_identifier("a`b", None, "mysql"), "`a``b`");
+        assert_eq!(quote_identifier("a`b", Some("`"), "mysql"), "`a``b`");
+        assert_eq!(quote_identifier("a]b", Some("["), "sqlserver"), "[a]]b]");
+        assert_eq!(quote_identifier("a'b", Some("'"), "postgres"), "'a''b'");
+        // Backslashes cannot escape the closing delimiter where they are escape characters.
+        assert_eq!(quote_identifier("x\\", Some("'"), "mysql"), "'x\\\\'");
+        assert_eq!(quote_identifier("x\\", Some("`"), "mysql"), "`x\\`");
+        assert_eq!(quote_identifier("x\\`", Some("`"), "clickhouse"), "`x\\\\```");
+        assert_eq!(
+            quote_identifier("x\" FROM users; DROP TABLE users; --", None, "postgres"),
+            "\"x\"\" FROM users; DROP TABLE users; --\""
+        );
+    }
 
     fn preview(sql: &str, database_type: &str) -> Result<DmlChangePreviewSqlResult, String> {
         build_dml_change_preview_sql(DmlChangePreviewSqlOptions {

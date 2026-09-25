@@ -78,6 +78,7 @@ vi.mock("@/lib/backend/api", () => ({
   cancelSqlFileExecution: mocks.cancelSqlFileExecution,
   executeSqlFiles: mocks.executeSqlFiles,
   listenSqlFileProgress: mocks.listenSqlFileProgress,
+  pickExternalFiles: mocks.openFileDialog,
   previewSqlFile: mocks.previewSqlFile,
   releaseSqlFilePreview: mocks.releaseSqlFilePreview,
   inspectSqlFileTables: mocks.inspectSqlFileTables,

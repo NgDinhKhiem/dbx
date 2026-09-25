@@ -241,6 +241,10 @@ import McpResourceScopePicker from "@/components/settings/McpResourceScopePicker
 import McpDatabaseScopePicker from "@/components/settings/McpDatabaseScopePicker.vue";
 import McpAuthorizationStepper from "@/components/settings/McpAuthorizationStepper.vue";
 import ScheduledDatabaseBackupSettings from "@/components/backup/ScheduledDatabaseBackupSettings.vue";
+import SyncImportConfirmDialog from "@/components/sync/SyncImportConfirmDialog.vue";
+import { isInsecureSyncUrl, isSyncPassphraseTooShort, runConfirmedSyncDownload, SYNC_PASSPHRASE_MIN_LENGTH } from "@/lib/webdav/syncImport";
+import type { SyncImportReview, WebDavDownloadResult } from "@/lib/backend/api";
+import { AI_API_KEY_SECRET, AI_CLI_ENV_FIELDS, AI_PROXY_URL_SECRET, aiEnvSecretPath, aiHeaderSecretPath, effectiveAiClearedSecrets, hasAiApiKey, type AiCliEnvField } from "@/lib/ai/aiConfigSecrets";
 import SqlFormatterSettingsPanel from "./SqlFormatterSettingsPanel.vue";
 import { APP_CUSTOM_UI_COLOR_DEFS, APP_THEME_PALETTES, type AppCornerStyle, type AppCustomUiColors, type AppThemeAppearance, type AppThemeMode, type AppThemePalette } from "@/lib/app/appTheme";
 import { BACKGROUND_IMAGE_DISPLAY_MODES, BACKGROUND_IMAGE_STORAGE_LIMIT_BYTES, defaultBackgroundImageSettings, normalizeBackgroundImageDisplayMode, type BackgroundImageSettings } from "@/lib/app/appBackgroundImage";
@@ -3164,7 +3168,7 @@ async function refreshAppSupportInfo() {
         settingsStore.aiConfigs
           .filter((config) => {
             const preset = getAiProviderPreset(config.provider, config.endpoint);
-            return config.endpoint.trim() && config.model.trim() && (!preset.requiresApiKey || config.apiKey.trim());
+            return config.endpoint.trim() && config.model.trim() && (!preset.requiresApiKey || hasAiApiKey(config));
           })
           .map((config) => getAiProviderPreset(config.provider, config.endpoint).label),
       ),
@@ -3981,9 +3985,17 @@ const legacySnippetId = ref("");
 const pendingLegacyCleanupId = ref("");
 const snippetSyncSettingsLoading = ref(true);
 
-const webdavReady = computed(() => !!webdavEndpoint.value.trim() && !webdavBusy.value && (!webdavSyncSecrets.value || !!webdavSecretsPassphrase.value.trim() || webdavHasSavedSecretsPassphrase.value));
-const snippetReady = computed(() => !snippetSyncSettingsLoading.value && !snippetBusy.value && (snippetProvider.value !== "gitlab" || (!snippetInstanceError.value && snippetInstanceUrl.value === activeSnippetInstanceUrl.value)) && (!!snippetToken.value.trim() || snippetHasSavedToken.value));
-const snippetUploadReady = computed(() => snippetReady.value && !!snippetPassphrase.value.trim() && (!snippetIncludeSecrets.value || !!snippetSecretsPassphrase.value.trim()));
+// Sync endpoints must use HTTPS (loopback excepted); the backend rejects others with HTTPS_REQUIRED.
+const webdavEndpointInsecure = computed(() => isInsecureSyncUrl(webdavEndpoint.value));
+const snippetInstanceInsecure = computed(() => snippetProvider.value === "gitlab" && (isInsecureSyncUrl(snippetInstanceUrl.value) || isInsecureSyncUrl(activeSnippetInstanceUrl.value)));
+// Newly entered sync passphrases need SYNC_PASSPHRASE_MIN_LENGTH characters; downloads still accept any existing passphrase.
+const webdavSecretsPassphraseTooShort = computed(() => webdavSyncSecrets.value && isSyncPassphraseTooShort(webdavSecretsPassphrase.value));
+const snippetPassphraseTooShortForNew = computed(() => !snippetId.value.trim() && isSyncPassphraseTooShort(snippetPassphrase.value));
+const snippetSecretsPassphraseTooShort = computed(() => snippetIncludeSecrets.value && isSyncPassphraseTooShort(snippetSecretsPassphrase.value));
+const webdavReady = computed(() => !!webdavEndpoint.value.trim() && !webdavEndpointInsecure.value && !webdavBusy.value && (!webdavSyncSecrets.value || !!webdavSecretsPassphrase.value.trim() || webdavHasSavedSecretsPassphrase.value));
+const webdavUploadReady = computed(() => webdavReady.value && !webdavSecretsPassphraseTooShort.value);
+const snippetReady = computed(() => !snippetSyncSettingsLoading.value && !snippetBusy.value && (snippetProvider.value !== "gitlab" || (!snippetInstanceError.value && !snippetInstanceInsecure.value && snippetInstanceUrl.value === activeSnippetInstanceUrl.value)) && (!!snippetToken.value.trim() || snippetHasSavedToken.value));
+const snippetUploadReady = computed(() => snippetReady.value && !!snippetPassphrase.value.trim() && !snippetPassphraseTooShortForNew.value && (!snippetIncludeSecrets.value || (!!snippetSecretsPassphrase.value.trim() && !snippetSecretsPassphraseTooShort.value)));
 // Legacy plaintext snippets have no outer encryption password. Let the
 // backend require one only after it detects an encrypted envelope so those
 // snapshots remain recoverable for migration.
@@ -4050,6 +4062,10 @@ function commitSnippetInstance() {
   try {
     const url = new URL(snippetInstanceUrl.value.trim());
     if (!["https:", "http:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error();
+    if (isInsecureSyncUrl(url.href)) {
+      snippetInstanceError.value = t("settings.syncHttpsRequired");
+      return;
+    }
     snippetInstanceUrl.value = url.href.replace(/\/$/, "");
     snippetInstanceError.value = "";
   } catch {
@@ -4094,7 +4110,7 @@ async function runSnippetAction(kind: "test" | "upload" | "download" | "migrate"
     await applySnippetTokenPreference();
     snippetMessage.value = await action();
   } catch (e: any) {
-    snippetMessage.value = e?.message || String(e);
+    snippetMessage.value = syncErrorMessage(e);
     if (kind === "upload" && snippetMessage.value.includes("legacy unencrypted DBX snapshot")) {
       legacySnippetId.value = snippetId.value.trim();
     }
@@ -4117,6 +4133,11 @@ async function uploadSnippetSnapshot() {
     snippetError.value = true;
     return;
   }
+  if (snippetPassphraseTooShortForNew.value || snippetSecretsPassphraseTooShort.value) {
+    snippetMessage.value = t("settings.syncPassphraseTooShort", { min: SYNC_PASSPHRASE_MIN_LENGTH });
+    snippetError.value = true;
+    return;
+  }
   await runSnippetAction("upload", async () => {
     const summary = await snippetSyncUpload(currentSnippetConfig(), settingsStore.editorSettings, snippetPassphrase.value, snippetIncludeSecrets.value, snippetIncludeSecrets.value ? snippetSecretsPassphrase.value : undefined);
     snippetId.value = summary.snippetId;
@@ -4130,7 +4151,14 @@ async function uploadSnippetSnapshot() {
 
 async function migrateLegacySnippet() {
   const id = legacySnippetId.value;
-  if (!id || !window.confirm(t("settings.syncSnippetMigrateLegacyConfirm", { id }))) return;
+  if (!id) return;
+  // Migration encrypts the legacy snapshot with a newly chosen password.
+  if (isSyncPassphraseTooShort(snippetPassphrase.value) || snippetSecretsPassphraseTooShort.value) {
+    snippetMessage.value = t("settings.syncPassphraseTooShort", { min: SYNC_PASSPHRASE_MIN_LENGTH });
+    snippetError.value = true;
+    return;
+  }
+  if (!window.confirm(t("settings.syncSnippetMigrateLegacyConfirm", { id }))) return;
   await runSnippetAction(
     "migrate",
     async () => {
@@ -4167,23 +4195,80 @@ async function retryLegacySnippetCleanup() {
 async function downloadSnippetSnapshot() {
   if (!snippetId.value.trim() || !window.confirm(t("settings.syncDownloadConfirm"))) return;
   await runSnippetAction("download", async () => {
-    const result = await snippetSyncDownload(currentSnippetConfig(), snippetPassphrase.value, snippetRestoreSecrets.value, snippetRestoreSecrets.value ? snippetSecretsPassphrase.value : undefined);
-    if (result.editorSettings && typeof result.editorSettings === "object") settingsStore.updateEditorSettings(result.editorSettings as any);
-    await settingsStore.updateDesktopSettings(result.desktopSettings);
-    await connectionStore.initFromDisk();
-    await savedSqlStore.initFromStorage();
-    // Snapshot downloads replace backend-managed tunnel profiles, so refresh
-    // the already-loaded Pinia store instead of leaving the UI stale.
-    await tunnelProfileStore.refresh();
-    await settingsStore.reloadAiConfigs();
-    let message = t("settings.syncSnippetDownloadSuccess", {
+    const config = currentSnippetConfig();
+    const snippetPassword = snippetPassphrase.value;
+    const restoreSecrets = snippetRestoreSecrets.value;
+    const secretsPassphrase = restoreSecrets ? snippetSecretsPassphrase.value : undefined;
+    const result = await runConfirmedSyncDownload((confirmation) => snippetSyncDownload(config, snippetPassword, restoreSecrets, secretsPassphrase, confirmation), confirmSyncImport);
+    if (!result) return t("settings.syncImportCancelled");
+    const notes = await applyDownloadedSyncSnapshot(result);
+    const message = t("settings.syncSnippetDownloadSuccess", {
       bytes: result.summary.bytes,
       id: result.summary.snippetId,
     });
-    if (result.applySummary.encryptedSecretsPresent && !result.applySummary.secretsApplied) message += ` ${t("settings.syncSecretsSkipped")}`;
-    if (result.applySummary.secretsApplied) message += ` ${t("settings.syncSecretsApplied")}`;
-    return message;
+    return [message, ...notes].join(" ");
   });
+}
+
+// --- Cloud sync import (shared by WebDAV and snippet providers) ---
+const syncImportConfirmOpen = ref(false);
+const syncImportReview = ref<SyncImportReview | null>(null);
+let syncImportConfirmResolver: ((keepLocalSecrets: boolean | null) => void) | null = null;
+
+/** Shows the import review and resolves with the user's choice (null = cancel). */
+function confirmSyncImport(review: SyncImportReview): Promise<boolean | null> {
+  syncImportConfirmResolver?.(null);
+  syncImportReview.value = review;
+  syncImportConfirmOpen.value = true;
+  return new Promise((resolve) => {
+    syncImportConfirmResolver = resolve;
+  });
+}
+
+function settleSyncImportConfirmation(keepLocalSecrets: boolean | null) {
+  const resolve = syncImportConfirmResolver;
+  syncImportConfirmResolver = null;
+  syncImportConfirmOpen.value = false;
+  syncImportReview.value = null;
+  resolve?.(keepLocalSecrets);
+}
+
+watch(
+  () => settingsVisible.value,
+  (open) => {
+    if (!open) settleSyncImportConfirmation(null);
+  },
+);
+
+/**
+ * Refreshes every store an applied snapshot replaced and returns the extra
+ * status notes for the success message. Only call for `status === "applied"`.
+ */
+async function applyDownloadedSyncSnapshot(result: Pick<WebDavDownloadResult, "editorSettings" | "desktopSettings" | "applySummary">): Promise<string[]> {
+  // Editor settings arrive sanitized (update and background-image keys removed).
+  if (result.editorSettings && typeof result.editorSettings === "object") settingsStore.updateEditorSettings(result.editorSettings as any);
+  // Desktop settings are the local settings after import; path/exec settings are never imported.
+  if (result.desktopSettings) await settingsStore.updateDesktopSettings(result.desktopSettings);
+  await connectionStore.initFromDisk();
+  await savedSqlStore.initFromStorage();
+  // Snapshot downloads replace backend-managed tunnel profiles, so refresh
+  // the already-loaded Pinia store instead of leaving the UI stale.
+  await tunnelProfileStore.refresh();
+  await settingsStore.reloadAiConfigs();
+  const summary = result.applySummary;
+  const notes: string[] = [];
+  if (summary?.encryptedSecretsPresent && !summary.secretsApplied) notes.push(t("settings.syncSecretsSkipped"));
+  if (summary?.secretsApplied) notes.push(t("settings.syncSecretsApplied"));
+  const dropped = summary?.droppedSecretConnectionIds?.length ?? 0;
+  if (dropped > 0) notes.push(t("settings.syncImportDroppedCredentials", { count: dropped }));
+  return notes;
+}
+
+function syncErrorMessage(e: any): string {
+  const message = e?.message || String(e);
+  if (message.includes("HTTPS_REQUIRED")) return t("settings.syncHttpsRequired");
+  if (message.includes("SYNC_PASSPHRASE_TOO_SHORT") || message.includes("SNIPPET_PASSPHRASE_TOO_SHORT")) return t("settings.syncPassphraseTooShort", { min: SYNC_PASSPHRASE_MIN_LENGTH });
+  return message;
 }
 
 function currentWebDavConfig(): WebDavConfig {
@@ -4223,7 +4308,7 @@ async function runWebDavAction(kind: "test" | "upload" | "download", action: () 
     await applyWebDavSyncSecretsPreference();
     setWebDavResult(await action());
   } catch (e: any) {
-    setWebDavResult(e?.message || String(e), true);
+    setWebDavResult(syncErrorMessage(e), true);
   } finally {
     webdavBusy.value = "";
   }
@@ -4274,6 +4359,12 @@ async function applyWebDavSyncSecretsPreference() {
     await saveWebdavSyncSecretsPreference(false);
     return;
   }
+  // A short passphrase may still decrypt an existing snapshot, so it is used
+  // for this download only and never saved as the new sync passphrase.
+  if (isSyncPassphraseTooShort(passphrase)) {
+    await saveWebdavSyncSecretsPreference(true);
+    return;
+  }
   await saveWebdavSyncSecretsPreference(true, passphrase || undefined);
   if (passphrase) {
     webdavHasSavedSecretsPassphrase.value = true;
@@ -4299,6 +4390,10 @@ async function testWebDav() {
 }
 
 async function uploadWebDavSnapshot() {
+  if (webdavSecretsPassphraseTooShort.value) {
+    setWebDavResult(t("settings.syncPassphraseTooShort", { min: SYNC_PASSPHRASE_MIN_LENGTH }), true);
+    return;
+  }
   await runWebDavAction("upload", async () => {
     const summary = await webdavSyncUpload(currentWebDavConfig(), settingsStore.editorSettings, webdavSyncSecrets.value ? webdavSecretsPassphrase.value : undefined, webdavSyncSecrets.value);
     return t("settings.syncUploadSuccess", {
@@ -4311,27 +4406,17 @@ async function uploadWebDavSnapshot() {
 async function downloadWebDavSnapshot() {
   if (!window.confirm(t("settings.syncDownloadConfirm"))) return;
   await runWebDavAction("download", async () => {
-    const result = await webdavSyncDownload(currentWebDavConfig(), webdavSyncSecrets.value ? webdavSecretsPassphrase.value : undefined, webdavSyncSecrets.value);
-    if (result.editorSettings && typeof result.editorSettings === "object") {
-      settingsStore.updateEditorSettings(result.editorSettings as any);
-    }
-    await settingsStore.updateDesktopSettings(result.desktopSettings);
-    await connectionStore.initFromDisk();
-    await savedSqlStore.initFromStorage();
-    // Keep the shared tunnel profile UI consistent with the downloaded snapshot.
-    await tunnelProfileStore.refresh();
-    await settingsStore.reloadAiConfigs();
+    const config = currentWebDavConfig();
+    const restoreSecrets = webdavSyncSecrets.value;
+    const secretsPassphrase = restoreSecrets ? webdavSecretsPassphrase.value : undefined;
+    const result = await runConfirmedSyncDownload((confirmation) => webdavSyncDownload(config, secretsPassphrase, restoreSecrets, confirmation), confirmSyncImport);
+    if (!result) return t("settings.syncImportCancelled");
+    const notes = await applyDownloadedSyncSnapshot(result);
     const message = t("settings.syncDownloadSuccess", {
       bytes: result.summary.bytes,
       path: result.summary.remotePath,
     });
-    if (result.applySummary.encryptedSecretsPresent && !result.applySummary.secretsApplied) {
-      return `${message} ${t("settings.syncSecretsSkipped")}`;
-    }
-    if (result.applySummary.secretsApplied) {
-      return `${message} ${t("settings.syncSecretsApplied")}`;
-    }
-    return message;
+    return [message, ...notes].join(" ");
   });
 }
 
@@ -4565,6 +4650,14 @@ async function changePassword() {
       confirmNewPassword.value = "";
     } else if (res.status === 401) {
       passwordMessage.value = t("auth.oldPasswordWrong");
+      passwordError.value = true;
+    } else if (res.status === 409) {
+      // DBX_PASSWORD overrides the stored password on every start.
+      passwordMessage.value = t("auth.passwordManagedByEnv");
+      passwordError.value = true;
+    } else if (res.status === 429) {
+      const body = await res.json().catch(() => null);
+      passwordMessage.value = typeof body?.error === "string" ? translateBackendError(t, body.error) || body.error : t("auth.changePasswordFailed");
       passwordError.value = true;
     } else {
       passwordMessage.value = t("auth.changePasswordFailed");
@@ -4893,6 +4986,23 @@ const aiEditCodeBuddyCliPath = ref("");
 const aiEditCodeBuddyCliEnvRows = ref<AiEnvRow[]>([]);
 const aiEditQoderCliPath = ref("");
 const aiEditQoderCliEnvRows = ref<AiEnvRow[]>([]);
+// Secrets of an existing config arrive blank; these track which ones the backend
+// stores (left blank = keep) and which the user explicitly asked to delete.
+const aiEditSavedSecrets = ref<string[]>([]);
+const aiEditClearedSecrets = ref<string[]>([]);
+
+function aiIsSecretKept(path: string): boolean {
+  return aiEditSavedSecrets.value.includes(path) && !aiEditClearedSecrets.value.includes(path);
+}
+
+function clearAiSavedSecret(path: string) {
+  if (!aiEditSavedSecrets.value.includes(path) || aiEditClearedSecrets.value.includes(path)) return;
+  aiEditClearedSecrets.value = [...aiEditClearedSecrets.value, path];
+}
+
+const aiEditHasSavedApiKey = computed(() => aiIsSecretKept(AI_API_KEY_SECRET));
+const aiEditHasSavedProxyUrl = computed(() => aiIsSecretKept(AI_PROXY_URL_SECRET));
+const aiEditHasApiKey = computed(() => !!aiEditApiKey.value.trim() || aiEditHasSavedApiKey.value);
 
 const aiAnthropicMessagesMode = computed(() => aiEditApiStyle.value === "anthropic-messages");
 const selectedAiProviderPreset = computed(() => getAiProviderPresetOption(aiEditProviderPresetId.value));
@@ -4986,6 +5096,23 @@ const aiEditCliPath = computed({
     }
   },
 });
+const aiEditCliEnvField = computed<AiCliEnvField>(() => {
+  if (aiIsClaudeCodeCli.value) return "claudeCodeCliEnv";
+  if (aiIsPiAgentCli.value) return "piAgentCliEnv";
+  if (aiIsOpenCodeCli.value) return "opencodeCliEnv";
+  if (aiIsCursorCli.value) return "cursorCliEnv";
+  if (aiIsGrokCli.value) return "grokCliEnv";
+  if (aiIsCodeBuddyCli.value) return "codebuddyCliEnv";
+  if (aiIsQoderCli.value) return "qoderCliEnv";
+  return AI_CLI_ENV_FIELDS[0];
+});
+/** A header/env row whose value is blank but whose stored secret is kept on save. */
+function aiHeaderRowUsesSavedValue(row: AiHeaderRow): boolean {
+  return !row.value && !!row.name.trim() && aiIsSecretKept(aiHeaderSecretPath(row.name));
+}
+function aiEnvRowUsesSavedValue(row: AiEnvRow): boolean {
+  return !row.value && !!row.key.trim() && aiIsSecretKept(aiEnvSecretPath(aiEditCliEnvField.value, row.key));
+}
 const aiEditCliEnvRows = computed(() => {
   if (aiIsClaudeCodeCli.value) return aiEditClaudeCodeCliEnvRows.value;
   if (aiIsPiAgentCli.value) return aiEditPiAgentCliEnvRows.value;
@@ -5005,6 +5132,7 @@ const aiUsesCompatibleAnthropicApi = computed(() => aiEditProvider.value === "an
 const aiSupportsAuthMethod = computed(() => aiUsesConfigurableAnthropicAuth.value);
 const aiCredentialLabel = computed(() => (aiSupportsAuthMethod.value && aiEditAuthMethod.value === "bearer" ? "Auth Token" : "API Key"));
 const aiCredentialPlaceholder = computed(() => {
+  if (aiEditHasSavedApiKey.value) return t("ai.savedSecretPlaceholder");
   if (!aiRequiresApiKey.value) return "Optional";
   if (aiSupportsAuthMethod.value && aiEditAuthMethod.value === "bearer") return "ANTHROPIC_AUTH_TOKEN";
   return "";
@@ -5205,6 +5333,7 @@ function aiSelectProvider(presetId: string) {
   aiEditProviderPresetId.value = presetId;
   aiEditProvider.value = provider;
   aiEditApiKey.value = "";
+  clearAiSavedSecret(AI_API_KEY_SECRET);
   aiEditAuthMethod.value = preset.authMethod;
   aiEditEndpoint.value = getAiProviderPresetDefaultEndpoint(preset, locale.value);
   aiEditModel.value = preset.group === "partner" ? preset.model : "";
@@ -5227,12 +5356,21 @@ function aiSelectApiStyle(style: AiApiStyle) {
 function aiEnterListMode() {
   aiConfigListMode.value = "list";
   aiEditConfigId.value = null;
+  // Do not keep typed secrets around once the editor closes; the backend owns them after save.
+  aiEditApiKey.value = "";
+  aiEditProxyUrl.value = "";
+  aiEditCustomHeaderRows.value = [];
+  for (const rows of [aiEditCodexCliEnvRows, aiEditClaudeCodeCliEnvRows, aiEditPiAgentCliEnvRows, aiEditOpenCodeCliEnvRows, aiEditCursorCliEnvRows, aiEditGrokCliEnvRows, aiEditCodeBuddyCliEnvRows, aiEditQoderCliEnvRows]) rows.value = [];
+  aiEditSavedSecrets.value = [];
+  aiEditClearedSecrets.value = [];
 }
 
 function aiEnterEditMode(configId?: string) {
   syncAiEditState();
   aiConfigListMode.value = "edit";
   aiEditConfigId.value = configId || null;
+  aiEditSavedSecrets.value = [];
+  aiEditClearedSecrets.value = [];
 
   if (configId) {
     const config = settingsStore.aiConfigs.find((c) => c.id === configId);
@@ -5240,6 +5378,8 @@ function aiEnterEditMode(configId?: string) {
       aiEditConfigName.value = config.name;
       aiEditProvider.value = config.provider;
       aiEditProviderPresetId.value = getAiProviderPresetId(config.provider, config.endpoint);
+      aiEditSavedSecrets.value = [...(config.savedSecrets ?? [])];
+      // Loaded secrets are blank; typing a value replaces the stored one.
       aiEditApiKey.value = config.apiKey;
       aiEditAuthMethod.value = config.authMethod;
       aiEditEndpoint.value = config.endpoint;
@@ -5370,10 +5510,13 @@ async function aiSaveConfig() {
   }
 
   const editConfig = currentAiEditConfig();
+  // Blank secrets keep the stored values; only explicit clears are sent for deletion.
+  const clearedSecrets = aiEditConfigId.value ? effectiveAiClearedSecrets(editConfig, aiEditClearedSecrets.value, aiEditSavedSecrets.value) : [];
   const config: AiConfigItem = {
     id: aiEditConfigId.value || generateId(),
     name: aiEditConfigName.value,
     ...editConfig,
+    ...(clearedSecrets.length ? { clearedSecrets } : {}),
   };
 
   try {
@@ -5414,7 +5557,7 @@ async function aiSetDefaultConfig(id: string) {
 }
 
 async function aiTestConn() {
-  if ((aiRequiresApiKey.value && !aiEditApiKey.value.trim()) || (!aiIsCliProvider.value && !aiEditEndpoint.value.trim())) return;
+  if ((aiRequiresApiKey.value && !aiEditHasApiKey.value) || (!aiIsCliProvider.value && !aiEditEndpoint.value.trim())) return;
   if (aiHeadersValidationError.value) {
     aiTestResult.value = "error";
     aiTestError.value = aiHeadersValidationError.value;
@@ -5433,7 +5576,8 @@ async function aiTestConn() {
   const requestId = ++aiTestRequestId;
   const config = currentAiEditConfig();
   try {
-    const result = await aiTestConnection(config);
+    // Editing an existing item: the backend fills secrets left blank from the stored config.
+    const result = await aiTestConnection(config, aiEditConfigId.value || undefined);
     if (requestId !== aiTestRequestId || !isAiConnectionTestConfigCurrent(config, currentAiEditConfig())) return;
     aiTestLatency.value = result.latencyMs ?? null;
     aiTestResult.value = "success";
@@ -8682,6 +8826,7 @@ LIMIT 100;</pre
                     <div class="space-y-2 md:col-span-2">
                       <Label for="webdav-endpoint">{{ t("settings.syncEndpoint") }}</Label>
                       <Input id="webdav-endpoint" v-model="webdavEndpoint" autocomplete="off" placeholder="https://example.com/remote.php/dav/files/user/" />
+                      <p v-if="webdavEndpointInsecure" data-webdav-https-required class="text-xs text-destructive">{{ t("settings.syncHttpsRequired") }}</p>
                     </div>
                     <div class="space-y-2">
                       <Label for="webdav-username">{{ t("settings.syncUsername") }}</Label>
@@ -8755,7 +8900,7 @@ LIMIT 100;</pre
                       <Download v-else class="mr-1 h-3 w-3" />
                       {{ t("settings.syncDownload") }}
                     </Button>
-                    <Button size="sm" :disabled="!webdavReady" @click="uploadWebDavSnapshot">
+                    <Button size="sm" :disabled="!webdavUploadReady" @click="uploadWebDavSnapshot">
                       <Loader2 v-if="webdavBusy === 'upload'" class="mr-1 h-3 w-3 animate-spin" />
                       <Upload v-else class="mr-1 h-3 w-3" />
                       {{ t("settings.syncUpload") }}
@@ -8796,6 +8941,7 @@ LIMIT 100;</pre
                       <Label for="gitlab-instance-url">{{ t("settings.syncGitLabInstance") }}</Label>
                       <Input id="gitlab-instance-url" v-model="snippetInstanceUrl" type="url" autocomplete="url" :disabled="!!snippetBusy" placeholder="https://gitlab.example.com" @blur="commitSnippetInstance" @keydown.enter="commitSnippetInstance" />
                       <p v-if="snippetInstanceError" class="text-xs text-destructive">{{ snippetInstanceError }}</p>
+                      <p v-else-if="snippetInstanceInsecure" data-gitlab-https-required class="text-xs text-destructive">{{ t("settings.syncHttpsRequired") }}</p>
                       <p v-if="activeSnippetInstanceUrl.startsWith('http://')" class="text-xs text-destructive">{{ t("settings.syncGitLabHttpWarning") }}</p>
                     </div>
                     <div class="space-y-2">
@@ -8832,6 +8978,7 @@ LIMIT 100;</pre
                     <div class="space-y-2 md:col-span-2">
                       <Label for="snippet-sync-passphrase">{{ t("settings.syncSnippetPassphrase") }}</Label>
                       <PasswordInput id="snippet-sync-passphrase" v-model="snippetPassphrase" autocomplete="new-password" />
+                      <p v-if="snippetPassphraseTooShortForNew" class="text-xs text-destructive">{{ t("settings.syncPassphraseTooShort", { min: SYNC_PASSPHRASE_MIN_LENGTH }) }}</p>
                       <p class="text-xs text-muted-foreground">
                         {{ t("settings.syncSnippetPassphraseDescription") }}
                       </p>
@@ -8849,6 +8996,7 @@ LIMIT 100;</pre
                     <div v-if="snippetIncludeSecrets || snippetRestoreSecrets || legacySnippetId" class="space-y-2 md:col-span-2">
                       <Label for="snippet-sync-secrets-passphrase">{{ t("settings.syncSecretsPassphrase") }}</Label>
                       <PasswordInput id="snippet-sync-secrets-passphrase" v-model="snippetSecretsPassphrase" autocomplete="new-password" />
+                      <p v-if="snippetSecretsPassphraseTooShort" class="text-xs text-destructive">{{ t("settings.syncPassphraseTooShort", { min: SYNC_PASSPHRASE_MIN_LENGTH }) }}</p>
                       <p class="text-xs text-muted-foreground">
                         {{ t("settings.syncSecretsPassphraseDescription") }}
                       </p>
@@ -8920,6 +9068,7 @@ LIMIT 100;</pre
                       <X class="size-3.5" />
                     </Button>
                   </div>
+                  <p v-if="webdavSecretsPassphraseTooShort" data-sync-passphrase-too-short class="text-xs text-destructive">{{ t("settings.syncPassphraseTooShortExisting", { min: SYNC_PASSPHRASE_MIN_LENGTH }) }}</p>
                   <p class="text-xs text-muted-foreground">
                     {{ t("settings.syncSecretsPassphraseDescription") }}
                   </p>
@@ -9386,6 +9535,19 @@ LIMIT 100;</pre
                   <Label class="text-right text-xs">{{ aiCredentialLabel }}</Label>
                   <div class="col-span-2 flex min-w-0 items-center gap-2">
                     <PasswordInput v-model="aiEditApiKey" autocomplete="off" class="min-w-0 flex-1" inputClass="h-8 text-xs" :placeholder="aiCredentialPlaceholder" />
+                    <Button
+                      v-if="aiEditHasSavedApiKey && !aiEditApiKey"
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      data-ai-clear-saved-api-key
+                      class="h-8 w-8 shrink-0 text-muted-foreground hover:text-foreground"
+                      :title="t('ai.clearSavedSecret')"
+                      :aria-label="t('ai.clearSavedSecret')"
+                      @click="clearAiSavedSecret(AI_API_KEY_SECRET)"
+                    >
+                      <X class="h-3.5 w-3.5" />
+                    </Button>
                     <Button v-if="selectedAiPartnerPreset" type="button" variant="outline" size="sm" class="h-8 shrink-0 gap-1.5 px-3 text-xs" :title="t('ai.getApiKey')" :aria-label="t('ai.getApiKey')" @click="openExternalUrl(selectedAiPartnerPreset.apiKeyUrl)">
                       {{ t("ai.getApiKey") }}
                       <ExternalLink class="h-3.5 w-3.5" />
@@ -9411,7 +9573,7 @@ LIMIT 100;</pre
                     <div class="space-y-1.5">
                       <div v-for="row in aiEditCustomHeaderRows" :key="row.id" class="grid grid-cols-[minmax(0,0.9fr)_minmax(0,1.3fr)_2rem] gap-2">
                         <Input v-model="row.name" autocomplete="off" class="h-8 font-mono text-xs" :placeholder="t('ai.customHeadersNamePlaceholder')" />
-                        <PasswordInput v-model="row.value" autocomplete="off" class="min-w-0" inputClass="h-8 font-mono text-xs" :placeholder="t('ai.customHeadersValuePlaceholder')" />
+                        <PasswordInput v-model="row.value" autocomplete="off" class="min-w-0" inputClass="h-8 font-mono text-xs" :placeholder="aiHeaderRowUsesSavedValue(row) ? t('ai.savedSecretPlaceholder') : t('ai.customHeadersValuePlaceholder')" />
                         <Button type="button" variant="ghost" size="icon" class="h-8 w-8" :title="t('common.remove')" :aria-label="t('common.remove')" @click="removeAiCustomHeaderRow(row.id)">
                           <X class="h-3.5 w-3.5" />
                         </Button>
@@ -9452,7 +9614,7 @@ LIMIT 100;</pre
                     <div class="space-y-1.5">
                       <div v-for="row in aiEditCliEnvRows" :key="row.id" class="grid grid-cols-[minmax(0,0.9fr)_minmax(0,1.3fr)_2rem] gap-2">
                         <Input v-model="row.key" autocomplete="off" class="h-8 font-mono text-xs" :placeholder="t('ai.cliEnvKeyPlaceholder')" />
-                        <Input v-model="row.value" autocomplete="off" class="h-8 font-mono text-xs" :placeholder="t('ai.cliEnvValuePlaceholder')" />
+                        <Input v-model="row.value" autocomplete="off" class="h-8 font-mono text-xs" :placeholder="aiEnvRowUsesSavedValue(row) ? t('ai.savedSecretPlaceholder') : t('ai.cliEnvValuePlaceholder')" />
                         <Button type="button" variant="ghost" size="icon" class="h-8 w-8" :title="t('common.remove')" :aria-label="t('common.remove')" @click="removeCliEnvRow(row.id)">
                           <X class="h-3.5 w-3.5" />
                         </Button>
@@ -9548,7 +9710,22 @@ LIMIT 100;</pre
                 <!-- Proxy URL -->
                 <div v-if="!aiIsCliProvider" class="grid grid-cols-3 items-center gap-3">
                   <Label class="text-right text-xs">{{ t("ai.proxyUrl") }}</Label>
-                  <Input v-model="aiEditProxyUrl" autocomplete="off" class="col-span-2" inputClass="h-8 text-xs" placeholder="socks5://127.0.0.1:7890" :disabled="!aiEditProxyEnabled" />
+                  <div class="col-span-2 flex min-w-0 items-center gap-2">
+                    <Input v-model="aiEditProxyUrl" autocomplete="off" class="min-w-0 flex-1" inputClass="h-8 text-xs" :placeholder="aiEditHasSavedProxyUrl ? t('ai.savedSecretPlaceholder') : 'socks5://127.0.0.1:7890'" :disabled="!aiEditProxyEnabled" />
+                    <Button
+                      v-if="aiEditHasSavedProxyUrl && !aiEditProxyUrl"
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      data-ai-clear-saved-proxy-url
+                      class="h-8 w-8 shrink-0 text-muted-foreground hover:text-foreground"
+                      :title="t('ai.clearSavedSecret')"
+                      :aria-label="t('ai.clearSavedSecret')"
+                      @click="clearAiSavedSecret(AI_PROXY_URL_SECRET)"
+                    >
+                      <X class="h-3.5 w-3.5" />
+                    </Button>
+                  </div>
                 </div>
 
                 <!-- Skip TLS Verify -->
@@ -9937,6 +10114,9 @@ LIMIT 100;</pre
                             </Button>
                           </div>
                           <p class="text-[11px] text-muted-foreground">{{ t("settings.mcpPermissionGlobalDefaultHint") }}</p>
+                          <p v-if="!settingsStore.mcpGlobalPolicy.configured && !mcpPolicyLoadError" data-mcp-policy-unconfigured-hint class="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-[11px] text-amber-700 dark:text-amber-300">
+                            {{ t("settings.mcpPolicyUnconfiguredReadOnlyHint") }}
+                          </p>
                           <div class="space-y-2 border-t border-border/60 pt-3">
                             <div>
                               <p class="text-xs font-medium">{{ t("settings.mcpCapabilityTitle") }}</p>
@@ -10592,7 +10772,7 @@ LIMIT 100;</pre
             </template>
             <template v-else>
               <div class="flex min-w-0 flex-1 items-center gap-2">
-                <Button size="sm" variant="outline" :disabled="aiTesting || !!aiCliValidationError || !!aiHeadersValidationError || (aiRequiresApiKey && !aiEditApiKey?.trim()) || (!aiIsCliProvider && !aiEditEndpoint?.trim())" @click="aiTestConn">
+                <Button size="sm" variant="outline" :disabled="aiTesting || !!aiCliValidationError || !!aiHeadersValidationError || (aiRequiresApiKey && !aiEditHasApiKey) || (!aiIsCliProvider && !aiEditEndpoint?.trim())" @click="aiTestConn">
                   <Loader2 v-if="aiTesting" class="h-3 w-3 animate-spin mr-1" />
                   {{ t("connection.test") }}
                 </Button>
@@ -10884,6 +11064,7 @@ LIMIT 100;</pre
 
     <!-- AI Config Delete Confirmation -->
     <DangerConfirmDialog v-model:open="aiDeleteConfirmOpen" :title="t('ai.deleteConfigTitle')" :message="t('ai.deleteConfigConfirm')" :confirm-label="t('common.delete')" @confirm="aiConfirmDeleteConfig" />
+    <SyncImportConfirmDialog :open="syncImportConfirmOpen" :review="syncImportReview" @confirm="settleSyncImportConfirmation" @cancel="settleSyncImportConfirmation(null)" />
     <DangerConfirmDialog
       v-model:open="templateDeleteConfirmOpen"
       :title="t('ai.promptTemplateDeleteTitle')"

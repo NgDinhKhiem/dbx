@@ -267,11 +267,40 @@ pub async fn remove_plugin_trusted_key(
     .map_err(AppError::bad_request)
 }
 
+/// `DBX_ALLOW_UNSIGNED_PLUGINS=1` lets Web sessions install unsigned plugin
+/// packages (`?allow_unsigned=true`); it is off by default and never allowed in
+/// demo mode, because an unsigned plugin runs native code on the server.
+pub fn unsigned_plugins_allowed_from_env_value(value: Option<&str>) -> bool {
+    value
+        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+fn ensure_unsigned_install_allowed(allow_unsigned: bool, demo_mode: bool, env_allows: bool) -> Result<(), AppError> {
+    if !allow_unsigned {
+        return Ok(());
+    }
+    if demo_mode {
+        return Err(AppError::forbidden("Installing unsigned plugins is disabled in demo mode"));
+    }
+    if !env_allows {
+        return Err(AppError::forbidden(
+            "Installing unsigned plugins is disabled on this server. Set DBX_ALLOW_UNSIGNED_PLUGINS=1 to allow it.",
+        ));
+    }
+    Ok(())
+}
+
 pub async fn install_plugin(
     State(state): State<Arc<WebState>>,
     Query(query): Query<PluginInstallQuery>,
     mut multipart: Multipart,
 ) -> Result<Json<PluginInstallResponse>, AppError> {
+    ensure_unsigned_install_allowed(
+        query.allow_unsigned,
+        state.demo_mode,
+        unsigned_plugins_allowed_from_env_value(std::env::var("DBX_ALLOW_UNSIGNED_PLUGINS").ok().as_deref()),
+    )?;
     let mut package = None;
     while let Some(field) = multipart.next_field().await.map_err(|error| AppError::bad_request(error.to_string()))? {
         if field.name() != Some("file") {
@@ -642,5 +671,25 @@ async fn stop_external_driver_pools(state: &Arc<WebState>, plugin: &InstalledPlu
     for driver in &plugin.manifest.drivers {
         let driver_id = driver.database_type.as_deref().unwrap_or(&driver.id);
         state.app.remove_external_driver_pools(driver_id).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ensure_unsigned_install_allowed, unsigned_plugins_allowed_from_env_value};
+
+    #[test]
+    fn unsigned_plugin_installs_need_the_env_opt_in_and_never_run_in_demo_mode() {
+        assert!(ensure_unsigned_install_allowed(false, true, false).is_ok());
+        assert!(ensure_unsigned_install_allowed(true, false, false).is_err());
+        assert!(ensure_unsigned_install_allowed(true, false, true).is_ok());
+        assert!(ensure_unsigned_install_allowed(true, true, true).is_err());
+
+        for value in ["1", "true", " YES ", "on"] {
+            assert!(unsigned_plugins_allowed_from_env_value(Some(value)), "{value}");
+        }
+        for value in [None, Some(""), Some("0"), Some("false")] {
+            assert!(!unsigned_plugins_allowed_from_env_value(value), "{value:?}");
+        }
     }
 }

@@ -980,6 +980,9 @@ impl DbxMcpServer {
                 return tool_error("SQL_BLOCKED", reason);
             }
 
+            if let Err(error) = claim_confirmed_write_sql(&request.sql, refreshed.connection.db_type) {
+                return error;
+            }
             let history_sql = request.sql.clone();
             let started_at = Instant::now();
             return match lease.query(request.sql, Some(max_rows as usize)).await {
@@ -1037,6 +1040,9 @@ impl DbxMcpServer {
         // being clobbered when set by the model.
         if let Some(secs) = resolved.policy.query_timeout_secs {
             arguments["timeout_secs"] = json!(secs);
+        }
+        if let Err(error) = claim_confirmed_write_sql(&history_sql, connection.db_type) {
+            return error;
         }
         let started_at = Instant::now();
         let result =
@@ -1271,6 +1277,9 @@ impl DbxMcpServer {
                 }
             }
 
+            if let Err(error) = claim_confirmed_write_sql(sql, refreshed.connection.db_type) {
+                return error;
+            }
             let started_at = Instant::now();
             let executions = lease
                 .batch(
@@ -1335,6 +1344,9 @@ impl DbxMcpServer {
         // would open physical connections that are closed unused, so only
         // auto-commit batches get an ephemeral pinned pool — it keeps temp
         // tables and SET state alive for every statement in the script.
+        if let Err(error) = claim_confirmed_write_sql(sql, connection.db_type) {
+            return error;
+        }
         let ephemeral_client_session_id =
             (!transactional && session.is_none()).then(|| format!("mcp-batch-{}", Uuid::new_v4()));
         let client_session_id = session
@@ -2201,6 +2213,11 @@ impl DbxMcpServer {
                 return error;
             }
         }
+        if connection.db_type != DatabaseType::MongoDb {
+            if let Err(error) = claim_confirmed_write_sql(&request.sql, connection.db_type) {
+                return error;
+            }
+        }
         match self
             .backend
             .bridge_request(
@@ -2830,8 +2847,95 @@ fn mcp_permissions(
     dbx_core::agent_tools::AgentSqlPermissions {
         allow_writes: !policy.read_only && !connection.read_only,
         allow_dangerous: !policy.read_only && !connection.read_only && policy.allow_dangerous_sql,
-        confirmed_write_sql: mcp_confirmed_write_sql_from_env(),
+        // A consumed binding stays in place as a narrowing constraint; `validate_sql_policy`
+        // rejects every further write while it is consumed.
+        confirmed_write_sql: match mcp_confirmed_write_binding() {
+            ConfirmedWriteBinding::Unbound => None,
+            ConfirmedWriteBinding::Pending(sql) | ConfirmedWriteBinding::Consumed(sql) => Some(sql),
+        },
     }
+}
+
+/// Single-use state of the CLI agent's confirmed write SQL (`DBX_MCP_CONFIRMED_WRITE_SQL`).
+///
+/// The variable is set once when the CLI agent spawns this process, so without tracking it
+/// would authorize the confirmed statement on every call for the life of the process (a
+/// confirmed `INSERT` could be replayed). The first execution consumes it; afterwards every
+/// write is rejected until the user confirms again (which starts a new process).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConfirmedWriteBinding {
+    /// No confirmation was handed over (desktop-embedded MCP).
+    Unbound,
+    /// Confirmed and not executed yet.
+    Pending(String),
+    /// Already executed once in this process.
+    Consumed(String),
+}
+
+/// The confirmed SQL values already consumed by this process.
+static CONSUMED_CONFIRMED_WRITE_SQL: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn consumed_confirmed_write_sql() -> std::sync::MutexGuard<'static, Vec<String>> {
+    CONSUMED_CONFIRMED_WRITE_SQL.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn mcp_confirmed_write_binding() -> ConfirmedWriteBinding {
+    confirmed_write_binding(&consumed_confirmed_write_sql(), mcp_confirmed_write_sql_from_env())
+}
+
+fn confirmed_write_binding(consumed: &[String], confirmed: Option<String>) -> ConfirmedWriteBinding {
+    match confirmed {
+        None => ConfirmedWriteBinding::Unbound,
+        Some(sql) if consumed.contains(&sql) => ConfirmedWriteBinding::Consumed(sql),
+        Some(sql) => ConfirmedWriteBinding::Pending(sql),
+    }
+}
+
+/// Claim the confirmed write binding for `sql` right before it is sent to the database.
+///
+/// A script that contains a write and is exactly the pending confirmed SQL consumes the binding
+/// atomically (so two concurrent calls cannot both execute it); a write after consumption is
+/// rejected. Reads and processes without a binding are unaffected.
+#[allow(clippy::result_large_err)]
+fn claim_confirmed_write_sql(
+    sql: &str,
+    db_type: dbx_core::models::connection::DatabaseType,
+) -> Result<(), CallToolResult> {
+    let confirmed = mcp_confirmed_write_sql_from_env();
+    claim_confirmed_write_sql_in(&mut consumed_confirmed_write_sql(), confirmed, sql, db_type)
+}
+
+#[allow(clippy::result_large_err)]
+fn claim_confirmed_write_sql_in(
+    consumed: &mut Vec<String>,
+    confirmed: Option<String>,
+    sql: &str,
+    db_type: dbx_core::models::connection::DatabaseType,
+) -> Result<(), CallToolResult> {
+    let Some(confirmed) = confirmed else {
+        return Ok(());
+    };
+    let is_write = match classify_sql_risk_for_database(sql, db_type) {
+        Ok(risk) => risk != SqlRisk::ReadOnly || is_write_sql_for_database(sql, db_type),
+        Err(_) => true,
+    };
+    if !is_write {
+        return Ok(());
+    }
+    if consumed.contains(&confirmed) {
+        return Err(confirmed_write_already_used_error());
+    }
+    if normalize_sql_for_confirmation(sql) == normalize_sql_for_confirmation(&confirmed) {
+        consumed.push(confirmed);
+    }
+    Ok(())
+}
+
+fn confirmed_write_already_used_error() -> CallToolResult {
+    tool_error(
+        "SQL_BLOCKED",
+        "The user-confirmed write SQL has already been executed once in this MCP session. Ask the user to confirm it again before re-running it.",
+    )
 }
 
 fn transaction_connection_supported(connection: &dbx_core::models::connection::ConnectionConfig) -> bool {
@@ -3124,6 +3228,25 @@ fn validate_sql_policy(
             "CONNECTION_READ_ONLY",
             format!("Connection \"{}\" has read-only protection enabled. SQL write blocked.", connection.name),
         ));
+    }
+    // A read is only accepted under read-only protection when DBX can prove it has no side
+    // effects: known side-effecting functions are always rejected, and on MySQL/PostgreSQL
+    // families any function outside the reviewed built-in allowlist (a UDF can write).
+    if (policy.read_only || connection.read_only) && !is_write {
+        if let Some(reason) = dbx_core::sql_risk::strict_read_only_violation_for_database(sql, connection.db_type) {
+            let (code, scope) = if policy.read_only {
+                ("MCP_READ_ONLY", format!("MCP execution permission for database \"{database}\" is read-only."))
+            } else {
+                (
+                    "CONNECTION_READ_ONLY",
+                    format!("Connection \"{}\" has read-only protection enabled.", connection.name),
+                )
+            };
+            return Err(tool_error(code, format!("{scope} {reason} SQL blocked.")));
+        }
+    }
+    if is_write && matches!(mcp_confirmed_write_binding(), ConfirmedWriteBinding::Consumed(_)) {
+        return Err(confirmed_write_already_used_error());
     }
     let high_risk = risk == SqlRisk::Ddl || is_dangerous_sql_for_database(sql, connection.db_type);
     if high_risk && !policy.allow_dangerous_sql {
@@ -6152,6 +6275,72 @@ mod tests {
         let results = structured["results"].as_array().expect("results must be an array");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["statement_index"], 0);
+    }
+
+    #[test]
+    fn confirmed_write_sql_is_single_use() {
+        // Exercised on a local store (not the env var) so it cannot race other tests.
+        let postgres = dbx_core::models::connection::DatabaseType::Postgres;
+        let confirmed = || Some("INSERT INTO t VALUES (1)".to_string());
+        let mut consumed = Vec::new();
+
+        assert_eq!(confirmed_write_binding(&consumed, None), ConfirmedWriteBinding::Unbound);
+        assert_eq!(
+            confirmed_write_binding(&consumed, confirmed()),
+            ConfirmedWriteBinding::Pending("INSERT INTO t VALUES (1)".to_string())
+        );
+        // Reads never consume or get blocked by the binding.
+        assert!(claim_confirmed_write_sql_in(&mut consumed, confirmed(), "SELECT 1", postgres).is_ok());
+        assert!(consumed.is_empty());
+        // The first execution of the confirmed statement consumes it...
+        let first = " INSERT INTO t VALUES (1) ";
+        assert!(claim_confirmed_write_sql_in(&mut consumed, confirmed(), first, postgres).is_ok());
+        assert_eq!(
+            confirmed_write_binding(&consumed, confirmed()),
+            ConfirmedWriteBinding::Consumed("INSERT INTO t VALUES (1)".to_string())
+        );
+        // ...and a replay (or any other write) is rejected afterwards.
+        let replay = claim_confirmed_write_sql_in(&mut consumed, confirmed(), "INSERT INTO t VALUES (1)", postgres)
+            .expect_err("replayed confirmed write must be blocked");
+        assert!(result_text(&replay).contains("already been executed"));
+        assert!(claim_confirmed_write_sql_in(&mut consumed, confirmed(), "DELETE FROM t", postgres).is_err());
+        assert!(claim_confirmed_write_sql_in(&mut consumed, confirmed(), "SELECT 1", postgres).is_ok());
+        // Without a binding nothing is tracked.
+        assert!(claim_confirmed_write_sql_in(&mut Vec::new(), None, "INSERT INTO t VALUES (1)", postgres).is_ok());
+    }
+
+    #[test]
+    fn read_only_policies_reject_side_effect_reads() {
+        let connection = connection("pg", "pg", "postgres", "app");
+        let read_only_policy = McpGlobalPolicy {
+            read_only: true,
+            allow_dangerous_sql: false,
+            allowed_connection_ids: None,
+            ..Default::default()
+        };
+        for sql in [
+            "SELECT pg_terminate_backend(42)",
+            "SELECT * FROM (SELECT dblink_exec('host=x', 'DROP TABLE t')) AS x",
+            "SELECT audit_touch(id) FROM users",
+        ] {
+            let error = validate_sql_policy(&connection, &read_only_policy, "app", sql, false).unwrap_err();
+            assert!(result_text(&error).contains("MCP_READ_ONLY"), "{sql}");
+        }
+        let counted = "SELECT count(*) FROM users";
+        assert!(validate_sql_policy(&connection, &read_only_policy, "app", counted, false).is_ok());
+
+        let read_only_connection = ConnectionConfig { read_only: true, ..connection.clone() };
+        let writable_policy = McpGlobalPolicy {
+            read_only: false,
+            allow_dangerous_sql: true,
+            allowed_connection_ids: None,
+            ..Default::default()
+        };
+        let udf = "SELECT audit_touch(1)";
+        let error = validate_sql_policy(&read_only_connection, &writable_policy, "app", udf, false).unwrap_err();
+        assert!(result_text(&error).contains("CONNECTION_READ_ONLY"));
+        // Without read-only protection an unknown function is a normal read.
+        assert!(validate_sql_policy(&connection, &writable_policy, "app", udf, false).is_ok());
     }
 
     #[tokio::test]

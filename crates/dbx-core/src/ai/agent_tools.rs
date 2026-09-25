@@ -9,7 +9,7 @@ use crate::connection::AppState;
 use crate::db::vector_driver;
 use crate::models::connection::DatabaseType;
 use crate::models::connection::{ConnectionConfig, SPANNER_MIN_QUERY_TIMEOUT_SECS};
-use crate::query::QueryExecutionOptions;
+use crate::query::{QueryExecutionMode, QueryExecutionOptions};
 use crate::query_execution_sql::{build_explain_sql, supports_explain_plan, supports_sql_query, ExplainSqlOptions};
 use crate::sql_dialect::{build_table_data_select_sql, TableDataSelectSqlOptions};
 use crate::sql_risk::SqlRisk;
@@ -223,6 +223,31 @@ pub fn verify_confirmed_target(
     (allow_write_sql, confirmed_write_sql)
 }
 
+/// Client session used for reads that DBX runs inside a database-enforced read-only transaction.
+/// A dedicated session keeps the `BEGIN READ ONLY … ROLLBACK` wrapper off the shared pool and
+/// away from any caller-owned session state.
+pub const AGENT_READ_ONLY_CLIENT_SESSION_ID: &str = "dbx:agent-read-only";
+
+/// Strict read-only context: the caller may not write at all (MCP read-only policy, read-only
+/// connection, an AI run without a confirmation), or it only holds a grant bound to one exact
+/// confirmed statement. Reads there must be provably side-effect free.
+pub fn strict_read_only_context(permissions: &AgentSqlPermissions) -> bool {
+    !permissions.allow_writes || permissions.confirmed_write_sql.is_some()
+}
+
+/// Reason a read-classified statement still needs a user confirmation in a strict context, or
+/// `None` when DBX can prove it read-only (see `sql_risk::strict_read_only_violation_for_database`).
+pub fn unproven_read_reason(sql: &str, db_type: DatabaseType) -> Option<String> {
+    crate::sql_risk::strict_read_only_violation_for_database(sql, db_type)
+}
+
+/// Whether a strict-context read can run inside a database-enforced read-only transaction.
+/// Only native PostgreSQL has an executor for it (`BEGIN READ ONLY`, always rolled back); it
+/// requires a single statement.
+fn uses_database_enforced_read_only_transaction(db_type: DatabaseType, sql: &str) -> bool {
+    db_type == DatabaseType::Postgres && crate::sql::split_sql_statements_for_database(sql, db_type).len() == 1
+}
+
 fn sql_risk_allowed(risk: SqlRisk, permissions: AgentSqlPermissions) -> bool {
     match risk {
         SqlRisk::ReadOnly => true,
@@ -244,7 +269,13 @@ pub fn write_requires_confirmation(
         return Ok(false);
     }
     let risk = crate::sql_risk::classify_sql_risk_for_database(sql, db_type)?;
-    Ok(matches!(risk, SqlRisk::Write | SqlRisk::Ddl))
+    Ok(match risk {
+        SqlRisk::Write | SqlRisk::Ddl => true,
+        // A read that calls functions DBX cannot vouch for (UDFs, side-effecting built-ins) is
+        // not auto-executed either; the user confirms it like a write.
+        SqlRisk::ReadOnly => unproven_read_reason(sql, db_type).is_some(),
+        SqlRisk::Transaction => false,
+    })
 }
 
 /// Snapshot the permissions for one execute_query call and consume an exact
@@ -261,6 +292,11 @@ pub(crate) fn take_sql_permissions_for_execution(
             sql_risk_allowed(risk, execution_permissions.clone())
                 && sql_matches_confirmed_write(sql, &execution_permissions.confirmed_write_sql)
                 && execution_permissions.confirmed_write_sql.is_some()
+        }
+        // A confirmed unproven read (see `write_requires_confirmation`) is single-use as well.
+        Ok(SqlRisk::ReadOnly) => {
+            execution_permissions.confirmed_write_sql.is_some()
+                && sql_matches_confirmed_write(sql, &execution_permissions.confirmed_write_sql)
         }
         _ => false,
     };
@@ -989,10 +1025,30 @@ async fn execute_execute_query(
         ));
     }
 
+    // In a strict read-only context a read must be provably side-effect free unless the user
+    // confirmed this exact statement (the keyword/AST classifier cannot see what a UDF does).
+    let strict_context = strict_read_only_context(&sql_permissions);
+    let confirmed_exact = sql_permissions.confirmed_write_sql.is_some()
+        && sql_matches_confirmed_write(sql, &sql_permissions.confirmed_write_sql);
+    if risk == SqlRisk::ReadOnly && strict_context && !confirmed_exact {
+        if let Some(reason) = unproven_read_reason(sql, *db_type) {
+            return Err(format!(
+                "Blocked: DBX cannot prove this query is read-only. {reason} Ask the user to confirm the query before executing it."
+            ));
+        }
+    }
+
     // Stateful callers (e.g. MCP sessions) pin the query to their dedicated
     // connection pool so USE/SET and other session state is preserved.
     let client_session_id =
         tool_call.arguments.get("client_session_id").and_then(|v| v.as_str()).map(str::trim).filter(|v| !v.is_empty());
+    // Defense in depth for strict-context reads: where the engine supports it, run them in a
+    // database-enforced read-only transaction so a write hidden behind a function fails at the
+    // server. Caller-owned sessions are left alone (their open transaction must not be touched).
+    let read_only_transaction = risk == SqlRisk::ReadOnly
+        && strict_context
+        && client_session_id.is_none()
+        && uses_database_enforced_read_only_transaction(*db_type, sql);
 
     // Execute query using existing infrastructure. Timeout resolves as
     // per-call `timeout_secs` > connection effective timeout (see
@@ -1004,7 +1060,14 @@ async fn execute_execute_query(
             tool_call.arguments.get("timeout_secs").and_then(Value::as_u64),
             connection_config.as_ref(),
         )),
-        client_session_id: client_session_id.map(str::to_string),
+        client_session_id: client_session_id
+            .map(str::to_string)
+            .or_else(|| read_only_transaction.then(|| AGENT_READ_ONLY_CLIENT_SESSION_ID.to_string())),
+        execution_mode: if read_only_transaction {
+            QueryExecutionMode::PostgresReadOnlyTransaction
+        } else {
+            QueryExecutionMode::Standard
+        },
         ..Default::default()
     };
     let result = crate::query::execute_sql_statement_with_options(
@@ -1883,6 +1946,45 @@ for line in sys.stdin:
         assert!(
             !write_requires_confirmation("CREATE TABLE users (id INT)", DatabaseType::Postgres, &confirmed).unwrap()
         );
+    }
+
+    #[test]
+    fn unproven_reads_require_confirmation_before_auto_execution() {
+        let permissions = AgentSqlPermissions::default();
+        for (sql, db_type) in [
+            ("SELECT audit_touch(id) FROM users", DatabaseType::Postgres),
+            ("SELECT * FROM (SELECT pg_terminate_backend(42)) AS x", DatabaseType::Postgres),
+            ("SELECT my_udf(1)", DatabaseType::Mysql),
+            ("SELECT SLEEP(30)", DatabaseType::Mysql),
+        ] {
+            assert!(write_requires_confirmation(sql, db_type, &permissions).unwrap(), "{sql}");
+        }
+        assert!(!write_requires_confirmation("SELECT count(*) FROM users", DatabaseType::Postgres, &permissions)
+            .unwrap());
+
+        // Strict contexts: no write permission, or a grant bound to one exact statement.
+        assert!(strict_read_only_context(&AgentSqlPermissions::default()));
+        assert!(strict_read_only_context(&confirmed_write_sql_permissions(false, true, Some("SELECT f()".into()))));
+        assert!(!strict_read_only_context(&AgentSqlPermissions {
+            allow_writes: true,
+            allow_dangerous: false,
+            confirmed_write_sql: None,
+        }));
+
+        // A confirmed unproven read is consumed like a confirmed write.
+        let mut confirmed = confirmed_write_sql_permissions(false, true, Some("SELECT my_udf(1)".to_string()));
+        let granted = take_sql_permissions_for_execution("SELECT my_udf(1)", DatabaseType::Mysql, &mut confirmed);
+        assert_eq!(granted.confirmed_write_sql.as_deref(), Some("SELECT my_udf(1)"));
+        assert_eq!(confirmed.confirmed_write_sql, None);
+        assert!(!confirmed.allow_writes);
+    }
+
+    #[test]
+    fn database_enforced_read_only_transaction_is_limited_to_single_postgres_statements() {
+        assert!(uses_database_enforced_read_only_transaction(DatabaseType::Postgres, "SELECT 1"));
+        assert!(!uses_database_enforced_read_only_transaction(DatabaseType::Postgres, "SELECT 1; SELECT 2"));
+        assert!(!uses_database_enforced_read_only_transaction(DatabaseType::Mysql, "SELECT 1"));
+        assert!(!uses_database_enforced_read_only_transaction(DatabaseType::Kingbase, "SELECT 1"));
     }
 
     #[test]

@@ -1173,6 +1173,46 @@ pub fn build_xlsx_workbook_with_auto_filter(
     build_xlsx_workbook_multi_with_auto_filter(std::slice::from_ref(data), auto_filter, date_time_format)
 }
 
+/// Write an XLSX workbook straight to `path` through a buffered file writer,
+/// so the zip archive is never materialized in memory next to the row data.
+pub fn write_xlsx_workbook_file_with_auto_filter(
+    path: impl AsRef<std::path::Path>,
+    data: &XlsxWorksheetData,
+    auto_filter: bool,
+    date_time_format: Option<&str>,
+) -> Result<(), String> {
+    write_xlsx_workbook_multi_file_with_auto_filter(path, std::slice::from_ref(data), auto_filter, date_time_format)
+}
+
+/// Multi-sheet variant of [`write_xlsx_workbook_file_with_auto_filter`].
+pub fn write_xlsx_workbook_multi_file_with_auto_filter(
+    path: impl AsRef<std::path::Path>,
+    sheets: &[XlsxWorksheetData],
+    auto_filter: bool,
+    date_time_format: Option<&str>,
+) -> Result<(), String> {
+    let file = std::fs::File::create(path).map_err(|err| err.to_string())?;
+    let writer = write_xlsx_workbook_multi_with_auto_filter(
+        std::io::BufWriter::new(file),
+        sheets,
+        auto_filter,
+        date_time_format,
+    )?;
+    writer.into_inner().map_err(|err| err.error().to_string())?;
+    Ok(())
+}
+
+/// Write an XLSX workbook into any seekable writer and return the writer.
+pub fn write_xlsx_workbook_multi_with_auto_filter<W: Write + Seek>(
+    writer: W,
+    sheets: &[XlsxWorksheetData],
+    auto_filter: bool,
+    date_time_format: Option<&str>,
+) -> Result<W, String> {
+    let max_data_rows = XLSX_MAX_DATA_ROWS;
+    write_xlsx_workbook_multi_with_max_rows_and_auto_filter(writer, sheets, max_data_rows, auto_filter, date_time_format)
+}
+
 pub fn build_xlsx_workbook_multi_with_auto_filter(
     sheets: &[XlsxWorksheetData],
     auto_filter: bool,
@@ -1202,6 +1242,23 @@ fn build_xlsx_workbook_multi_with_max_rows_and_auto_filter(
     auto_filter: bool,
     date_time_format: Option<&str>,
 ) -> Result<Vec<u8>, String> {
+    let cursor = write_xlsx_workbook_multi_with_max_rows_and_auto_filter(
+        Cursor::new(Vec::<u8>::new()),
+        sheets,
+        max_data_rows_per_sheet,
+        auto_filter,
+        date_time_format,
+    )?;
+    Ok(cursor.into_inner())
+}
+
+fn write_xlsx_workbook_multi_with_max_rows_and_auto_filter<W: Write + Seek>(
+    writer: W,
+    sheets: &[XlsxWorksheetData],
+    max_data_rows_per_sheet: usize,
+    auto_filter: bool,
+    date_time_format: Option<&str>,
+) -> Result<W, String> {
     if sheets.is_empty() {
         return Err("At least one worksheet is required".to_string());
     }
@@ -1215,8 +1272,7 @@ fn build_xlsx_workbook_multi_with_max_rows_and_auto_filter(
         ("xl/styles.xml", styles_xml(date_time_format)),
     ];
 
-    let cursor = Cursor::new(Vec::<u8>::new());
-    let mut zip = zip::ZipWriter::new(cursor);
+    let mut zip = zip::ZipWriter::new(writer);
     let options = xlsx_zip_options();
 
     for (path, content) in files {
@@ -1228,8 +1284,7 @@ fn build_xlsx_workbook_multi_with_max_rows_and_auto_filter(
         write_worksheet_xml(&mut zip, segment, auto_filter, date_time_format)?;
     }
 
-    let output = zip.finish().map_err(|err| err.to_string())?;
-    Ok(output.into_inner())
+    zip.finish().map_err(|err| err.to_string())
 }
 
 #[cfg(test)]
@@ -1273,6 +1328,28 @@ mod tests {
         let mut content = String::new();
         entry.read_to_string(&mut content).expect("read zip entry");
         content
+    }
+
+    #[test]
+    fn writes_workbook_file_with_same_entries_as_in_memory_build() {
+        let data = XlsxWorksheetData {
+            sheet_name: Some("People".to_string()),
+            columns: vec!["id".to_string(), "name".to_string()],
+            column_types: vec!["int".to_string(), "text".to_string()],
+            column_comments: Vec::new(),
+            rows: vec![vec![json!(1), json!("Ada")], vec![json!(2), json!("Bob")]],
+            numeric_column_right_align: false,
+        };
+        let in_memory = build_xlsx_workbook_with_auto_filter(&data, false, None).expect("build workbook");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("people.xlsx");
+        super::write_xlsx_workbook_file_with_auto_filter(&path, &data, false, None).expect("write workbook file");
+        let written = fs::read(&path).expect("read workbook file");
+
+        for entry in ["[Content_Types].xml", "xl/workbook.xml", "xl/styles.xml", "xl/worksheets/sheet1.xml"] {
+            assert_eq!(read_zip_entry(&written, entry), read_zip_entry(&in_memory, entry), "{entry}");
+        }
+        assert_all_entries_deflated(&written);
     }
 
     #[test]

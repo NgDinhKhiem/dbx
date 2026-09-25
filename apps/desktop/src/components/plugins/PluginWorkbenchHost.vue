@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, inject, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { AlertTriangle, Loader2 } from "@lucide/vue";
+import { AlertTriangle, Loader2, RotateCw } from "@lucide/vue";
+import { Button } from "@/components/ui/button";
 import * as api from "@/lib/backend/api";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { copyToClipboard } from "@/lib/common/clipboard";
@@ -56,10 +57,25 @@ const loading = ref(true);
 // frame, so the themed overlay must keep covering the frame area until then.
 const frameReady = ref(false);
 const error = ref("");
+// Set when the sandboxed frame navigated away from its srcdoc document. The
+// bridge is torn down and the frame removed; only an explicit reload (which
+// builds a fresh document, nonce and bridge) brings the workbench back.
+const navigationBlocked = ref(false);
+// Re-keys the iframe per load so every generation gets a fresh element whose
+// load events can be counted on their own.
+const frameKey = ref(0);
 let bridge: PluginHostBridge | undefined;
 let unsubscribeEvents: (() => void) | undefined;
 let disposed = false;
 let loadGeneration = 0;
+let channelNonce = "";
+const loadedFrames = new WeakSet<HTMLIFrameElement>();
+
+function createChannelNonce(): string {
+  const bytes = new Uint8Array(16);
+  globalThis.crypto.getRandomValues(bytes);
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
 
 // --- Plugin file-transfer bridge (native dialogs + OS file drops) ---------
 // The sandboxed iframe cannot reach local files, so handles live here: Tauri
@@ -422,6 +438,7 @@ function createBridge() {
   // open. Re-push the connection config through the same path as a sidebar
   // open before the plugin receives its fresh init, so it can reconnect
   // without the user reopening the connection from the sidebar.
+  bridge.channelNonce = channelNonce;
   bridge.onReinit = async () => {
     const connectionId = props.context?.connectionId;
     if (!connectionId) return;
@@ -548,6 +565,9 @@ async function loadWorkbench() {
   loading.value = true;
   frameReady.value = false;
   error.value = "";
+  navigationBlocked.value = false;
+  frameKey.value += 1;
+  channelNonce = createChannelNonce();
   try {
     if (!props.plugin.compatibility.compatible) throw new Error((props.plugin.compatibility.errors || []).join("; ") || t("pluginPlatform.pluginIncompatible"));
     // The read/decode/inline pipeline over a multi-megabyte ui build dominates
@@ -569,6 +589,7 @@ async function loadWorkbench() {
     const { html, entryDirectory } = cachedHtml;
     source.value = pluginSandboxDocument(html, props.plugin.manifest.permissions, currentBridgeTheme(), {
       baseUrl: pluginUiBaseUrl(props.plugin.manifest.id, entryDirectory),
+      channelNonce,
     });
     await nextTick();
     if (disposed || generation !== loadGeneration) return;
@@ -586,7 +607,52 @@ function onMessage(event: MessageEvent) {
   bridge?.handleWindowMessage(event);
 }
 
-function onFrameLoad() {
+/**
+ * A srcdoc frame loads exactly once. Any further load on the same element means
+ * the document navigated (e.g. `location = "https://…"`) or the element was
+ * re-inserted into the DOM; either way the frame may now host a page DBX never
+ * built, which must not receive init or reach the bridge. The bridge is torn
+ * down and never re-initialized for that frame: a fresh document (new nonce,
+ * new bridge, new element) replaces it. Legitimate reloads such as a DOM move
+ * recover automatically a couple of times; a frame that keeps navigating ends
+ * in an explicit reload state.
+ */
+const FRAME_AUTO_RECOVERY_WINDOW_MS = 30_000;
+const MAX_FRAME_AUTO_RECOVERIES = 2;
+let frameAutoRecoveries: number[] = [];
+
+function onFrameNavigated() {
+  loadGeneration += 1;
+  bridge?.dispose();
+  bridge = undefined;
+  frameReady.value = false;
+  const now = Date.now();
+  frameAutoRecoveries = frameAutoRecoveries.filter((at) => now - at < FRAME_AUTO_RECOVERY_WINDOW_MS);
+  if (frameAutoRecoveries.length < MAX_FRAME_AUTO_RECOVERIES) {
+    frameAutoRecoveries.push(now);
+    void loadWorkbench();
+    return;
+  }
+  source.value = "";
+  loading.value = false;
+  navigationBlocked.value = true;
+  error.value = t("pluginPlatform.workbenchNavigationBlocked");
+  emit("error", error.value);
+}
+
+function reloadWorkbench() {
+  frameAutoRecoveries = [];
+  void loadWorkbench();
+}
+
+function onFrameLoad(event: Event) {
+  const frame = event.target;
+  if (!(frame instanceof HTMLIFrameElement) || frame !== iframe.value) return;
+  if (loadedFrames.has(frame)) {
+    onFrameNavigated();
+    return;
+  }
+  loadedFrames.add(frame);
   // The load event can precede the webview's first actual paint (notably on
   // WKWebView); reveal after two animation frames, with a timer fallback
   // because rAF stalls in occluded/background webviews. Guarded by generation
@@ -671,12 +737,18 @@ onBeforeUnmount(() => {
       <Loader2 class="mr-2 size-4 animate-spin" />
       {{ t("pluginPlatform.loadingTitle", { title }) }}
     </div>
-    <div v-else-if="error" class="m-auto flex max-w-lg items-start gap-3 rounded-lg border border-destructive/40 bg-destructive/5 p-4 text-sm text-destructive">
+    <div v-else-if="error" class="m-auto flex max-w-lg items-start gap-3 rounded-lg border border-destructive/40 bg-destructive/5 p-4 text-sm text-destructive" :data-plugin-navigation-blocked="navigationBlocked ? 'true' : undefined">
       <AlertTriangle class="mt-0.5 size-4 shrink-0" />
-      <span>{{ error }}</span>
+      <div class="flex min-w-0 flex-col items-start gap-3">
+        <span>{{ error }}</span>
+        <Button v-if="navigationBlocked" variant="outline" size="sm" data-plugin-reload @click="reloadWorkbench">
+          <RotateCw class="mr-1.5 size-3.5" />
+          {{ t("pluginPlatform.reloadWorkbench") }}
+        </Button>
+      </div>
     </div>
     <template v-else>
-      <iframe ref="iframe" :title="title" :srcdoc="source" sandbox="allow-scripts" allow="clipboard-write" referrerpolicy="no-referrer" class="size-full border-0 bg-transparent" @load="onFrameLoad" />
+      <iframe :key="frameKey" ref="iframe" :title="title" :srcdoc="source" sandbox="allow-scripts" allow="clipboard-write" referrerpolicy="no-referrer" class="size-full border-0 bg-transparent" @load="onFrameLoad" />
       <!-- Cover until the frame has actually painted: the iframe stays mounted
            underneath so its load event can fire (v-else on the overlay would
            deadlock), it just isn't visible yet. Fully opaque so the covered

@@ -39,10 +39,10 @@ pub struct AgentRuntimeClient {
 
 impl AgentRuntimeClient {
     pub async fn spawn(launch: AgentLaunchSpec, app_version: &str) -> Result<Arc<Self>, String> {
-        let mut child = spawn_agent_process(&launch)?;
-        let child_stdin = child.stdin.take().ok_or("Failed to capture agent stdin")?;
-        let child_stdout = child.stdout.take().ok_or("Failed to capture agent stdout")?;
-        let child_stderr = child.stderr.take().ok_or("Failed to capture agent stderr")?;
+        let mut child = StartingAgentProcess::new(spawn_agent_process(&launch)?);
+        let child_stdin = child.get_mut().stdin.take().ok_or("Failed to capture agent stdin")?;
+        let child_stdout = child.get_mut().stdout.take().ok_or("Failed to capture agent stdout")?;
+        let child_stderr = child.get_mut().stderr.take().ok_or("Failed to capture agent stderr")?;
         let stderr_tail = Arc::new(Mutex::new(StderrTail::default()));
         start_stderr_collector(child_stderr, stderr_tail.clone());
 
@@ -67,7 +67,7 @@ impl AgentRuntimeClient {
         .map_err(|e| format!("Agent startup task failed: {e}"))??;
 
         let runtime = Arc::new(Self {
-            child: Arc::new(Mutex::new(child)),
+            child: Arc::new(Mutex::new(child.into_started())),
             child_reaper_started: Arc::new(AtomicBool::new(false)),
             child_reaped: Arc::new(AtomicBool::new(false)),
             stdin: Arc::new(Mutex::new(BufWriter::new(child_stdin))),
@@ -102,8 +102,10 @@ impl AgentRuntimeClient {
             runtime.kill();
             return Err("Agent runtime does not support multi_session protocol v2".to_string());
         }
-        let runtime =
-            Arc::try_unwrap(runtime).map_err(|_| "Agent runtime initialization is still referenced".to_string())?;
+        let runtime = Arc::try_unwrap(runtime).map_err(|runtime| {
+            runtime.kill();
+            "Agent runtime initialization is still referenced".to_string()
+        })?;
         Ok(Arc::new(Self { handshake, ..runtime }))
     }
 
@@ -333,6 +335,42 @@ fn terminate_and_reap_shared_agent(
         let _ = child.kill();
     }
     start_shared_agent_reaper(child, child_reaper_started, child_reaped);
+}
+
+/// Owns an agent process until its startup handshake succeeds. A plain
+/// `std::process::Child` is not killed on drop, so every error path (startup
+/// timeout, non-ready line, missing pipes, cancelled caller future) would
+/// otherwise orphan the JVM; dropping this guard kills and reaps it instead.
+struct StartingAgentProcess {
+    child: Option<Child>,
+}
+
+impl StartingAgentProcess {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn get_mut(&mut self) -> &mut Child {
+        self.child.as_mut().expect("starting agent process is present until startup completes")
+    }
+
+    /// Startup succeeded: hand ownership (and cleanup) to the caller.
+    fn into_started(mut self) -> Child {
+        self.child.take().expect("starting agent process is present until startup completes")
+    }
+}
+
+impl Drop for StartingAgentProcess {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.take() {
+            log::warn!("[agent] terminating agent process {} after failed startup", child.id());
+            terminate_and_reap_shared_agent(
+                Arc::new(Mutex::new(child)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            );
+        }
+    }
 }
 
 fn start_shared_agent_reaper(
@@ -1613,11 +1651,13 @@ impl AgentDriverClient {
     /// they speak the DBX stdin/stdout JSON-RPC protocol.
     /// Blocks (async) until the agent writes `{"ready":true}` to stdout.
     pub async fn spawn(launch: AgentLaunchSpec) -> Result<Self, String> {
-        let mut child = spawn_agent_process(&launch)?;
+        // Killed and reaped on every early return below, so a failed startup
+        // never leaves a JVM (plus its stderr thread and blocked stdout reader) behind.
+        let mut child = StartingAgentProcess::new(spawn_agent_process(&launch)?);
 
-        let child_stdin = child.stdin.take().ok_or("Failed to capture agent stdin")?;
-        let child_stdout = child.stdout.take().ok_or("Failed to capture agent stdout")?;
-        let child_stderr = child.stderr.take().ok_or("Failed to capture agent stderr")?;
+        let child_stdin = child.get_mut().stdin.take().ok_or("Failed to capture agent stdin")?;
+        let child_stdout = child.get_mut().stdout.take().ok_or("Failed to capture agent stdout")?;
+        let child_stderr = child.get_mut().stderr.take().ok_or("Failed to capture agent stderr")?;
 
         let stdin = BufWriter::new(child_stdin);
         let mut stdout = BufReader::new(child_stdout);
@@ -1651,26 +1691,26 @@ impl AgentDriverClient {
         let ready_stdout = match startup_result {
             Ok(Ok(Ok(stdout))) => stdout,
             Ok(Ok(Err(e))) => {
-                return Err(format_agent_startup_error(&e, &mut child, &stderr_tail));
+                return Err(format_agent_startup_error(&e, child.get_mut(), &stderr_tail));
             }
             Ok(Err(e)) => {
                 return Err(format_agent_startup_error(
                     &format!("Agent startup task failed: {e}"),
-                    &mut child,
+                    child.get_mut(),
                     &stderr_tail,
                 ));
             }
             Err(_) => {
                 return Err(format_agent_startup_error(
                     &format!("Agent startup timed out ({STARTUP_TIMEOUT_SECS}s)"),
-                    &mut child,
+                    child.get_mut(),
                     &stderr_tail,
                 ));
             }
         };
 
         Ok(Self {
-            child: Some(child),
+            child: Some(child.into_started()),
             stdin: Some(stdin),
             stdout: Some(ready_stdout),
             stderr_tail,
@@ -4808,6 +4848,48 @@ for line in sys.stdin:
 
         runtime.kill();
         let _ = std::fs::remove_file(script_path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_startup_kills_and_reaps_the_agent_process() {
+        fn process_alive(pid: &str) -> bool {
+            Command::new("kill").args(["-0", pid]).status().is_ok_and(|status| status.success())
+        }
+
+        for shared_runtime in [false, true] {
+            let id = uuid::Uuid::new_v4();
+            let script_path = std::env::temp_dir().join(format!("dbx-agent-bad-startup-{id}.py"));
+            let pid_path = std::env::temp_dir().join(format!("dbx-agent-bad-startup-{id}.pid"));
+            std::fs::write(
+                &script_path,
+                format!(
+                    r#"import json, os, time
+open({pid:?}, 'w').write(str(os.getpid()))
+print(json.dumps({{'ready': False}}), flush=True)
+time.sleep(120)
+"#,
+                    pid = pid_path.to_string_lossy()
+                ),
+            )
+            .unwrap();
+            let launch = AgentLaunchSpec::new(test_python()).with_args([script_path.to_string_lossy().to_string()]);
+            let error = if shared_runtime {
+                AgentRuntimeClient::spawn(launch, "0.0.0-test").await.err().expect("startup must fail")
+            } else {
+                AgentDriverClient::spawn(launch).await.err().expect("startup must fail")
+            };
+            assert!(error.contains("ready signal"), "{error}");
+
+            let pid = std::fs::read_to_string(&pid_path).expect("agent wrote its pid");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while process_alive(pid.trim()) && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(!process_alive(pid.trim()), "agent {pid} must be killed after a failed startup");
+            let _ = std::fs::remove_file(script_path);
+            let _ = std::fs::remove_file(pid_path);
+        }
     }
 
     #[tokio::test]

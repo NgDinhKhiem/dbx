@@ -74,7 +74,7 @@ vi.mock("@/stores/settingsStore", async (importOriginal) => {
       },
     },
     desktopSettings: actual.DEFAULT_DESKTOP_SETTINGS,
-    mcpGlobalPolicy: { configured: false, readOnly: false },
+    mcpGlobalPolicy: { configured: false, readOnly: true },
     aiConfigs: [],
     aiDefaultTemplatesByDbType: {},
     defaultAiMode: "ask",

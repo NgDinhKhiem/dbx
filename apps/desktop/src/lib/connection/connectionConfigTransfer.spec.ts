@@ -164,4 +164,20 @@ describe("connectionConfigTransfer", () => {
     expect(preview.connections).toHaveLength(3);
     expect(selected.layout?.order.some((entry) => entry.type === "connection" && entry.id === "d")).toBe(false);
   });
+
+  it("never carries local secret bookkeeping into bundles, plaintext exports or imports", () => {
+    const withMetadata = conn("a", "A", { password: "", saved_secrets: ["password"], cleared_secrets: ["init_script"], secrets_from_connection_id: "src" });
+    const bundle = buildConnectionConfigBundle([withMetadata], null, [], undefined);
+    expect(bundle.connections[0]).not.toHaveProperty("saved_secrets");
+    expect(bundle.connections[0]).not.toHaveProperty("cleared_secrets");
+    expect(bundle.connections[0]).not.toHaveProperty("secrets_from_connection_id");
+    expect(bundle.connections[0].id).toBe("a");
+    expect(withMetadata.saved_secrets).toEqual(["password"]);
+
+    expect(scrubConnectionForPlaintextExport(withMetadata)).not.toHaveProperty("saved_secrets");
+
+    const imported = prepareConnectionConfigImport({ connections: [withMetadata] }, [], [], () => "new-id");
+    expect(imported.connections[0]).not.toHaveProperty("saved_secrets");
+    expect(imported.connections[0]).not.toHaveProperty("secrets_from_connection_id");
+  });
 });

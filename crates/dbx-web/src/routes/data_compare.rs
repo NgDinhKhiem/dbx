@@ -5,10 +5,22 @@ use std::sync::Arc;
 use crate::error::AppError;
 use crate::state::WebState;
 
+/// Row comparison is CPU-bound; keep it off the async worker threads.
+async fn run_cpu_bound<T, F>(work: F) -> Result<T, AppError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(work).await.map_err(|error| AppError::internal(error.to_string()))
+}
+
 pub async fn prepare_data_compare(
     Json(options): Json<dbx_core::data_compare::DataComparePreparationOptions>,
 ) -> Result<Json<dbx_core::data_compare::DataComparePreparation>, AppError> {
-    dbx_core::data_compare::prepare_data_compare(options).map(Json).map_err(AppError::from)
+    run_cpu_bound(move || dbx_core::data_compare::prepare_data_compare(options))
+        .await?
+        .map(Json)
+        .map_err(AppError::from)
 }
 
 pub async fn prepare_data_compare_from_tables(
@@ -33,6 +45,6 @@ pub async fn prepare_data_compare_missing_target(
 
 pub async fn build_data_compare_sync_plan(
     Json(options): Json<dbx_core::data_compare::DataCompareSyncPlanOptions>,
-) -> Json<dbx_core::data_compare::DataCompareSyncPlan> {
-    Json(dbx_core::data_compare::build_data_compare_sync_plan(options))
+) -> Result<Json<dbx_core::data_compare::DataCompareSyncPlan>, AppError> {
+    run_cpu_bound(move || dbx_core::data_compare::build_data_compare_sync_plan(options)).await.map(Json)
 }

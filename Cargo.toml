@@ -54,7 +54,11 @@ tiberius = { path = "vendor/tiberius" }
 debug = "line-tables-only"
 
 [profile.release]
-panic = "abort"
+# Keep unwinding: panic recovery relies on catch_unwind (for example the SQL
+# Server driver in dbx-drivers/src/db/sqlserver.rs and query cancellation), and
+# tokio only isolates a panicking task when panics unwind. With "abort", one
+# driver panic would terminate the desktop app or the whole web server.
+panic = "unwind"
 strip = true
 lto = true
 codegen-units = 1

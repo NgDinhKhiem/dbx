@@ -153,6 +153,39 @@ describe("ConfigPassphraseDialog", () => {
     expect(confirm).toHaveBeenCalledWith("matching-pass");
   });
 
+  it("requires at least 12 characters for a new encrypted export", async () => {
+    const confirm = vi.fn();
+    await mountDialog({ open: true, mode: "export", onConfirm: confirm });
+
+    const [passphraseInput, confirmInput] = [...document.body.querySelectorAll("input")];
+    for (const input of [passphraseInput, confirmInput]) {
+      input.value = "short-pass1";
+      input.dispatchEvent(new Event("input"));
+    }
+
+    const encrypted = [...document.body.querySelectorAll("button")].find((button) => button.textContent?.includes("Export encrypted"));
+    encrypted?.click();
+    await nextTick();
+
+    expect(confirm).not.toHaveBeenCalled();
+    expect(document.body.textContent).toContain("at least 12 characters");
+  });
+
+  it("accepts short passphrases when decrypting an existing file", async () => {
+    const confirm = vi.fn();
+    await mountDialog({ open: true, mode: "import", onConfirm: confirm });
+
+    const [passphraseInput] = [...document.body.querySelectorAll("input")];
+    passphraseInput.value = "abcd";
+    passphraseInput.dispatchEvent(new Event("input"));
+
+    const decrypt = [...document.body.querySelectorAll("button")].find((button) => button.textContent?.includes("Decrypt"));
+    decrypt?.click();
+    await nextTick();
+
+    expect(confirm).toHaveBeenCalledWith("abcd");
+  });
+
   it("prefills the session-remembered passphrase into both export fields", async () => {
     rememberExportPassphrase("session-pass");
     await mountDialog({ open: true, mode: "export", onConfirm: vi.fn() });

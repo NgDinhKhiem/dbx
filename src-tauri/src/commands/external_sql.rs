@@ -58,38 +58,63 @@ pub struct ExternalSqlFileSaveResult {
     pub path: String,
     pub version: ExternalSqlFileVersion,
 }
+use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 
+use super::external_path_access::{self, AccessKind};
+
 #[tauri::command]
-pub fn pending_open_sql_files(state: tauri::State<'_, ExternalSqlOpenState>) -> Vec<String> {
+pub fn pending_open_sql_files(app: tauri::AppHandle, state: tauri::State<'_, ExternalSqlOpenState>) -> Vec<String> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut paths = sql_file_paths_from_args(std::env::args().skip(1), &cwd);
     paths.extend(state.drain());
+    // Launch arguments and queued OS open-file events come from the OS, not
+    // the webview: grant them so the frontend can open them through the
+    // authorized read command.
+    external_path_access::grant_opened_files(&app, &paths);
     dedupe_paths(paths)
+}
+
+/// Resolves a webview-supplied external editor path to an authorized one.
+/// User-initiated opens and saves may ask for consent through a native dialog;
+/// background checks (`prompt == false`) never do.
+async fn authorized_external_text_path(
+    app: &tauri::AppHandle,
+    path: &str,
+    kind: AccessKind,
+    prompt: bool,
+) -> Result<PathBuf, String> {
+    let path = PathBuf::from(path);
+    external_path_access::ensure_external_text_file_extension(&path)?;
+    external_path_access::ensure_file_access(app, &path, kind, prompt, None).await
 }
 
 #[tauri::command]
 pub async fn read_external_sql_file(
+    app: tauri::AppHandle,
     path: String,
     max_size_bytes: Option<u64>,
 ) -> Result<ExternalSqlFileReadResult, String> {
-    read_external_sql_file_content_async(PathBuf::from(path), clamp_external_sql_editor_limit(max_size_bytes)).await
+    let path = authorized_external_text_path(&app, &path, AccessKind::Read, true).await?;
+    read_external_sql_file_content_async(path, clamp_external_sql_editor_limit(max_size_bytes)).await
 }
 
 #[tauri::command]
-pub async fn inspect_external_sql_file(path: String) -> Result<ExternalSqlFileStatus, String> {
-    inspect_external_sql_file_async(PathBuf::from(path)).await
+pub async fn inspect_external_sql_file(app: tauri::AppHandle, path: String) -> Result<ExternalSqlFileStatus, String> {
+    let path = authorized_external_text_path(&app, &path, AccessKind::Read, false).await?;
+    inspect_external_sql_file_async(path).await
 }
 
 #[tauri::command]
 pub async fn write_external_sql_file(
+    app: tauri::AppHandle,
     path: String,
     content: String,
     expected_content_hash: Option<String>,
     expected_missing: bool,
 ) -> Result<ExternalSqlFileWriteResult, String> {
-    write_external_sql_file_checked_async(PathBuf::from(path), content, expected_content_hash, expected_missing, false)
-        .await
+    let path = authorized_external_text_path(&app, &path, AccessKind::Write, true).await?;
+    write_external_sql_file_checked_async(path, content, expected_content_hash, expected_missing, false).await
 }
 
 #[tauri::command]
@@ -117,6 +142,18 @@ pub async fn save_external_sql_file(
         .map_err(|_| "SQL save dialog closed unexpectedly".to_string())?
         .map(|file_path| file_path.into_path().map_err(|error| format!("Failed to resolve SQL file path: {error}")))
         .transpose()?;
+    if let Some(path) = &path {
+        // The native save dialog is the user's consent for this path; the
+        // grant lets later saves of the linked tab reach it again.
+        external_path_access::ensure_external_text_file_extension(path)?;
+        if !external_path_access::grant_file(window.app_handle(), path) {
+            return Err(format!(
+                "{}: this location cannot be used for external files: {}",
+                external_path_access::NOT_AUTHORIZED_ERROR_PREFIX,
+                path.display()
+            ));
+        }
+    }
 
     // Keep the native dialog result as a PathBuf until after the write so
     // Windows Unicode paths do not cross an extra frontend IPC boundary.

@@ -44,6 +44,8 @@ import { useTunnelProfileStore } from "@/stores/tunnelProfileStore";
 import { detachTunnelProfileLayer, tunnelProfileReferenceLayer, tunnelProfileSummary } from "@/lib/connection/tunnelProfiles";
 import { sanitizeConnectionCredentials } from "@/lib/connection/credentialSanitizer";
 import { applySshAuthMethod, inferSshAuthMethod } from "@/lib/connection/sshAuthMethod";
+import { clearSavedSecret, externalConfigSecretPath, hasSavedSecret, pluginFieldSecretPath, savedSecretApplies, transportLayerSecretPath } from "@/lib/connection/savedSecrets";
+import SavedSecretsSummary from "./SavedSecretsSummary.vue";
 import { applySshConfigHostAliasPrefill as prefillSshConfigHostAlias } from "@/lib/connection/sshConfigHosts";
 import { canPersistConnectionTestResult, connectionEditDraftSyncAction } from "./connectionEditDraftSync";
 import { createConnectionNoteVisibilityDraft, persistConnectionNoteVisibilityDraft as persistConnectionNoteVisibilityDraftState, resetConnectionNoteVisibilityDraft, setConnectionNoteVisibilityDraft, syncConnectionNoteVisibilityDraft } from "./connectionNoteVisibilityDraft";
@@ -627,7 +629,71 @@ function sshLayersForConfig(config: LegacyConnectionConfig): SshTunnelConfig[] {
   return [];
 }
 
+/**
+ * Legacy layers without an explicit auth method infer it from the credential
+ * fields, which now arrive blank when a password is stored. Treat a stored
+ * password as "password" auth so the input (and the saved value) is kept.
+ */
+function inferSavedSshAuthMethods(layers: TransportLayerConfig[], original: TransportLayerConfig[] | undefined) {
+  layers.forEach((layer, index) => {
+    const source = original?.[index];
+    if (layer.type !== "ssh" || source?.type !== "ssh" || source.auth_method) return;
+    if (!hasSavedSecret(secretState.value, transportLayerSecretPath(layer, index, "password"))) return;
+    if (layer.auth_method === "none") layer.auth_method = "password";
+    else if (layer.auth_method === "key") layer.auth_method = "key+password";
+  });
+}
+
 const form = ref(defaultForm());
+// Stored secrets never reach the frontend: their fields arrive blank and are
+// listed in `saved_secrets`. A blank field keeps the stored value (the backend
+// merges it by connection id); `cleared_secrets` explicitly deletes one.
+const secretState = ref<{ saved_secrets: string[]; cleared_secrets: string[] }>({ saved_secrets: [], cleared_secrets: [] });
+function resetSecretState(config?: Pick<ConnectionConfig, "saved_secrets"> | null) {
+  secretState.value = { saved_secrets: [...(config?.saved_secrets ?? [])], cleared_secrets: [] };
+}
+function secretSaved(path: string): boolean {
+  return hasSavedSecret(secretState.value, path);
+}
+function savedSecretPlaceholder(path: string, fallback?: string): string | undefined {
+  return secretSaved(path) ? t("connection.savedSecretPlaceholder") : fallback;
+}
+function clearSavedConnectionSecret(path: string) {
+  clearSavedSecret(secretState.value, path);
+  resetTestState();
+}
+function restoreSavedConnectionSecret(path: string) {
+  secretState.value.cleared_secrets = secretState.value.cleared_secrets.filter((item) => item !== path);
+  if (!secretState.value.saved_secrets.includes(path)) secretState.value.saved_secrets = [...secretState.value.saved_secrets, path];
+  resetTestState();
+}
+function sshLayerSecretPlaceholder(layer: SshTunnelConfig | ProxyTunnelConfig | HttpTunnelConfig, field: "password" | "key_passphrase" | "token", fallback: string): string | undefined {
+  const index = (form.value.transport_layers ?? []).findIndex((candidate) => candidate.id === layer.id);
+  return savedSecretPlaceholder(transportLayerSecretPath(layer, Math.max(index, 0), field), fallback);
+}
+/**
+ * Secret bookkeeping sent with every submitted config of the edited
+ * connection. Stored secrets the submitted config no longer uses (auth mode
+ * switched, layer removed, URL mode turned off...) are cleared explicitly so
+ * the backend does not merge them back.
+ */
+function applySecretStateForSubmit(config: ConnectionConfig) {
+  if (!editingId.value || config.id !== editingId.value) {
+    delete config.saved_secrets;
+    delete config.cleared_secrets;
+    return;
+  }
+  const cleared = new Set(secretState.value.cleared_secrets);
+  const saved: string[] = [];
+  for (const path of secretState.value.saved_secrets) {
+    const unused = !savedSecretApplies(config, path) || (path === "connection_string" && config.db_type === "mongodb" && !mongoUseUrl.value);
+    if (unused) cleared.add(path);
+    else saved.push(path);
+  }
+  config.saved_secrets = saved;
+  if (cleared.size) config.cleared_secrets = [...cleared];
+  else delete config.cleared_secrets;
+}
 const redisKeyTemplatesText = ref("");
 const noteTextareaRef = ref<HTMLTextAreaElement | null>(null);
 const showGaussdbConnectionMode = computed(() => form.value.db_type === "gaussdb");
@@ -1542,7 +1608,7 @@ function buildInfluxDbExternalConfig(): InfluxDbExternalConfig {
   if (influxDbVersion.value !== "2") return { version: "1" };
   const org = influxDbOrg.value.trim();
   if (!org) throw new Error("InfluxDB 2.x organization is required");
-  if (!form.value.password.trim()) throw new Error("InfluxDB 2.x token is required");
+  if (!form.value.password.trim() && !secretSaved("password")) throw new Error("InfluxDB 2.x token is required");
   if (!form.value.database?.trim()) throw new Error("InfluxDB 2.x bucket is required");
   return { version: "2", org };
 }
@@ -1593,10 +1659,16 @@ function requireMqField(value: string, message: string): string {
   return trimmed;
 }
 
+/** Like `requireMqField`, but a blank value is accepted while a stored secret exists (the backend keeps it). */
+function requireMqSecret(value: string, externalPath: string, message: string): string {
+  if (!value.trim() && secretSaved(externalConfigSecretPath(externalPath))) return "";
+  return requireMqField(value, message);
+}
+
 function buildMqAuth(): MqAuth {
   switch (mqAuthKind.value) {
     case "token":
-      return { kind: "token", token: requireMqField(mqToken.value, "Token auth requires a token") };
+      return { kind: "token", token: requireMqSecret(mqToken.value, "auth.token", "Token auth requires a token") };
     case "basic":
       return {
         kind: "basic",
@@ -1607,14 +1679,14 @@ function buildMqAuth(): MqAuth {
       return {
         kind: "apiKey",
         header: requireMqField(mqApiKeyHeader.value, "API key auth requires a header"),
-        value: requireMqField(mqApiKeyValue.value, "API key auth requires a value"),
+        value: requireMqSecret(mqApiKeyValue.value, "auth.value", "API key auth requires a value"),
       };
     case "oauth2":
       return {
         kind: "oauth2",
         issuerUrl: requireMqField(mqOauthIssuerUrl.value, t("connection.mqOauthIssuerRequired")),
         clientId: requireMqField(mqOauthClientId.value, t("connection.mqOauthClientIdRequired")),
-        clientSecret: requireMqField(mqOauthClientSecret.value, t("connection.mqOauthClientSecretRequired")),
+        clientSecret: requireMqSecret(mqOauthClientSecret.value, "auth.clientSecret", t("connection.mqOauthClientSecretRequired")),
         audience: mqOauthAudience.value.trim() || undefined,
         scope: mqOauthScope.value.trim() || undefined,
       };
@@ -1633,8 +1705,13 @@ function buildMqTokenSigning() {
   if (mqTokenSigningMode.value === "none") return undefined;
   return {
     algorithm: mqTokenSigningMode.value,
-    key: requireMqField(mqTokenSigningKey.value, t("connection.mqTokenSigningKeyRequired")),
+    key: requireMqSecret(mqTokenSigningKey.value, "tokenSigning.key", t("connection.mqTokenSigningKeyRequired")),
   };
+}
+
+function storedRocketmqSecretKey(): string {
+  const extra = externalConfigRecord(externalConfigRecord(props.editConfig?.external_config).extra);
+  return typeof extra.secretKey === "string" ? extra.secretKey : "";
 }
 
 function buildMqAdminConfig(): MqAdminConfig {
@@ -1676,7 +1753,8 @@ function buildMqAdminConfig(): MqAdminConfig {
     if (mqRocketmqClusterName.value.trim()) extra.clusterName = mqRocketmqClusterName.value.trim();
     if (mqAuthKind.value === "basic") {
       extra.accessKey = mqBasicUsername.value.trim();
-      extra.secretKey = mqBasicPassword.value;
+      // A blank password with a stored one keeps the previously saved secret key.
+      extra.secretKey = mqBasicPassword.value || (secretSaved(externalConfigSecretPath("auth.password")) ? storedRocketmqSecretKey() : "");
     }
     return {
       systemKind: "rocketmq",
@@ -2308,7 +2386,8 @@ function isDremioGeneratedDefaultDriverClass(value: string | undefined) {
 
 function restoreDremioConnectionDefaultsIfEmpty() {
   if (form.value.driver_profile !== "dremio") return;
-  if (!form.value.connection_string?.trim()) {
+  // A blank URL with a stored one keeps the stored URL; do not replace it with a default.
+  if (!form.value.connection_string?.trim() && !secretSaved("connection_string")) {
     form.value.connection_string = dremioDefaultConnectionUrl();
   }
   if (isDremioGeneratedDefaultDriverClass(form.value.jdbc_driver_class)) {
@@ -2368,7 +2447,7 @@ function restoreJdbcProductConnectionDefaultsIfEmpty() {
   const profile = activeJdbcProductProfile.value;
   if (!profile) return;
   const defaults = jdbcProductConnectionDefaults(profile, jdbcProductConnectionMode.value);
-  form.value.connection_string = form.value.connection_string?.trim() || defaults.connectionString;
+  if (!secretSaved("connection_string")) form.value.connection_string = form.value.connection_string?.trim() || defaults.connectionString;
   form.value.jdbc_driver_class = form.value.jdbc_driver_class?.trim() || defaults.driverClass;
 }
 
@@ -2670,6 +2749,7 @@ watch(
       const oceanbaseMode = profile === "oceanbase" ? oceanbaseSubModeFromConfig(config) : "mysql";
       const oceanbasePatch = profile === "oceanbase" ? oceanbaseModeConnectionPatch(oceanbaseMode) : null;
       editingId.value = config.id;
+      resetSecretState(config);
       const profileConfig = driverProfiles[profile];
       form.value = {
         name: config.name,
@@ -2730,6 +2810,7 @@ watch(
         save_password: config.save_password !== false,
       };
       redisKeyTemplatesText.value = redisKeyTemplatesToTextarea(form.value.redis_key_templates);
+      inferSavedSshAuthMethods(form.value.transport_layers ?? [], config.transport_layers);
       oracleTnsAdminPath.value = parseOracleTnsConnectionString(config.connection_string)?.tnsAdmin || "";
       productionProtectionEnabled.value = !!config.is_production || (config.production_databases?.length ?? 0) > 0;
       connectionUrlInput.value = config.db_type === "h2" && config.connection_string ? config.connection_string : "";
@@ -2800,7 +2881,7 @@ watch(
       dremioConnectionMode.value = profile === "dremio" ? dremioConnectionModeForConfig(config) : "legacy";
       resetDremioConnectionUrls(dremioConnectionMode.value, profile === "dremio" ? config.connection_string : undefined);
       resetJdbcProductConnectionFields(jdbcProductProfileForConfig(config), config);
-      mongoUseUrl.value = !!config.connection_string;
+      mongoUseUrl.value = !!config.connection_string || hasSavedSecret(config, "connection_string");
       jdbcDriverPathsInput.value = (config.jdbc_driver_paths || []).join("\n");
       jdbcManualClasspathOpen.value = supportsNativeAgentJdbcDriverConfigType(config.db_type) || (config.jdbc_driver_paths || []).length > 0;
       customDriverName.value = isCustomCompatibleProfile() ? config.driver_label || "" : "";
@@ -2817,6 +2898,7 @@ watch(
       appliedConnectionUpdate = null;
       clearSavedDatabaseInfo();
       editingId.value = null;
+      resetSecretState();
       selectedConnectionGroupId.value = initialConnectionGroupId();
       form.value = defaultForm();
       redisKeyTemplatesText.value = "";
@@ -3688,7 +3770,11 @@ function pluginFieldValue(field: PluginFormField): PluginFormFieldValue {
 
 function pluginFieldHasValue(field: PluginFormField): boolean {
   const value = pluginFieldValue(field);
-  return typeof value === "string" ? value.trim().length > 0 : value !== undefined;
+  const hasValue = typeof value === "string" ? value.trim().length > 0 : value !== undefined;
+  if (hasValue) return true;
+  // A stored secret left blank is kept by the backend.
+  const secretPath = pluginFieldSecretPath(field);
+  return !!secretPath && secretSaved(secretPath);
 }
 
 function pluginFieldValueByKey(key: string): PluginFormFieldValue {
@@ -3765,15 +3851,16 @@ const hasRequiredConnectionTarget = computed(() => {
     if (mqSystemKind.value === "rabbitmq") return !!mqRabbitmqAddresses.value.trim();
     return !!mqAdminUrl.value.trim();
   }
-  if (form.value.db_type === "zookeeper") return !!(form.value.host || form.value.connection_string || connectionUrlInput.value.trim());
+  if (form.value.db_type === "zookeeper") return !!(form.value.host || form.value.connection_string || secretSaved("connection_string") || connectionUrlInput.value.trim());
   if (form.value.db_type === "mqtt") return !!mqttHost.value.trim() && mqttPort.value > 0;
   if (form.value.db_type === "nacos") return !!nacosServerAddr.value.trim();
   if (form.value.db_type === "consul") return !!consulServerAddr.value.trim();
-  if (isCloudflareD1Connection(form.value)) return hasCloudflareD1Credentials(form.value);
+  if (isCloudflareD1Connection(form.value)) return hasCloudflareD1Credentials({ ...form.value, ...secretState.value });
   // Cloud Spanner has no host to fall back on: the resource path is the target.
   if (isSpannerConnection(form.value)) return hasSpannerResourcePath(form.value);
   if (isH2FileMode.value) return !!(form.value.host.trim() || h2FilePathFromJdbcUrl(form.value.connection_string));
-  return !!(form.value.host || (mongoUseUrl.value && form.value.connection_string) || (form.value.db_type === "jdbc" && form.value.connection_string) || connectionUrlInput.value.trim());
+  const connectionString = form.value.connection_string || (secretSaved("connection_string") ? "saved" : "");
+  return !!(form.value.host || (mongoUseUrl.value && connectionString) || (form.value.db_type === "jdbc" && connectionString) || connectionUrlInput.value.trim());
 });
 const mongoAuthDatabase = computed({
   get: () => mongoUrlParam(form.value.url_params, "authSource"),
@@ -4074,6 +4161,8 @@ function formValueForSubmit(): Omit<ConnectionConfig, "id"> {
 }
 
 function applyDremioJdbcMetadata(config: LegacyConnectionConfig) {
+  // Blank + stored: the backend keeps the stored URL, so there is nothing to parse here.
+  if (!config.connection_string?.trim() && hasSavedSecret(config, "connection_string")) return;
   config.connection_string = config.connection_string?.trim() || dremioDefaultConnectionUrl();
   try {
     const parsed = parseConnectionUrl(config.connection_string);
@@ -4171,6 +4260,7 @@ function normalizeTransportLayersForSubmit(config: LegacyConnectionConfig) {
 function connectionConfigForSshTunnelTest(id: string): ConnectionConfig {
   const config = { ...formValueForSubmit(), id } as LegacyConnectionConfig;
   normalizeTransportLayersForSubmit(config);
+  applySecretStateForSubmit(config as ConnectionConfig);
   return config;
 }
 
@@ -4228,6 +4318,12 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
   } else {
     config = { ...formValueForSubmit(), id } as LegacyConnectionConfig;
   }
+  // Validation below may rely on saved (hidden) secrets; the final bookkeeping
+  // is recomputed at the end once the submitted shape is known.
+  if (editingId.value && id === editingId.value) {
+    config.saved_secrets = [...secretState.value.saved_secrets];
+    config.cleared_secrets = [...secretState.value.cleared_secrets];
+  }
   config.database_info = undefined;
   config.database = normalizeStoredConnectionDatabase(config.db_type, config.database);
   config.note = config.note?.trim() || undefined;
@@ -4254,7 +4350,7 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
     config.username = config.username.trim();
     config.password = config.password.trim();
     config.connection_string = config.connection_string?.trim() || undefined;
-    if (!config.username || !config.password) {
+    if (!config.username || (!config.password && !hasSavedSecret(config, "password"))) {
       throw new Error(t("connection.dynamodbCredentialsRequired"));
     }
   }
@@ -4602,7 +4698,7 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
   if (config.db_type === "dameng") {
     if (damengDriverModeForConfig(config) === "custom") {
       config.driver_profile = DAMENG_CUSTOM_DRIVER_PROFILE;
-      config.connection_string = damengCustomJdbcUrl(config);
+      config.connection_string = !config.connection_string?.trim() && hasSavedSecret(config, "connection_string") ? undefined : damengCustomJdbcUrl(config);
       config.jdbc_driver_class = config.jdbc_driver_class?.trim() || DAMENG_DEFAULT_JDBC_DRIVER_CLASS;
       config.jdbc_driver_paths = parsedJdbcDriverPaths();
       if (config.jdbc_driver_paths.length === 0) {
@@ -4624,12 +4720,12 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
         const defaults = jdbcProductConnectionDefaults(jdbcProductProfile, jdbcProductProfile.detectMode(config));
         config.host = "";
         config.port = 0;
-        config.connection_string = config.connection_string?.trim() || defaults.connectionString;
+        config.connection_string = config.connection_string?.trim() || (hasSavedSecret(config, "connection_string") ? undefined : defaults.connectionString);
         config.jdbc_driver_class = config.jdbc_driver_class?.trim() || defaults.driverClass;
       } else if (config.driver_profile === JDBCX_DRIVER_PROFILE) {
         config.host = "";
         config.port = 0;
-        config.connection_string = config.connection_string?.trim() || JDBCX_DEFAULT_URL;
+        config.connection_string = config.connection_string?.trim() || (hasSavedSecret(config, "connection_string") ? undefined : JDBCX_DEFAULT_URL);
         config.jdbc_driver_class = config.jdbc_driver_class?.trim() || JDBCX_JDBC_DRIVER_CLASS;
       } else {
         config.host = "";
@@ -4707,6 +4803,7 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
   if (config.agent_java_options && config.agent_java_options.length === 0) config.agent_java_options = undefined;
   // Pasted credentials may carry invisible characters that trim() keeps (#9043).
   sanitizeConnectionCredentials(config);
+  applySecretStateForSubmit(config as ConnectionConfig);
   return config as ConnectionConfig;
 }
 
@@ -5453,6 +5550,7 @@ function openJdbcDriverManagerFromError() {
 
 function resetForm(options: { preservePickerState?: boolean } = {}) {
   editingId.value = null;
+  resetSecretState();
   selectedConnectionGroupId.value = initialConnectionGroupId();
   form.value = defaultForm();
   redisKeyTemplatesText.value = "";

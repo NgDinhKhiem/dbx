@@ -24,6 +24,11 @@ describe("isAiConfigModelCandidate", () => {
     expect(isAiConfigModelCandidate(config({ apiKey: "" }), true)).toBe(false);
   });
 
+  it("accepts a redacted API key the backend reports as saved", () => {
+    expect(isAiConfigModelCandidate(config({ apiKey: "", savedSecrets: ["apiKey"] }), true)).toBe(true);
+    expect(isAiConfigModelCandidate(config({ apiKey: "", savedSecrets: ["customHeaders.X-Tenant"] }), true)).toBe(false);
+  });
+
   it.each(["codex-cli", "claude-code-cli", "opencode-cli", "pi-agent-cli", "cursor-cli", "grok-cli", "codebuddy-cli", "qoder-cli"] as const)("keeps %s configs eligible without endpoint, API key, or model metadata", (provider) => {
     expect(
       isAiConfigModelCandidate(

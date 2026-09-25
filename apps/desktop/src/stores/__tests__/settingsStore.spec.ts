@@ -5,6 +5,7 @@ import {
   AI_PROVIDER_PARTNER_PRESETS,
   AI_PROVIDER_PRESETS,
   DEFAULT_EDITOR_SETTINGS,
+  DEFAULT_MCP_GLOBAL_POLICY,
   EXECUTE_MODE_CURRENT_DEFAULT_VERSION,
   SIDEBAR_BROWSE_OBJECTS_MIGRATION_VERSION,
   enforceRightSidebarPanelExclusivity,
@@ -600,9 +601,9 @@ describe("normalizeDesktopSettings", () => {
 });
 
 describe("normalizeMcpGlobalPolicy", () => {
-  it("defaults to all connections with writes allowed", () => {
+  it("defaults to all connections in read-only mode until a policy is saved", () => {
     expect(normalizeMcpGlobalPolicy(undefined)).toEqual({
-      readOnly: false,
+      readOnly: true,
       allowDangerousSql: false,
       allowedConnectionIds: null,
       allowedGroupIds: [],
@@ -633,6 +634,14 @@ describe("normalizeMcpGlobalPolicy", () => {
       configured: true,
       queryTimeoutSecs: null,
     });
+  });
+
+  it("keeps the effective read-only default for an unconfigured backend policy", () => {
+    expect(normalizeMcpGlobalPolicy({ configured: false }).readOnly).toBe(true);
+    expect(normalizeMcpGlobalPolicy({ configured: false, readOnly: true }).readOnly).toBe(true);
+    expect(DEFAULT_MCP_GLOBAL_POLICY.readOnly).toBe(true);
+    expect(normalizeMcpGlobalPolicy({ configured: true }).readOnly).toBe(false);
+    expect(normalizeMcpGlobalPolicy({ configured: true, readOnly: false }).readOnly).toBe(false);
   });
 
   it("preserves an empty allowlist as deny all", () => {
@@ -834,7 +843,67 @@ describe("settingsStore AI API key normalization", () => {
     await store.createAiConfig(config);
 
     expect(saveAiConfigItem).toHaveBeenCalledWith(expect.objectContaining({ apiKey: "secret" }));
-    expect(store.aiConfigs[0].apiKey).toBe("secret");
+    // The typed key is handed to the backend and only its saved marker stays in memory.
+    expect(store.aiConfigs[0].apiKey).toBe("");
+    expect(store.aiConfigs[0].savedSecrets).toEqual(["apiKey"]);
+  });
+
+  it("keeps stored secrets by sending blanks and redacts newly typed secrets after an update", async () => {
+    const saveAiConfigItem = vi.fn().mockResolvedValue(undefined);
+    vi.doMock("@/lib/backend/api", () => ({
+      saveAiConfigItem,
+      saveAiChatSelection: vi.fn().mockResolvedValue(undefined),
+    }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+    store.aiConfigs = [
+      makeTestConfig({
+        id: "c1",
+        apiKey: "",
+        customHeaders: { "X-Tenant": "" },
+        savedSecrets: ["apiKey", "customHeaders.X-Tenant"],
+      }),
+    ];
+
+    await store.updateAiConfigItem("c1", {
+      customHeaders: { "X-Tenant": "", "X-Trace": "typed-value" },
+      proxyEnabled: true,
+      proxyUrl: "http://user:pass@proxy.local:8080",
+    });
+
+    expect(saveAiConfigItem).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "c1",
+        apiKey: "",
+        customHeaders: { "X-Tenant": "", "X-Trace": "typed-value" },
+        proxyUrl: "http://user:pass@proxy.local:8080",
+      }),
+    );
+    expect(store.aiConfigs[0]).toMatchObject({
+      apiKey: "",
+      proxyUrl: "",
+      customHeaders: { "X-Tenant": "", "X-Trace": "" },
+    });
+    expect(store.aiConfigs[0].savedSecrets).toEqual(["apiKey", "proxyUrl", "customHeaders.X-Tenant", "customHeaders.X-Trace"]);
+  });
+
+  it("drops explicitly cleared secrets from the saved markers", async () => {
+    const saveAiConfigItem = vi.fn().mockResolvedValue(undefined);
+    vi.doMock("@/lib/backend/api", () => ({
+      saveAiConfigItem,
+      saveAiChatSelection: vi.fn().mockResolvedValue(undefined),
+    }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+    store.aiConfigs = [makeTestConfig({ id: "c1", apiKey: "", savedSecrets: ["apiKey"] })];
+
+    await store.updateAiConfigItem("c1", { apiKey: "", clearedSecrets: ["apiKey"] });
+
+    expect(saveAiConfigItem).toHaveBeenCalledWith(expect.objectContaining({ clearedSecrets: ["apiKey"] }));
+    expect(store.aiConfigs[0].savedSecrets).toEqual([]);
+    expect(store.aiConfigs[0].clearedSecrets).toBeUndefined();
   });
 
   it("trims API keys when normalizing loaded configurations", () => {
@@ -1576,6 +1645,38 @@ describe("settingsStore regular expression match limit persistence", () => {
 
     expect(store.editorSettings.regexMaxMatchCount).toBe(2500);
     expect(saveEditorSettings).toHaveBeenCalledWith(expect.objectContaining({ regexMaxMatchCount: 2500 }));
+  });
+});
+
+describe("settingsStore legacy AI config migration", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    setActivePinia(createPinia());
+  });
+
+  it("tells the backend where to copy redacted legacy secrets from", async () => {
+    const saveAiConfigs = vi.fn().mockResolvedValue(undefined);
+    const legacy = { provider: "openai", apiKey: "", authMethod: "bearer", endpoint: "https://api.openai.com/v1", model: "gpt-4o", apiStyle: "completions", savedSecrets: ["apiKey"] };
+    vi.doMock("@/lib/backend/api", () => ({
+      loadAiConfigs: vi.fn().mockResolvedValue([]),
+      loadAiConfig: vi.fn().mockResolvedValue(legacy),
+      loadAiProviderConfigs: vi.fn().mockResolvedValue({
+        openai: legacy,
+        deepseek: { provider: "deepseek", apiKey: "", authMethod: "bearer", endpoint: "https://api.deepseek.com", model: "deepseek-chat", apiStyle: "completions", savedSecrets: ["apiKey", "customHeaders.X-Tenant"], customHeaders: { "X-Tenant": "" } },
+      }),
+      saveAiConfigs,
+      loadAiChatSelection: vi.fn().mockResolvedValue(null),
+      saveAiChatSelection: vi.fn().mockResolvedValue(undefined),
+    }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+    await store.initAiConfigs();
+
+    const saved = saveAiConfigs.mock.calls[0][0] as AiConfigItem[];
+    expect(saved.map((item) => item.legacySecretsFrom)).toEqual(["legacy", "provider:deepseek"]);
+    expect(store.aiConfigs.map((item) => item.legacySecretsFrom)).toEqual([undefined, undefined]);
+    expect(store.aiConfigs.map((item) => item.savedSecrets)).toEqual([["apiKey"], ["apiKey", "customHeaders.X-Tenant"]]);
   });
 });
 

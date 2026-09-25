@@ -190,6 +190,27 @@ describe("useAiModelCatalog", () => {
     expect(apiMock.aiListModels).toHaveBeenCalledTimes(2);
   });
 
+  it("sends the config id so the backend can resolve redacted secrets", async () => {
+    apiMock.aiListModels.mockResolvedValue([{ id: "model" }]);
+    apiMock.aiResolveModelEffort.mockResolvedValue({ kind: "unsupported" });
+    const redacted: AiConfigItem = { ...config(), apiKey: "", savedSecrets: ["apiKey"] };
+
+    await catalog.loadModels(redacted);
+    await catalog.resolveEffort(redacted, "manual-model");
+
+    expect(apiMock.aiListModels).toHaveBeenCalledWith(expect.objectContaining({ id: "config-1", apiKey: "" }), "config-1");
+    expect(apiMock.aiResolveModelEffort).toHaveBeenCalledWith(expect.objectContaining({ id: "config-1", model: "manual-model" }), "manual-model", "config-1");
+  });
+
+  it("refreshes the catalog when a stored secret is saved or cleared", async () => {
+    apiMock.aiListModels.mockResolvedValueOnce([{ id: "before" }]).mockResolvedValueOnce([{ id: "after" }]);
+    const withoutKey: AiConfigItem = { ...config(), apiKey: "", savedSecrets: [] };
+
+    await expect(catalog.loadModels(withoutKey)).resolves.toEqual([{ id: "before" }]);
+    await expect(catalog.loadModels({ ...withoutKey, savedSecrets: ["apiKey"] })).resolves.toEqual([{ id: "after" }]);
+    expect(apiMock.aiListModels).toHaveBeenCalledTimes(2);
+  });
+
   it("does not let a stale request overwrite a newer provider catalog", async () => {
     let resolveInitial: ((models: { id: string }[]) => void) | undefined;
     apiMock.aiListModels

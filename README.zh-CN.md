@@ -410,6 +410,26 @@ environment:
 
 如果自行从源码构建前端并希望使用绝对资源路径，可在 `pnpm build` 前设置 `VITE_DBX_BASE_PATH=/dbx/`。
 
+### Web 安全配置
+
+DBX Web 使用访问密码保护界面。可通过 `DBX_PASSWORD` 设置（推荐用于 Docker；每次启动都会覆盖已保存的密码，因此无法在界面中修改）。未设置 `DBX_PASSWORD` 时，由首次访问者在浏览器中设置密码：服务器本机的浏览器（`localhost`）可直接设置，其他客户端还需填写 DBX 启动时打印在日志中的一次性**初始化令牌**（`docker logs dbx`）。`DBX_DISABLE_PASSWORD=1` 会关闭认证，仅应在可信机器上或自有认证之后使用。
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `DBX_HOST` | `127.0.0.1` | 监听地址。Docker 镜像设置为 `0.0.0.0`。在非回环地址上监听且设置了 `DBX_DISABLE_PASSWORD` 时会输出警告。 |
+| `DBX_PORT` | `4224` | 监听端口。 |
+| `DBX_ALLOWED_HOSTS` | 未设置 | 允许访问 `/api` 的主机名，逗号分隔（`*.example.com` 匹配子域名，`*` 关闭检查）。设置后始终检查；未设置时仅在 `DBX_DISABLE_PASSWORD` 下检查，此时允许 IP 地址和 `localhost`（防御 DNS 重绑定）。 |
+| `DBX_TRUSTED_PROXIES` | 未设置 | 反向代理的 IP/CIDR，逗号分隔（例如 `172.16.0.0/12`）。只有这些代理发送的 `X-Forwarded-For`/`X-Real-IP`（按客户端限制登录频率）、`X-Forwarded-Proto` 和 `X-Forwarded-Host` 会被信任。 |
+| `DBX_COOKIE_SECURE` | `auto` | `true`/`false` 强制设置会话 Cookie 的 `Secure` 标记；`auto` 在受信代理发送 `X-Forwarded-Proto: https` 时设置。 |
+| `DBX_PUBLIC_ORIGIN` | 未设置 | 代理未保留 `Host` 头时，额外允许建立 WebSocket 的浏览器来源（例如 `https://dbx.example.com`）。 |
+| `DBX_SESSION_IDLE_TIMEOUT_SECS` | `43200`（12 小时） | 会话空闲超过该时长后退出登录。 |
+| `DBX_SESSION_MAX_AGE_SECS` | `604800`（7 天） | 会话最长有效期，同时作为 Cookie 的 `Max-Age`。 |
+| `DBX_SESSION_MAX_COUNT` | `1024` | 最大并发会话数，超出时移除最久未使用的会话。 |
+| `DBX_CSP` | 内置策略 | 覆盖 Web 界面的 `Content-Security-Policy`；设为空值则不发送。 |
+| `DBX_ALLOW_UNSIGNED_PLUGINS` | 关闭 | 设为 `1` 后允许在 Web 界面安装未签名插件。`DBX_DEMO_MODE` 下始终禁止。 |
+
+登录、初始化令牌和修改密码按客户端 IP 限制尝试次数（失败 5 次后锁定，锁定时间从 60 秒起指数增长）。修改密码后，其他所有会话都会退出登录。
+
 浏览器访问 `http://localhost:4224`。支持 amd64 / arm64 双架构镜像。
 
 ## 快速开始

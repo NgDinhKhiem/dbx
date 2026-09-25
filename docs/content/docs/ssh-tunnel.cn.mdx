@@ -108,13 +108,35 @@ DBX 支持：
 
 在 PHP 服务器上配置环境变量：
 
-| 变量                             | 必填 | 说明                                         |
-| -------------------------------- | ---- | -------------------------------------------- |
-| `DBX_TUNNEL_TOKEN`               | 是   | 共享 token。DBX 里填写同一个值。             |
-| `DBX_TUNNEL_ALLOWED_HOSTS`       | 否   | 允许连接的目标主机列表，逗号分隔，强烈建议配置。 |
-| `DBX_TUNNEL_DIR`                 | 否   | 会话队列目录，默认使用临时目录。             |
-| `DBX_TUNNEL_MAX_SESSION_SECONDS` | 否   | 会话最长生命周期，默认 `3600` 秒。           |
-| `DBX_TUNNEL_PHP`                 | 否   | 当 PHP-FPM 没有 `fastcgi_finish_request` 时，用于启动 worker 的 PHP CLI 路径。 |
+| 变量                              | 必填 | 说明 |
+| --------------------------------- | ---- | ---- |
+| `DBX_TUNNEL_TOKEN`                | 是   | 共享 token。DBX 里填写同一个值。 |
+| `DBX_TUNNEL_ALLOWED_HOSTS`        | 是\* | 允许连接的目标列表，逗号分隔（见下文）。也可使用别名 `DBX_TUNNEL_ALLOWED_TARGETS`。 |
+| `DBX_TUNNEL_ALLOW_ANY_TARGET`     | 是\* | 设为 `true` 时允许任意目标，不使用 allow-list。回环、链路本地和云元数据地址仍被拒绝。 |
+| `DBX_TUNNEL_ALLOW_INSECURE_HTTP`  | 否   | 设为 `true` 时接受明文 HTTP 请求。默认 `false`，只接受 HTTPS。 |
+| `DBX_TUNNEL_TRUSTED_PROXIES`      | 否   | 受信任代理的 IP 或 CIDR，逗号分隔；TLS 在反向代理终止时，只信任这些代理发来的 `X-Forwarded-Proto`。 |
+| `DBX_TUNNEL_DEFAULT_PORTS`        | 否   | 只写主机名的 allow-list 条目允许的端口。默认是常见数据库端口（3306、5432、1433、1521、27017、6379、8123、9000、9200 等）。 |
+| `DBX_TUNNEL_MAX_SESSIONS`         | 否   | 最大并发会话数，默认 `16`。PHP-FPM 下每个会话占用一个 worker，请小于 `pm.max_children`。 |
+| `DBX_TUNNEL_IDLE_TIMEOUT_SECONDS` | 否   | DBX 超过该时长没有轮询或写入时关闭会话，默认 `120` 秒。 |
+| `DBX_TUNNEL_MAX_SESSION_SECONDS`  | 否   | 会话最长生命周期，默认 `3600` 秒。 |
+| `DBX_TUNNEL_MAX_WRITE_BYTES`      | 否   | 单次 `write` 请求体上限，默认 `1048576`（1 MiB）。 |
+| `DBX_TUNNEL_MAX_QUEUE_BYTES`      | 否   | 每个方向的缓冲上限，默认 `16777216`（16 MiB）。 |
+| `DBX_TUNNEL_DIR`                  | 否   | 会话队列目录，默认是系统临时目录下的 `dbx_tunnel_<uid>`。目录必须归 PHP 运行用户所有，权限会被强制设为 `0700`。 |
+| `DBX_TUNNEL_PHP`                  | 否   | 当 PHP-FPM 没有 `fastcgi_finish_request` 时，用于启动 worker 的 PHP CLI 路径。 |
+
+\* `DBX_TUNNEL_ALLOWED_HOSTS` 与 `DBX_TUNNEL_ALLOW_ANY_TARGET` 必须设置其一；都未设置时脚本拒绝所有连接。
+
+allow-list 条目格式：
+
+| 条目 | 允许范围 |
+| ---- | -------- |
+| `mysql.internal:3306` | 仅该主机和端口 |
+| `pg.internal` | 该主机的默认数据库端口 |
+| `redis.internal:*` | 该主机的任意端口 |
+| `[2001:db8::5]:5432` | 带端口的 IPv6 地址 |
+| `*.db.example.com:5432` | 该端口上的任意子域名 |
+
+即使主机名在 allow-list 中，回环（`127.0.0.0/8`、`::1`）、链路本地（`169.254.0.0/16`、`fe80::/10`）和云元数据地址也会被拒绝。要访问 PHP 服务器本机上的数据库，请显式列出 IP 或 `localhost`，例如 `127.0.0.1:3306` 或 `localhost:3306`。脚本只解析一次主机名，并连接到已校验的 IP，因此 DNS 变化无法把允许的主机名重定向到内网地址。
 
 在 DBX 里添加 **HTTP 隧道** 层，并填写：
 
@@ -143,7 +165,7 @@ DBX 数据库驱动
 1. DBX 在当前运行环境中启动一个 TCP 监听端口。
 2. 数据库驱动连接这个本地端口。
 3. DBX 向 `dbx_tunnel.php` 发送 `open`，带上 session id、目标主机、目标端口和连接超时。
-4. PHP 脚本校验 token 和 allow-list，然后启动 worker，worker 打开到数据库的 TCP socket。
+4. PHP 脚本校验 HTTPS、token、allow-list 和会话数上限，然后启动 worker，worker 打开到数据库的 TCP socket。
 5. 数据库驱动发出的字节由 DBX 通过 `write` 发给脚本。
 6. DBX 通过 `read` 轮询脚本；脚本返回数据库响应字节后，DBX 写回本地数据库驱动连接。
 7. 连接结束时，DBX 发送 `close`，PHP worker 关闭数据库 socket。
@@ -152,9 +174,11 @@ DBX 数据库驱动
 
 ### 安全与限制
 
-- 脚本 URL 建议使用 HTTPS。
+- 脚本 URL 应使用 HTTPS。除非设置 `DBX_TUNNEL_ALLOW_INSECURE_HTTP=true`，脚本会拒绝明文 HTTP；TLS 在反向代理终止时请配置 `DBX_TUNNEL_TRUSTED_PROXIES`。
 - `DBX_TUNNEL_TOKEN` 应使用足够长的随机值。
-- 建议配置 `DBX_TUNNEL_ALLOWED_HOSTS`，避免脚本变成通用内网 TCP 转发入口。
+- 优先使用带明确 `host:port` 的 `DBX_TUNNEL_ALLOWED_HOSTS`，而不是 `DBX_TUNNEL_ALLOW_ANY_TARGET`，避免脚本变成通用内网 TCP 转发入口。
+- 错误响应只返回通用信息，连接细节写入 PHP 错误日志。
+- 从旧版脚本升级：已有部署需要配置 `DBX_TUNNEL_ALLOWED_HOSTS`（或 `DBX_TUNNEL_ALLOW_ANY_TARGET=true`）；使用明文 HTTP 的部署还需要 `DBX_TUNNEL_ALLOW_INSECURE_HTTP=true`。
 - 如果条件允许，限制脚本路径的公网访问范围。
 - HTTP 隧道部署方便，但通常比直连、VPN、SSH 慢，因为它通过 HTTP 轮询和服务器端队列搬运数据库字节流。
 - 如果和其他连接层一起使用，HTTP 隧道必须放在隧道/代理第一层，因为它是最外层网络边界。

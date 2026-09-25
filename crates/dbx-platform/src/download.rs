@@ -53,6 +53,9 @@ pub async fn race_download(
     race_download_urls(client, &download_candidate_urls(github_url, r2_path), user_agent).await
 }
 
+/// Returns the response of whichever mirror answers first. Mirrors are not
+/// trusted individually: callers must verify the payload (size plus a SHA-256
+/// taken from a signed manifest such as the agent registry) before using it.
 pub async fn race_download_urls(
     client: &reqwest::Client,
     urls: &[String],

@@ -45,6 +45,7 @@ GET /api/auth/check
 | --- | --- |
 | `required` | 已启用密码保护 |
 | `setup_required` | 仍需首次设置密码 |
+| `setup_token_required` | 初始化时必须携带服务器日志中打印的一次性令牌（服务器本机上的浏览器为 false） |
 | `authenticated` | 当前请求已持有有效会话 |
 
 ### 首次设置密码
@@ -54,9 +55,12 @@ POST /api/auth/setup
 Content-Type: application/json
 
 {
-  "password": "your-password"
+  "password": "your-password",
+  "setup_token": "token-from-the-server-log"
 }
 ```
+
+未配置密码时，DBX 会在日志中打印一次性初始化令牌（Docker 可用 `docker logs <容器名>` 查看）。不在服务器本机上的客户端必须通过 `setup_token` 提交该令牌，否则返回 `403`（`SETUP_TOKEN_INVALID`）。服务器部署建议直接设置 `DBX_PASSWORD`。
 
 ### 登录
 
@@ -87,6 +91,7 @@ Cookie: dbx_session=...
 | `DBX_PASSWORD` | 容器启动时设置初始密码 |
 | `DBX_DISABLE_PASSWORD=1` | 完全关闭密码保护 |
 | `DBX_PORT` | 修改监听端口，默认 `4224` |
+| `DBX_HOST` | 监听地址，默认 `127.0.0.1`；Docker 镜像设置为 `0.0.0.0` |
 | `DBX_DATA_DIR` | 存放 `dbx.db` 的数据目录 |
 | `DBX_PUBLIC_BASE_PATH` | 在子路径下提供服务，例如 `/dbx` |
 | `DBX_MAX_UPLOAD_MB` | 调整通用请求及上传文件大小上限，默认 1024 MB；multipart 路由会额外预留固定的协议开销（如需上传 4 GiB 文件，请设为至少 `4096`） |
@@ -310,7 +315,7 @@ Content-Type: application/json
 {
   "env": {
     "DBX_WEB_URL": "http://localhost:4224",
-    "DBX_WEB_PASSWORD": "your-password"
+    "DBX_WEB_PASSWORD": "${DBX_WEB_PASSWORD}"
   }
 }
 ```

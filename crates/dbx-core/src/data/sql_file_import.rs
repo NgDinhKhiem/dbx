@@ -298,20 +298,19 @@ impl MySqlSqlFileExecutor {
         let execution_id = sql_file_statement_execution_id(&request.execution_id, statement_index);
         let registered = state.running_queries.register(execution_id.clone());
         let child_token = registered.token();
-        let cancel_task = {
+        // Aborted on drop, so the watcher does not outlive a cancelled or
+        // dropped import future (it would otherwise wait on `parent_token` forever).
+        let _cancel_task = AbortCancelWatcherOnDrop::spawn({
             let parent_token = token.clone();
             let running_queries = state.running_queries.clone();
             let execution_id = execution_id.clone();
-            tokio::spawn(async move {
+            async move {
                 parent_token.cancelled().await;
                 running_queries.cancel(&execution_id);
-            })
-        };
+            }
+        });
 
-        let result = self.execute_statement_inner(state, sql, &child_token, &execution_id).await;
-
-        cancel_task.abort();
-        result
+        self.execute_statement_inner(state, sql, &child_token, &execution_id).await
     }
 
     async fn execute_statement_inner(
@@ -2541,21 +2540,21 @@ async fn execute_sql_file_statement(
     let execution_id = sql_file_statement_execution_id(&request.execution_id, statement_index);
     let registered = state.running_queries.register(execution_id.clone());
     let child_token = registered.token();
-    let cancel_task = {
+    let _cancel_task = AbortCancelWatcherOnDrop::spawn({
         let parent_token = token.clone();
         let running_queries = state.running_queries.clone();
         let execution_id = execution_id.clone();
-        tokio::spawn(async move {
+        async move {
             parent_token.cancelled().await;
             running_queries.cancel(&execution_id);
-        })
-    };
+        }
+    });
 
     let timeout_secs = {
         let configs = state.configs.read().await;
         configs.get(&request.connection_id).map(|config| config.effective_query_timeout_secs())
     };
-    let result = execute_sql_statement_with_options(
+    execute_sql_statement_with_options(
         state,
         &request.connection_id,
         &request.database,
@@ -2564,10 +2563,26 @@ async fn execute_sql_file_statement(
         Some(child_token),
         QueryExecutionOptions { execution_id: Some(execution_id), timeout_secs, ..Default::default() },
     )
-    .await;
+    .await
+}
 
-    cancel_task.abort();
-    result
+/// Aborts a spawned cancel-forwarding task when dropped, covering both normal
+/// completion and the statement future being dropped mid-flight.
+struct AbortCancelWatcherOnDrop(tokio::task::AbortHandle);
+
+impl AbortCancelWatcherOnDrop {
+    fn spawn<F>(future: F) -> Self
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        Self(tokio::spawn(future).abort_handle())
+    }
+}
+
+impl Drop for AbortCancelWatcherOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 fn sql_file_statement_execution_id(parent_execution_id: &str, statement_index: usize) -> String {
@@ -2645,6 +2660,28 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_SQL_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    #[tokio::test]
+    async fn cancel_watcher_is_aborted_when_statement_future_is_dropped() {
+        let token = CancellationToken::new();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel::<()>();
+        let statement = async {
+            let parent_token = token.clone();
+            let _cancel_task = AbortCancelWatcherOnDrop::spawn(async move {
+                // Signals (by dropping the sender) when the task is aborted.
+                let _dropped_tx = dropped_tx;
+                parent_token.cancelled().await;
+            });
+            std::future::pending::<()>().await;
+        };
+        // Drop the statement future mid-flight, as a cancelled import would.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(10), statement).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), dropped_rx)
+            .await
+            .expect("watcher task should be aborted")
+            .expect_err("sender is dropped without sending");
+        assert!(!token.is_cancelled());
+    }
 
     #[test]
     fn manual_file_plan_keeps_insert_error_boundaries() {

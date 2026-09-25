@@ -167,7 +167,7 @@ pub(super) fn build_create_table_sql_with_partition_clause(
             }
         }
         if dialect == StructureDialect::Mysql && capabilities.comment && !clean(&column.comment).is_empty() {
-            parts.push(format!("COMMENT {}", quote_string(&clean(&column.comment))));
+            parts.push(format!("COMMENT {}", quote_string(dialect, &clean(&column.comment))));
         }
         column_definitions.push(parts.join(" "));
     }
@@ -208,7 +208,7 @@ pub(super) fn build_create_table_sql_with_partition_clause(
         if !table_comment.is_empty() {
             if matches!(dialect, StructureDialect::Mysql | StructureDialect::GaussdbM) {
                 if let Some(last) = statements.last_mut() {
-                    append_mysql_table_option(last, &format!("COMMENT = {}", quote_string(&table_comment)));
+                    append_mysql_table_option(last, &format!("COMMENT = {}", quote_string(dialect, &table_comment)));
                 }
             } else if matches!(
                 dialect,
@@ -218,9 +218,10 @@ pub(super) fn build_create_table_sql_with_partition_clause(
                     | StructureDialect::Oscar
                     | StructureDialect::H2
             ) {
-                statements.push(format!("COMMENT ON TABLE {table} IS {};", quote_string(&table_comment)));
+                statements.push(format!("COMMENT ON TABLE {table} IS {};", quote_string(dialect, &table_comment)));
             } else if dialect == StructureDialect::ClickHouse {
-                statements.push(format!("ALTER TABLE {table} MODIFY COMMENT {};", quote_string(&table_comment)));
+                statements
+                    .push(format!("ALTER TABLE {table} MODIFY COMMENT {};", quote_string(dialect, &table_comment)));
             } else if dialect == StructureDialect::SqlServer {
                 statements.extend(build_sqlserver_table_comment_sql_for_profile(
                     &table,
@@ -248,7 +249,7 @@ pub(super) fn build_create_table_sql_with_partition_clause(
                 statements.push(format!(
                     "COMMENT ON COLUMN {table}.{} IS {};",
                     quote_new_ident(options.database_type, dialect, &column.name),
-                    quote_string(&clean(&column.comment))
+                    quote_string(dialect, &clean(&column.comment))
                 ));
             }
         }
@@ -259,7 +260,7 @@ pub(super) fn build_create_table_sql_with_partition_clause(
                 statements.push(format!(
                     "ALTER TABLE {table} COMMENT COLUMN {} {};",
                     quote_new_ident(options.database_type, dialect, &column.name),
-                    quote_string(&clean(&column.comment))
+                    quote_string(dialect, &clean(&column.comment))
                 ));
             }
         }

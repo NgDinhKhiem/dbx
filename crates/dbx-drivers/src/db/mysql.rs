@@ -361,8 +361,11 @@ pub enum MySqlQueryStreamItem {
     Row(Vec<serde_json::Value>),
 }
 
+/// MySQL string literal that stays a single token with and without `NO_BACKSLASH_ESCAPES`
+/// (which a session can enable through `sql_mode`): backslashes are doubled and quotes are
+/// doubled as `''` rather than escaped as `\'`, which would close the literal in that mode.
 pub(super) fn quote_value(s: &str) -> String {
-    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
+    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''"))
 }
 
 pub(super) fn quote_identifier(s: &str) -> String {
@@ -7429,8 +7432,17 @@ mod tests {
     fn mysql_exact_table_status_sql_quotes_identifiers_and_names() {
         assert_eq!(
             show_table_status_exact_sql("sales`archive", "order's"),
-            "SHOW TABLE STATUS FROM `sales``archive` WHERE Name = 'order\\'s'"
+            "SHOW TABLE STATUS FROM `sales``archive` WHERE Name = 'order''s'"
         );
+    }
+
+    #[test]
+    fn quote_value_is_safe_with_and_without_no_backslash_escapes() {
+        assert_eq!(quote_value("order's"), "'order''s'");
+        assert_eq!(quote_value("a\\b"), "'a\\\\b'");
+        // Under NO_BACKSLASH_ESCAPES the old `\'` form closed the literal early.
+        let quoted = quote_value("x\\' OR 1=1 -- ");
+        assert_eq!(quoted, "'x\\\\'' OR 1=1 -- '");
     }
 
     #[test]

@@ -1,10 +1,14 @@
 #!/usr/bin/env node
 
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { existsSync, lstatSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve, sep } from "node:path";
 
 const LOCALES_DIR = "apps/desktop/src/i18n/locales";
+// Bounds for one run: PR content is untrusted, so neither the number of keys
+// sent to the model nor the requested completion size may grow without limit.
+const MAX_NEW_KEYS = Number.parseInt(process.env.I18N_MAX_NEW_KEYS || "", 10) || 200;
+const MAX_COMPLETION_TOKENS = 24000;
 const SOURCE_LOCALE = "zh-CN";
 const TARGET_LOCALES = ["en", "es", "it", "ja", "ko", "pt-BR", "zh-TW"];
 // `git show <ref>:<path>` needs forward slashes even on Windows, where
@@ -31,6 +35,7 @@ const model = process.env.DEEPSEEK_MODEL || "deepseek-v4-pro";
 async function main() {
   const sourcePath = localePath(SOURCE_LOCALE);
   const baseSourceText = readBaseFile(sourcePath);
+  assertRegularLocaleFile(sourcePath);
   const headSource = parseLocaleFile(readFileSync(sourcePath, "utf8"), sourcePath);
   const baseSource = parseLocaleFile(baseSourceText, `${baseRef}:${sourcePath}`);
 
@@ -42,6 +47,13 @@ async function main() {
 
   if (newSourceKeys.length === 0) {
     console.log(`No new ${SOURCE_LOCALE} i18n keys compared with ${baseRef}`);
+    return;
+  }
+
+  if (newSourceKeys.length > MAX_NEW_KEYS) {
+    console.log(
+      `::warning::Found ${newSourceKeys.length} new ${SOURCE_LOCALE} i18n keys, more than the ${MAX_NEW_KEYS}-key autofill limit; skipping autofill. Add translations manually.`,
+    );
     return;
   }
 
@@ -58,6 +70,7 @@ async function main() {
   for (const locale of TARGET_LOCALES) {
     const path = localePath(locale);
     if (!existsSync(path)) throw new Error(`Missing locale file: ${path}`);
+    assertRegularLocaleFile(path);
 
     const text = readFileSync(path, "utf8");
     const parsed = parseLocaleFile(text, path);
@@ -108,6 +121,27 @@ function localePath(locale) {
   return join(LOCALES_DIR, `${locale}.ts`);
 }
 
+// Locale files come from the (possibly forked) PR checkout. Only regular files
+// whose real path stays inside the locales directory may be read or written, so
+// symlinks and "../" imports cannot reach other files on the runner.
+function isInsideLocalesDir(path) {
+  let root;
+  let real;
+  try {
+    root = realpathSync(LOCALES_DIR);
+    real = realpathSync(path);
+  } catch {
+    return false;
+  }
+  return real.startsWith(root + sep);
+}
+
+function assertRegularLocaleFile(path) {
+  if (lstatSync(path).isSymbolicLink() || !isInsideLocalesDir(path)) {
+    throw new Error(`Refusing to use ${path}: locale files must be regular files inside ${LOCALES_DIR}`);
+  }
+}
+
 function readBaseFile(path) {
   try {
     return execFileSync("git", ["show", `${baseRef}:${refPath(path)}`], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
@@ -142,7 +176,7 @@ async function translateMissing(locale, keys, sourceLeaves) {
       model,
       response_format: { type: "json_object" },
       temperature: 0.1,
-      max_tokens: Math.max(1024, keys.length * 120),
+      max_tokens: Math.min(MAX_COMPLETION_TOKENS, Math.max(1024, keys.length * 120)),
       messages: [
         {
           role: "system",
@@ -422,6 +456,10 @@ function parseImportedObjects(text, file, visited = new Set()) {
   for (const match of text.matchAll(importPattern)) {
     const modulePath = resolve(dirname(actualFile), `${match[2]}.ts`);
     if (!existsSync(modulePath)) continue;
+    if (lstatSync(modulePath).isSymbolicLink() || !isInsideLocalesDir(modulePath)) {
+      console.log(`Ignoring import outside ${LOCALES_DIR}: ${match[2]}`);
+      continue;
+    }
     const moduleText = readFileSync(modulePath, "utf8");
     for (const [name, object] of parseImportedObjects(moduleText, modulePath, visited)) {
       if (!result.has(name)) result.set(name, object);

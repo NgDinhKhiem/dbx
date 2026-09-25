@@ -6,7 +6,7 @@ use std::net::IpAddr;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{timeout, Duration};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -108,20 +108,29 @@ struct RemoteEndpoint {
 }
 
 async fn proxy_forward_loop(listener: TcpListener, proxy: ProxyEndpoint, remote: RemoteEndpoint) {
+    // Bridge tasks are owned by this JoinSet: `stop_tunnel` aborts this task,
+    // and dropping the set aborts every established bridge with it.
+    let mut bridges = JoinSet::new();
     loop {
-        let (mut inbound, _) = match listener.accept().await {
-            Ok(pair) => pair,
-            Err(_) => break,
-        };
-        let proxy = proxy.clone();
-        let remote = remote.clone();
-        tokio::spawn(async move {
-            let Ok(mut outbound) = connect_via_proxy(&proxy, &remote).await else {
-                return;
-            };
-            let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
-        });
+        tokio::select! {
+            accepted = listener.accept() => {
+                let Ok((mut inbound, _)) = accepted else {
+                    break;
+                };
+                let proxy = proxy.clone();
+                let remote = remote.clone();
+                bridges.spawn(async move {
+                    let Ok(mut outbound) = connect_via_proxy(&proxy, &remote).await else {
+                        return;
+                    };
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                });
+            }
+            Some(_) = bridges.join_next(), if !bridges.is_empty() => {}
+        }
     }
+    // A listener failure stops new connections but keeps established ones.
+    while bridges.join_next().await.is_some() {}
 }
 
 async fn connect_via_proxy(proxy: &ProxyEndpoint, remote: &RemoteEndpoint) -> Result<TcpStream, String> {
@@ -836,6 +845,51 @@ mod tests {
 
         mock.await.unwrap();
         assert_eq!(&actual_payload, payload);
+    }
+
+    #[tokio::test]
+    async fn stop_tunnel_aborts_established_bridges() {
+        // A minimal HTTP CONNECT proxy that echoes the tunneled bytes back.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_port = listener.local_addr().unwrap().port();
+        let mock = tokio::spawn(async move {
+            let (mut connection, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 256];
+            while find_http_header_end(&request).is_none() {
+                let n = connection.read(&mut buf).await.unwrap();
+                request.extend_from_slice(&buf[..n]);
+            }
+            connection.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await.unwrap();
+            loop {
+                let n = connection.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                if connection.write_all(&buf[..n]).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let manager = ProxyTunnelManager::new();
+        let local_port = manager
+            .start_tunnel("test", ProxyType::Http, "127.0.0.1", proxy_port, "", "", "db.example.com", 5432)
+            .await
+            .unwrap();
+        let mut client = TcpStream::connect(("127.0.0.1", local_port)).await.unwrap();
+        client.write_all(b"ping").await.unwrap();
+        let mut response = [0_u8; 4];
+        timeout(Duration::from_secs(5), client.read_exact(&mut response)).await.unwrap().unwrap();
+        assert_eq!(&response, b"ping");
+
+        manager.stop_tunnel("test").await;
+        let mut buf = [0_u8; 1];
+        let read = timeout(Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .expect("the bridge must be torn down when the tunnel stops");
+        assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+        timeout(Duration::from_secs(2), mock).await.expect("proxy side sees the bridge close").unwrap();
     }
 
     // ── test_target parsing ───────────────────────────────────────────────

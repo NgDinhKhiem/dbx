@@ -95,7 +95,7 @@ pub fn build_database_search_sql(options: DatabaseSearchSqlOptions) -> Option<Da
         conditions.push(format!(
             "{} LIKE {} ESCAPE '~'",
             text_cast_expression(options.database_type, options.driver_profile.as_deref(), &identifier),
-            sql_string_literal(&like_pattern(&term))
+            sql_string_literal(options.database_type, &like_pattern(&term))
         ));
     }
     for column in &numeric_columns {
@@ -215,8 +215,10 @@ fn parse_numeric_term(term: &str) -> Option<String> {
     }
 }
 
-fn sql_string_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
+/// Quote a string literal for `database_type`: MySQL-family engines and ClickHouse also escape
+/// backslashes so a value such as `x\'; DROP TABLE t; -- ` stays inside the literal.
+fn sql_string_literal(database_type: Option<DatabaseType>, value: &str) -> String {
+    crate::value_literals::quote_string_literal_for_database(database_type, value)
 }
 
 fn like_pattern(term: &str) -> String {
@@ -264,12 +266,12 @@ fn sql_value_literal(database_type: Option<DatabaseType>, column: &DatabaseSearc
                 return value.trim().to_string();
             }
             if database_type == Some(DatabaseType::SqlServer) {
-                format!("N{}", sql_string_literal(value))
+                format!("N{}", sql_string_literal(database_type, value))
             } else {
-                sql_string_literal(value)
+                sql_string_literal(database_type, value)
             }
         }
-        other => sql_string_literal(&other.to_string()),
+        other => sql_string_literal(database_type, &other.to_string()),
     }
 }
 
@@ -385,5 +387,45 @@ mod tests {
         });
 
         assert_eq!(where_clause, "[id] = 42");
+    }
+
+    #[test]
+    fn result_row_literals_escape_backslashes_for_mysql_family() {
+        let payload = "x\\'; DROP TABLE users; -- ";
+        let where_clause = build_search_result_where(SearchResultWhereOptions {
+            database_type: Some(DatabaseType::Mysql),
+            columns: vec![col("code", "varchar", true)],
+            result_columns: vec!["code".to_string()],
+            row: vec![Value::from(payload)],
+            matched_columns: Vec::new(),
+        });
+        assert_eq!(where_clause, "`code` = 'x\\\\''; DROP TABLE users; -- '");
+        let literal = where_clause.strip_prefix("`code` = ").unwrap();
+        assert!(crate::value_literals::mysql_literal_is_single_token(literal, true));
+        assert!(crate::value_literals::mysql_literal_is_single_token(literal, false));
+
+        let where_clause = build_search_result_where(SearchResultWhereOptions {
+            database_type: Some(DatabaseType::Postgres),
+            columns: vec![col("code", "varchar", true)],
+            result_columns: vec!["code".to_string()],
+            row: vec![Value::from(payload)],
+            matched_columns: Vec::new(),
+        });
+        assert_eq!(where_clause, "\"code\" = 'x\\''; DROP TABLE users; -- '");
+    }
+
+    #[test]
+    fn search_term_literal_escapes_backslashes_for_mysql() {
+        let sql = build_database_search_sql(DatabaseSearchSqlOptions {
+            database_type: Some(DatabaseType::Mysql),
+            driver_profile: None,
+            schema: None,
+            table_name: "users".to_string(),
+            columns: vec![col("email", "varchar", false)],
+            term: "a\\'b".to_string(),
+            limit: Some(20),
+        })
+        .unwrap();
+        assert!(sql.sql.contains("LIKE '%a\\\\''b%' ESCAPE '~'"), "{}", sql.sql);
     }
 }

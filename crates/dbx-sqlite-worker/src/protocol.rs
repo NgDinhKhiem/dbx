@@ -28,6 +28,12 @@ pub struct WorkerResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum WorkerBody {
+    // `Err` must come first: every `Ok` field is optional, so an untagged `Ok`
+    // would also accept `{"error": ...}` and silently turn worker errors into
+    // empty successes.
+    Err {
+        error: String,
+    },
     Ok {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         columns: Option<Vec<String>>,
@@ -41,9 +47,6 @@ pub enum WorkerBody {
         truncated: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pong: Option<bool>,
-    },
-    Err {
-        error: String,
     },
 }
 
@@ -88,6 +91,16 @@ impl WorkerBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_response_roundtrips_as_error() {
+        let response = WorkerResponse { id: 3, body: WorkerBody::err("near \"SELEC\": syntax error") };
+        let decoded: WorkerResponse = serde_json::from_str(&serde_json::to_string(&response).unwrap()).unwrap();
+        assert_eq!(decoded, response);
+        let ok = WorkerResponse { id: 4, body: WorkerBody::ok() };
+        let decoded: WorkerResponse = serde_json::from_str(&serde_json::to_string(&ok).unwrap()).unwrap();
+        assert_eq!(decoded, ok);
+    }
 
     #[test]
     fn request_roundtrip() {

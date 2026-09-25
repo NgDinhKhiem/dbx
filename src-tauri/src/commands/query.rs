@@ -911,18 +911,24 @@ pub fn build_hive_table_properties_sql(
     Ok(dbx_core::data_grid_sql::build_hive_table_properties_sql(options))
 }
 
+/// INSERT generation scales with the exported row count; synchronous commands
+/// run on the main thread, so it runs on the blocking pool instead.
 #[tauri::command]
-pub fn build_export_insert_statements(
+pub async fn build_export_insert_statements(
     options: dbx_core::database_export::BuildExportInsertStatementsOptions,
 ) -> Result<Vec<String>, String> {
-    dbx_core::database_export::build_export_insert_statements(options)
+    tauri::async_runtime::spawn_blocking(move || dbx_core::database_export::build_export_insert_statements(options))
+        .await
+        .map_err(|error| format!("Failed to build INSERT statements: {error}"))?
 }
 
 #[tauri::command]
-pub fn build_export_sql_insert(
+pub async fn build_export_sql_insert(
     options: dbx_core::database_export::BuildExportSqlInsertOptions,
 ) -> Result<String, String> {
-    dbx_core::database_export::build_export_sql_insert(options)
+    tauri::async_runtime::spawn_blocking(move || dbx_core::database_export::build_export_sql_insert(options))
+        .await
+        .map_err(|error| format!("Failed to build INSERT statements: {error}"))?
 }
 
 #[tauri::command]

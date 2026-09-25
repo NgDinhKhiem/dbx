@@ -70,6 +70,15 @@ describe("buildConnectionUrlCopy standard URL", () => {
     expect(buildConnectionUrlCopy(config({ ssl: true, url_params: "sslmode=verify-full" }), "url")).toBe("postgresql://app_user@db.example.com:5432/appdb?sslmode=verify-full");
   });
 
+  it("omits hidden (blank) sensitive params and never emits empty credential artifacts for redacted configs", () => {
+    const redacted = config({ password: "", url_params: "sslmode=require&password=&application_name=svc" });
+    expect(connectionUrlCopyFormats(redacted)).toEqual(["url", "jdbcUrl", "hostPort", "dsn", "psqlCommand"]);
+    expect(buildConnectionUrlCopy(redacted, "url")).toBe("postgresql://app_user@db.example.com:5432/appdb?sslmode=require&application_name=svc");
+    expect(buildConnectionUrlCopy(redacted, "jdbcUrl")).not.toContain("password");
+    expect(buildConnectionUrlCopy(redacted, "dsn")).not.toContain("password");
+    expect(buildConnectionUrlCopy(config({ password: "", username: "" }), "url")).toBe("postgresql://db.example.com:5432/appdb");
+  });
+
   it("honours the database override from a database tree node", () => {
     expect(buildConnectionUrlCopy(config({}), "url", { database: "reporting" })).toBe("postgresql://app_user@db.example.com:5432/reporting");
   });

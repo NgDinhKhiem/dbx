@@ -1478,6 +1478,7 @@ pub fn run() {
 
             let paths = commands::external_sql::sql_file_paths_from_args(args.clone(), std::path::Path::new(&cwd));
             if !paths.is_empty() {
+                commands::external_path_access::grant_opened_files(app, &paths);
                 if let Some(state) = app.try_state::<commands::external_sql::ExternalSqlOpenState>() {
                     state.push(paths.clone());
                 }
@@ -1692,6 +1693,7 @@ pub fn run() {
             app.manage(commands::redis_pubsub_server::start_pubsub_server(state.clone()));
             app.manage(commands::saved_sql::SavedSqlStorageState { data_dir: data_dir.clone() });
             app.manage(commands::external_sql::ExternalSqlOpenState::default());
+            commands::external_path_access::install(app.handle(), &data_dir, state.clone());
             app.manage(commands::external_db::ExternalDbOpenState::default());
             app.manage(commands::deep_link::DeepLinkOpenState::default());
             app.manage(commands::update::PendingUpdateState::default());
@@ -1749,6 +1751,11 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            // Files dropped by the user are consent to open them; grant them
+            // before the webview's drop handler asks the backend to read them.
+            if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
+                commands::external_path_access::grant_dropped_paths(window.app_handle(), paths);
+            }
             if let tauri::WindowEvent::Destroyed = event {
                 if let Some(tab_id) = window.label().strip_prefix("detached-tab-") {
                     let _ = window.emit("dbx:detached-tab-lost", serde_json::json!({ "tabId": tab_id }));
@@ -2110,6 +2117,10 @@ pub fn run() {
             commands::external_sql::inspect_external_sql_file,
             commands::external_sql::write_external_sql_file,
             commands::external_sql::save_external_sql_file,
+            commands::external_path_access::pick_external_files,
+            commands::external_path_access::pick_external_directory,
+            commands::external_path_access::pick_external_save_path,
+            commands::external_path_access::request_external_path_access,
             commands::list_sql_files::list_sql_files_in_folder,
             commands::list_sql_files::create_sql_file_in_folder,
             commands::list_sql_files::rename_sql_file_in_folder,
@@ -2174,6 +2185,7 @@ pub fn run() {
             commands::redis_cmd::redis_load_more,
             commands::redis_cmd::redis_pubsub_publish,
             commands::redis_pubsub_server::redis_pubsub_server_port,
+            commands::redis_pubsub_server::redis_pubsub_server_endpoint,
             commands::redis_cmd::redis_slowlog_get,
             commands::redis_cmd::redis_cluster_master_nodes,
             commands::etcd_cmd::etcd_supports_ttl,
@@ -2769,6 +2781,7 @@ pub fn run() {
                     .map(|path| path.to_string_lossy().to_string())
                     .collect();
                 if !paths.is_empty() {
+                    commands::external_path_access::grant_opened_files(app_handle, &paths);
                     if let Some(state) = app_handle.try_state::<commands::external_sql::ExternalSqlOpenState>() {
                         state.push(paths.clone());
                     }

@@ -1,7 +1,7 @@
 use crate::models::connection::{ConnectionConfig, DatabaseType, TransportLayerConfig};
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub const MAIN_PASSWORD_KEY: &str = "password";
 pub const SSH_PASSWORD_KEY: &str = "ssh_password";
@@ -45,66 +45,6 @@ pub trait ConnectionSecretStore {
     fn delete_secret(&self, connection_id: &str, key: &str) -> Result<(), String>;
     fn delete_secret_prefix(&self, _connection_id: &str, _key_prefix: &str) -> Result<(), String> {
         Ok(())
-    }
-}
-
-pub struct FileSecretStore {
-    path: PathBuf,
-}
-
-impl FileSecretStore {
-    pub fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-
-    fn read_store(&self) -> HashMap<String, String> {
-        match std::fs::read_to_string(&self.path) {
-            Ok(json) => match serde_json::from_str(&json) {
-                Ok(map) => map,
-                Err(e) => {
-                    log::warn!(
-                        "Failed to parse secret store at {:?}: {}. Returning empty store. This may indicate file corruption.",
-                        self.path, e
-                    );
-                    HashMap::default()
-                }
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::default(),
-            Err(e) => {
-                log::warn!("Failed to read secret store at {:?}: {}. Returning empty store.", self.path, e);
-                HashMap::default()
-            }
-        }
-    }
-
-    fn write_store(&self, map: &HashMap<String, String>) -> Result<(), String> {
-        let json = serde_json::to_string_pretty(map).map_err(|e| e.to_string())?;
-        std::fs::write(&self.path, json).map_err(|e| e.to_string())
-    }
-}
-
-impl ConnectionSecretStore for FileSecretStore {
-    fn set_secret(&self, connection_id: &str, key: &str, secret: &str) -> Result<(), String> {
-        let mut map = self.read_store();
-        map.insert(secret_account(connection_id, key), secret.to_string());
-        self.write_store(&map)
-    }
-
-    fn get_secret(&self, connection_id: &str, key: &str) -> Result<Option<String>, String> {
-        Ok(self.read_store().get(&secret_account(connection_id, key)).cloned())
-    }
-
-    fn delete_secret(&self, connection_id: &str, key: &str) -> Result<(), String> {
-        let mut map = self.read_store();
-        map.remove(&secret_account(connection_id, key));
-        self.write_store(&map)
-    }
-
-    fn delete_secret_prefix(&self, connection_id: &str, key_prefix: &str) -> Result<(), String> {
-        let mut map = self.read_store();
-        let account_prefix = secret_account(connection_id, key_prefix);
-        map.retain(|key, _| !key.starts_with(&account_prefix));
-        self.write_store(&map)
     }
 }
 
@@ -854,6 +794,461 @@ fn sanitize_connections(configs: &[ConnectionConfig]) -> Vec<ConnectionConfig> {
 fn scrub_plugin_connection_secrets(config: &mut ConnectionConfig) {
     for secret in config.connection_secrets.values_mut() {
         secret.clear();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Client-facing secret redaction
+//
+// Saved connection secrets never leave the backend. Configurations sent to a
+// UI are redacted: every secret slot is blanked and its client path is listed
+// in `saved_secrets`. When a UI sends a configuration back (save, test,
+// connect, ...), blank slots are filled from the stored configuration of the
+// same connection id unless the UI explicitly listed the path in
+// `cleared_secrets`.
+// ---------------------------------------------------------------------------
+
+/// Field added to redacted configurations sent to a client.
+pub const CLIENT_SAVED_SECRETS_FIELD: &str = "saved_secrets";
+/// Optional field of a client configuration: secret paths to remove.
+pub const CLIENT_CLEARED_SECRETS_FIELD: &str = "cleared_secrets";
+/// Optional field of a client configuration: saved connection whose stored
+/// secrets fill blank fields when this id has no stored record (duplicates).
+pub const CLIENT_SECRETS_FROM_FIELD: &str = "secrets_from_connection_id";
+
+/// A connection configuration received from a client together with its
+/// secret directives. Deserializes from the plain configuration object; the
+/// directive fields are removed before the configuration is parsed.
+#[derive(Debug, Clone)]
+pub struct ClientConnectionInput {
+    pub config: ConnectionConfig,
+    pub cleared_secrets: Vec<String>,
+    pub secrets_from_connection_id: Option<String>,
+}
+
+impl From<ConnectionConfig> for ClientConnectionInput {
+    fn from(config: ConnectionConfig) -> Self {
+        Self { config, cleared_secrets: Vec::new(), secrets_from_connection_id: None }
+    }
+}
+
+impl ClientConnectionInput {
+    pub fn from_value(mut value: serde_json::Value) -> Result<Self, String> {
+        let Some(object) = value.as_object_mut() else {
+            return Err("Connection configuration must be a JSON object".to_string());
+        };
+        object.remove(CLIENT_SAVED_SECRETS_FIELD);
+        let cleared_secrets = match object.remove(CLIENT_CLEARED_SECRETS_FIELD) {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(value) => serde_json::from_value::<Vec<String>>(value)
+                .map_err(|error| format!("Invalid {CLIENT_CLEARED_SECRETS_FIELD}: {error}"))?,
+        };
+        let secrets_from_connection_id = match object.remove(CLIENT_SECRETS_FROM_FIELD) {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(id)) => Some(id).filter(|id| !id.trim().is_empty()),
+            Some(_) => return Err(format!("Invalid {CLIENT_SECRETS_FROM_FIELD}")),
+        };
+        let config = serde_json::from_value(value).map_err(|error| error.to_string())?;
+        Ok(Self { config, cleared_secrets, secrets_from_connection_id })
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ClientConnectionInput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+        Self::from_value(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecretSlotKind {
+    /// A string field; blank means `""`.
+    Text,
+    /// An optional string field; blank means `null`.
+    Optional,
+}
+
+#[derive(Debug, Clone)]
+struct SecretSlot {
+    path: String,
+    /// JSON pointer of the object that holds the field (`""` = root).
+    parent: String,
+    field: String,
+    kind: SecretSlotKind,
+}
+
+impl SecretSlot {
+    fn text(path: impl Into<String>, parent: impl Into<String>, field: impl Into<String>) -> Self {
+        Self { path: path.into(), parent: parent.into(), field: field.into(), kind: SecretSlotKind::Text }
+    }
+
+    fn optional(field: &str) -> Self {
+        Self { path: field.to_string(), parent: String::new(), field: field.to_string(), kind: SecretSlotKind::Optional }
+    }
+}
+
+fn json_pointer_segment(value: &str) -> String {
+    value.replace('~', "~0").replace('/', "~1")
+}
+
+/// Client path segment of a transport layer: its id, or `#<index>` for
+/// legacy layers without an id.
+pub fn transport_layer_client_segment(index: usize, layer: &TransportLayerConfig) -> String {
+    let id = layer.id().trim();
+    if id.is_empty() {
+        format!("#{index}")
+    } else {
+        id.to_string()
+    }
+}
+
+fn external_object<'a>(
+    config: &'a ConnectionConfig,
+    key: &str,
+) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
+    config.external_config.as_ref()?.get(key)?.as_object()
+}
+
+fn external_kind<'a>(object: &'a serde_json::Map<String, serde_json::Value>) -> Option<&'a str> {
+    object.get("kind").and_then(serde_json::Value::as_str)
+}
+
+fn external_slot(object_key: &str, field: &str) -> SecretSlot {
+    SecretSlot::text(
+        format!("external_config.{object_key}.{field}"),
+        format!("/external_config/{}", json_pointer_segment(object_key)),
+        field,
+    )
+}
+
+/// Secret slots of the structured (non-plugin) connection fields. Plugin
+/// secrets (`connection_secrets`) are handled separately because the map
+/// keys are provider-defined.
+fn connection_secret_slots(config: &ConnectionConfig) -> Vec<SecretSlot> {
+    let mut slots = vec![
+        SecretSlot::text("password", "", "password"),
+        SecretSlot::text("redis_sentinel_password", "", "redis_sentinel_password"),
+        SecretSlot::optional("connection_string"),
+        SecretSlot::optional("init_script"),
+    ];
+    for (index, layer) in config.transport_layers.iter().enumerate() {
+        let segment = transport_layer_client_segment(index, layer);
+        let parent = format!("/transport_layers/{index}");
+        let fields: &[&str] = match layer {
+            TransportLayerConfig::Ssh(_) => &["password", "key_passphrase"],
+            TransportLayerConfig::Proxy(_) => &["password"],
+            TransportLayerConfig::HttpTunnel(_) => &["token"],
+        };
+        for field in fields {
+            slots.push(SecretSlot::text(format!("transport_layers.{segment}.{field}"), parent.clone(), *field));
+        }
+    }
+    match config.db_type {
+        DatabaseType::MessageQueue => {
+            if let Some(auth) = external_object(config, "auth") {
+                let field = match external_kind(auth) {
+                    Some("token") => Some("token"),
+                    Some("basic") => Some("password"),
+                    Some("apiKey" | "api_key" | "apikey") => Some("value"),
+                    Some("oauth2") => Some("clientSecret"),
+                    _ => None,
+                };
+                if let Some(field) = field {
+                    slots.push(external_slot("auth", field));
+                }
+            }
+            if external_object(config, "tokenSigning").is_some() {
+                slots.push(external_slot("tokenSigning", "key"));
+            }
+        }
+        DatabaseType::Mqtt => {
+            if external_object(config, "auth").is_some_and(|auth| external_kind(auth) == Some("password")) {
+                slots.push(external_slot("auth", "password"));
+            }
+        }
+        DatabaseType::Nacos => {
+            if external_object(config, "auth").is_some_and(|auth| external_kind(auth) == Some("usernamePassword")) {
+                slots.push(external_slot("auth", "password"));
+            }
+            if external_object(config, "rnacosConsoleAuth")
+                .is_some_and(|auth| external_kind(auth) == Some("usernamePassword"))
+            {
+                slots.push(external_slot("rnacosConsoleAuth", "password"));
+            }
+        }
+        DatabaseType::Cassandra => {
+            if external_object(config, "tls").is_some() {
+                slots.push(external_slot("tls", "truststore_password"));
+                slots.push(external_slot("tls", "keystore_password"));
+            }
+        }
+        _ => {}
+    }
+    slots
+}
+
+fn slot_value(value: &serde_json::Value, slot: &SecretSlot) -> String {
+    let parent = if slot.parent.is_empty() { Some(value) } else { value.pointer(&slot.parent) };
+    parent
+        .and_then(|parent| parent.get(&slot.field))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn set_slot_value(value: &mut serde_json::Value, slot: &SecretSlot, secret: Option<&str>) {
+    let parent = if slot.parent.is_empty() { Some(value) } else { value.pointer_mut(&slot.parent) };
+    let Some(object) = parent.and_then(serde_json::Value::as_object_mut) else {
+        return;
+    };
+    let replacement = match (secret, slot.kind) {
+        (Some(secret), _) => serde_json::Value::String(secret.to_string()),
+        (None, SecretSlotKind::Text) => {
+            if !object.contains_key(&slot.field) {
+                return;
+            }
+            serde_json::Value::String(String::new())
+        }
+        (None, SecretSlotKind::Optional) => serde_json::Value::Null,
+    };
+    object.insert(slot.field.clone(), replacement);
+}
+
+fn url_param_key_is_sensitive(key: &str) -> bool {
+    let normalized = key.trim().trim_start_matches('?').to_ascii_lowercase().replace(['_', '-', '.'], "");
+    normalized.contains("password")
+        || normalized.contains("passwd")
+        || normalized == "pwd"
+        || normalized.contains("passphrase")
+        || normalized.contains("secret")
+        || normalized.contains("token")
+        || normalized.contains("apikey")
+        || normalized.contains("privatekey")
+        || normalized.contains("credential")
+}
+
+/// Splits `a=1&b=2;c=3` into segments, keeping each trailing separator.
+fn split_url_params(value: &str) -> Vec<(&str, Option<char>)> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    for (index, ch) in value.char_indices() {
+        if ch == '&' || ch == ';' {
+            parts.push((&value[start..index], Some(ch)));
+            start = index + ch.len_utf8();
+        }
+    }
+    parts.push((&value[start..], None));
+    parts
+}
+
+fn rebuild_url_params(parts: impl Iterator<Item = (String, Option<char>)>) -> String {
+    let mut output = String::new();
+    for (segment, separator) in parts {
+        output.push_str(&segment);
+        if let Some(separator) = separator {
+            output.push(separator);
+        }
+    }
+    output
+}
+
+/// Blanks the values of credential-like URL parameters. Returns the redacted
+/// string and whether anything was hidden.
+pub fn redact_url_params(value: &str) -> (String, bool) {
+    let mut hidden = false;
+    let parts = split_url_params(value)
+        .into_iter()
+        .map(|(segment, separator)| match segment.split_once('=') {
+            Some((key, secret)) if url_param_key_is_sensitive(key) && !secret.is_empty() => {
+                hidden = true;
+                (format!("{key}="), separator)
+            }
+            _ => (segment.to_string(), separator),
+        })
+        .collect::<Vec<_>>();
+    (rebuild_url_params(parts.into_iter()), hidden)
+}
+
+/// Fills blank credential-like URL parameters from the stored parameters.
+fn merge_url_params(incoming: &str, stored: &str) -> String {
+    let stored_values = split_url_params(stored)
+        .into_iter()
+        .filter_map(|(segment, _)| segment.split_once('='))
+        .filter(|(key, value)| url_param_key_is_sensitive(key) && !value.is_empty())
+        .map(|(key, value)| (key.trim().to_string(), value.to_string()))
+        .fold(HashMap::new(), |mut values, (key, value)| {
+            values.entry(key).or_insert(value);
+            values
+        });
+    let parts = split_url_params(incoming)
+        .into_iter()
+        .map(|(segment, separator)| match segment.split_once('=') {
+            Some((key, "")) if url_param_key_is_sensitive(key) => match stored_values.get(key.trim()) {
+                Some(secret) => (format!("{key}={secret}"), separator),
+                None => (segment.to_string(), separator),
+            },
+            _ => (segment.to_string(), separator),
+        })
+        .collect::<Vec<_>>();
+    rebuild_url_params(parts.into_iter())
+}
+
+/// Serializes a configuration for a client with every secret removed and a
+/// `saved_secrets` list naming the secrets that exist.
+pub fn redact_connection_for_client(config: &ConnectionConfig) -> Result<serde_json::Value, String> {
+    let mut value = serde_json::to_value(config).map_err(|error| error.to_string())?;
+    let mut saved = Vec::new();
+    for slot in connection_secret_slots(config) {
+        if !slot_value(&value, &slot).is_empty() {
+            saved.push(slot.path.clone());
+        }
+        set_slot_value(&mut value, &slot, None);
+    }
+    if let Some(url_params) = config.url_params.as_deref() {
+        let (redacted, hidden) = redact_url_params(url_params);
+        if hidden {
+            saved.push("url_params".to_string());
+        }
+        if let Some(object) = value.as_object_mut() {
+            object.insert("url_params".to_string(), serde_json::Value::String(redacted));
+        }
+    }
+    let mut plugin_keys = config.connection_secrets.iter().collect::<Vec<_>>();
+    plugin_keys.sort_by(|left, right| left.0.cmp(right.0));
+    for (key, secret) in plugin_keys {
+        if !secret.is_empty() {
+            saved.push(format!("connection_secrets.{key}"));
+        }
+    }
+    let Some(object) = value.as_object_mut() else {
+        return Err("Connection configuration must serialize to an object".to_string());
+    };
+    object.remove("connection_secrets");
+    object.insert(
+        CLIENT_SAVED_SECRETS_FIELD.to_string(),
+        serde_json::Value::Array(saved.into_iter().map(serde_json::Value::String).collect()),
+    );
+    Ok(value)
+}
+
+pub fn redact_connections_for_client(configs: &[ConnectionConfig]) -> Result<Vec<serde_json::Value>, String> {
+    configs.iter().map(redact_connection_for_client).collect()
+}
+
+/// Paths whose stored value must not be reused for this configuration, for
+/// example the database password of a connection that does not save it.
+fn secret_path_excluded(config: &ConnectionConfig, path: &str) -> bool {
+    !config.save_password
+        && (path == "password"
+            || (config.db_type == DatabaseType::Nacos
+                && matches!(path, "external_config.auth.password" | "external_config.rnacosConsoleAuth.password")))
+}
+
+/// Fills blank secret fields of a client configuration from the stored
+/// configuration. Non-empty client values always win; `cleared` paths are
+/// blanked and never filled.
+pub fn merge_stored_connection_secrets(
+    incoming: &ConnectionConfig,
+    stored: Option<&ConnectionConfig>,
+    cleared: &[String],
+) -> Result<ConnectionConfig, String> {
+    let cleared = cleared.iter().map(String::as_str).collect::<HashSet<_>>();
+    let mut value = serde_json::to_value(incoming).map_err(|error| error.to_string())?;
+    let stored_value = stored.map(serde_json::to_value).transpose().map_err(|error| error.to_string())?;
+    let stored_secrets = match (stored, stored_value.as_ref()) {
+        (Some(stored), Some(stored_value)) => connection_secret_slots(stored)
+            .into_iter()
+            .filter_map(|slot| {
+                let secret = slot_value(stored_value, &slot);
+                (!secret.is_empty()).then_some((slot.path, secret))
+            })
+            .collect::<HashMap<_, _>>(),
+        _ => HashMap::new(),
+    };
+    for slot in connection_secret_slots(incoming) {
+        if cleared.contains(slot.path.as_str()) {
+            set_slot_value(&mut value, &slot, None);
+            continue;
+        }
+        if !slot_value(&value, &slot).is_empty() || secret_path_excluded(incoming, &slot.path) {
+            continue;
+        }
+        if let Some(secret) = stored_secrets.get(&slot.path) {
+            set_slot_value(&mut value, &slot, Some(secret));
+        }
+    }
+
+    let object = value.as_object_mut().ok_or_else(|| "Connection configuration must be an object".to_string())?;
+    let stored_url_params = stored.and_then(|stored| stored.url_params.as_deref()).filter(|value| !value.is_empty());
+    if !cleared.contains("url_params") {
+        match (incoming.url_params.as_deref(), stored_url_params) {
+            (Some(incoming_params), Some(stored_params)) => {
+                object.insert(
+                    "url_params".to_string(),
+                    serde_json::Value::String(merge_url_params(incoming_params, stored_params)),
+                );
+            }
+            // An absent field keeps the stored parameters; an explicit empty
+            // string is an edit that removes them.
+            (None, Some(stored_params)) => {
+                object.insert("url_params".to_string(), serde_json::Value::String(stored_params.to_string()));
+            }
+            _ => {}
+        }
+    }
+
+    let mut plugin_secrets = incoming.connection_secrets.clone();
+    plugin_secrets.retain(|key, secret| {
+        !(secret.is_empty() && cleared.contains(format!("connection_secrets.{key}").as_str()))
+    });
+    if let Some(stored) = stored.filter(|stored| {
+        stored.plugin_id == incoming.plugin_id && stored.plugin_connection_provider == incoming.plugin_connection_provider
+    }) {
+        for (key, secret) in &stored.connection_secrets {
+            if secret.is_empty() || cleared.contains(format!("connection_secrets.{key}").as_str()) {
+                continue;
+            }
+            let current = plugin_secrets.entry(key.clone()).or_default();
+            if current.is_empty() {
+                *current = secret.clone();
+            }
+        }
+    }
+    plugin_secrets.retain(|_, secret| !secret.is_empty());
+    object.insert(
+        "connection_secrets".to_string(),
+        serde_json::to_value(&plugin_secrets).map_err(|error| error.to_string())?,
+    );
+
+    serde_json::from_value(value).map_err(|error| error.to_string())
+}
+
+/// Storage keys that must be deleted for an explicitly cleared client path
+/// whose persistence would otherwise keep the previously stored value.
+pub fn storage_keys_for_cleared_secret(config: &ConnectionConfig, path: &str) -> Vec<&'static str> {
+    match (config.db_type, path) {
+        (_, "password") => vec![MAIN_PASSWORD_KEY],
+        (_, "redis_sentinel_password") => vec![REDIS_SENTINEL_PASSWORD_KEY],
+        (_, "connection_string") => vec![CONNECTION_STRING_KEY],
+        (_, "init_script") => vec![INIT_SCRIPT_KEY],
+        (DatabaseType::MessageQueue, "external_config.auth.token") => vec![MQ_AUTH_TOKEN_KEY],
+        (DatabaseType::MessageQueue, "external_config.auth.password") => vec![MQ_AUTH_PASSWORD_KEY],
+        (DatabaseType::MessageQueue, "external_config.auth.value") => vec![MQ_AUTH_API_KEY_VALUE_KEY],
+        (DatabaseType::MessageQueue, "external_config.auth.clientSecret") => vec![MQ_AUTH_CLIENT_SECRET_KEY],
+        (DatabaseType::MessageQueue, "external_config.tokenSigning.key") => vec![MQ_TOKEN_SIGNING_KEY],
+        (DatabaseType::Mqtt, "external_config.auth.password") => vec![MQTT_AUTH_PASSWORD_KEY],
+        (DatabaseType::Nacos, "external_config.auth.password") => vec![NACOS_AUTH_PASSWORD_KEY],
+        (DatabaseType::Nacos, "external_config.rnacosConsoleAuth.password") => {
+            vec![NACOS_RNACOS_CONSOLE_PASSWORD_KEY]
+        }
+        (DatabaseType::Cassandra, "external_config.tls.truststore_password") => {
+            vec![CASSANDRA_TRUSTSTORE_PASSWORD_KEY]
+        }
+        (DatabaseType::Cassandra, "external_config.tls.keystore_password") => vec![CASSANDRA_KEYSTORE_PASSWORD_KEY],
+        _ => Vec::new(),
     }
 }
 
@@ -1642,24 +2037,106 @@ mod tests {
     }
 
     #[test]
-    fn file_secret_store_preserves_opaque_null_credentials() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("connections.json");
-        let secret_path = dir.path().join("secrets.json");
-        let store = super::FileSecretStore::new(secret_path.clone());
-        let mut config = connection("plugin-connection", "", "");
-        config.db_type = DatabaseType::Plugin;
-        config.connection_secrets.insert("credential".to_string(), "null".to_string());
-        save_connections_to_file(&path, &[config], &store).unwrap();
-        let raw_config = std::fs::read(&path).unwrap();
-        let raw_secrets = std::fs::read(&secret_path).unwrap();
+    fn client_redaction_removes_every_secret_and_lists_saved_paths() {
+        let mut config = connection("prod", "db-secret", "");
+        config.url_params = Some("sslmode=require&password=url-secret;apiKey=k".to_string());
+        config.connection_string = Some("Server=x;Password=cs".to_string());
+        config.init_script = Some("CREATE SECRET s (KEY_ID 'a', SECRET 'b')".to_string());
+        config.transport_layers = vec![
+            TransportLayerConfig::Ssh(ssh_hop("hop-a", "ssh-secret", "pp-value")),
+            http_tunnel("", "tunnel-token"),
+        ];
+        config.connection_secrets.insert("token".to_string(), "plugin-secret".to_string());
 
-        for _ in 0..2 {
-            let reopened_store = super::FileSecretStore::new(secret_path.clone());
-            let loaded = load_connections_from_file(&path, &reopened_store).unwrap();
-            assert_eq!(loaded[0].connection_secrets.get("credential").map(String::as_str), Some("null"));
-            assert_eq!(std::fs::read(&path).unwrap(), raw_config);
-            assert_eq!(std::fs::read(&secret_path).unwrap(), raw_secrets);
+        let redacted = super::redact_connection_for_client(&config).unwrap();
+        let text = redacted.to_string();
+        for secret in ["db-secret", "url-secret", "ssh-secret", "pp-value", "tunnel-token", "plugin-secret", "Password=cs"] {
+            assert!(!text.contains(secret), "{secret} leaked: {text}");
         }
+        assert_eq!(redacted["url_params"], "sslmode=require&password=;apiKey=");
+        assert!(redacted["connection_string"].is_null());
+        assert!(redacted.get("connection_secrets").is_none());
+        let saved = redacted["saved_secrets"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect::<Vec<_>>();
+        assert_eq!(
+            saved,
+            vec![
+                "password",
+                "connection_string",
+                "init_script",
+                "transport_layers.hop-a.password",
+                "transport_layers.hop-a.key_passphrase",
+                "transport_layers.#1.token",
+                "url_params",
+                "connection_secrets.token",
+            ]
+        );
+    }
+
+    #[test]
+    fn client_merge_keeps_stored_secrets_for_blank_fields_and_honors_clears() {
+        let mut stored = connection("prod", "db-secret", "");
+        stored.url_params = Some("sslmode=require&password=url-secret".to_string());
+        stored.init_script = Some("SET x = 1".to_string());
+        stored.transport_layers = vec![TransportLayerConfig::Ssh(ssh_hop("hop-a", "ssh-secret", "pp-value"))];
+        stored.connection_secrets.insert("token".to_string(), "plugin-secret".to_string());
+
+        let redacted = super::redact_connection_for_client(&stored).unwrap();
+        let mut incoming = super::ClientConnectionInput::from_value(redacted).unwrap().config;
+        incoming.host = "db.internal".to_string();
+        incoming.url_params = Some("sslmode=disable&password=".to_string());
+        let merged = super::merge_stored_connection_secrets(&incoming, Some(&stored), &[]).unwrap();
+        assert_eq!(merged.host, "db.internal");
+        assert_eq!(merged.password, "db-secret");
+        assert_eq!(merged.url_params.as_deref(), Some("sslmode=disable&password=url-secret"));
+        assert_eq!(merged.init_script.as_deref(), Some("SET x = 1"));
+        let TransportLayerConfig::Ssh(ssh) = &merged.transport_layers[0] else { panic!("ssh layer expected") };
+        assert_eq!((ssh.password.as_str(), ssh.key_passphrase.as_str()), ("ssh-secret", "pp-value"));
+        assert_eq!(merged.connection_secrets.get("token").map(String::as_str), Some("plugin-secret"));
+
+        incoming.password = "typed".to_string();
+        let cleared = vec![
+            "transport_layers.hop-a.key_passphrase".to_string(),
+            "init_script".to_string(),
+            "connection_secrets.token".to_string(),
+        ];
+        let merged = super::merge_stored_connection_secrets(&incoming, Some(&stored), &cleared).unwrap();
+        assert_eq!(merged.password, "typed");
+        assert_eq!(merged.init_script, None);
+        assert!(merged.connection_secrets.is_empty());
+        let TransportLayerConfig::Ssh(ssh) = &merged.transport_layers[0] else { panic!("ssh layer expected") };
+        assert_eq!((ssh.password.as_str(), ssh.key_passphrase.as_str()), ("ssh-secret", ""));
+    }
+
+    #[test]
+    fn client_merge_never_reuses_the_password_of_a_no_save_connection() {
+        let stored = connection("prod", "db-secret", "");
+        let mut incoming = connection("prod", "", "");
+        incoming.save_password = false;
+        let merged = super::merge_stored_connection_secrets(&incoming, Some(&stored), &[]).unwrap();
+        assert_eq!(merged.password, "");
+    }
+
+    #[test]
+    fn client_merge_does_not_move_plugin_secrets_to_another_provider() {
+        let mut stored = connection("plugin", "", "");
+        stored.plugin_id = Some("plugin-a".to_string());
+        stored.connection_secrets.insert("token".to_string(), "plugin-secret".to_string());
+        let mut incoming = stored.clone();
+        incoming.connection_secrets.clear();
+        incoming.plugin_id = Some("plugin-b".to_string());
+        let merged = super::merge_stored_connection_secrets(&incoming, Some(&stored), &[]).unwrap();
+        assert!(merged.connection_secrets.is_empty());
+    }
+
+    #[test]
+    fn client_input_strips_directive_fields() {
+        let mut value = serde_json::to_value(connection("prod", "", "")).unwrap();
+        value["saved_secrets"] = serde_json::json!(["password"]);
+        value["cleared_secrets"] = serde_json::json!(["init_script"]);
+        value["secrets_from_connection_id"] = serde_json::json!("source");
+        let input: super::ClientConnectionInput = serde_json::from_value(value).unwrap();
+        assert_eq!(input.cleared_secrets, vec!["init_script".to_string()]);
+        assert_eq!(input.secrets_from_connection_id.as_deref(), Some("source"));
+        assert_eq!(input.config.id, "prod");
     }
 }

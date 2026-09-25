@@ -1,5 +1,6 @@
 import type { ConnectionConfig, PluginFormField, PluginFormFieldValue } from "@/types/database";
 import { pluginFieldIsRequired } from "@/lib/plugins/pluginFieldConditions";
+import { hasSavedSecret } from "@/lib/connection/savedSecrets";
 
 type PasswordAuthenticationConfig = Pick<ConnectionConfig, "db_type" | "driver_profile" | "url_params">;
 
@@ -29,7 +30,7 @@ export function connectionUsesPasswordlessAuthentication(config: PasswordAuthent
 }
 
 export function connectionNeedsPasswordPrompt(config: ConnectionConfig): boolean {
-  return config.save_password === false && !config.password && !connectionUsesPasswordlessAuthentication(config);
+  return config.save_password === false && !config.password && !hasSavedSecret(config, "password") && !connectionUsesPasswordlessAuthentication(config);
 }
 
 /**

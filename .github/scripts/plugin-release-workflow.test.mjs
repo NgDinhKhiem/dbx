@@ -8,8 +8,9 @@ import test from "node:test";
 const workflow = readFileSync(new URL("../workflows/plugin-release-reusable.yml", import.meta.url), "utf8");
 const cacheScript = workflow.match(/^          node <<'NODE'\n([\s\S]*?)^          NODE\n/m)[1].replace(/^ {10}/gm, "");
 
+// Actions are pinned by commit SHA ("owner/repo@<sha> # vX.Y.Z"), so match on the action name.
 function workflowStep(action) {
-  const start = workflow.indexOf(`      - uses: ${action}\n`);
+  const start = workflow.indexOf(`      - uses: ${action}@`);
   assert.notEqual(start, -1, `Missing workflow action ${action}`);
   const nextStep = workflow.indexOf("\n      - ", start + 1);
   return workflow.slice(start, nextStep === -1 ? workflow.indexOf("\n  publish:", start) : nextStep);
@@ -98,24 +99,24 @@ test("cache lockfile paths remain relative to the repository for nested projects
 });
 
 test("pnpm setup precedes setup-node cache restoration and respects nested package.json", () => {
-  const pnpmIndex = workflow.indexOf("uses: pnpm/action-setup@v4");
-  const nodeIndex = workflow.indexOf("uses: actions/setup-node@v4");
+  const pnpmIndex = workflow.indexOf("uses: pnpm/action-setup@");
+  const nodeIndex = workflow.indexOf("uses: actions/setup-node@");
   assert.ok(pnpmIndex > 0 && pnpmIndex < nodeIndex);
-  const pnpmStep = workflowStep("pnpm/action-setup@v4");
+  const pnpmStep = workflowStep("pnpm/action-setup");
   assert.ok(pnpmStep.includes("package_json_file: ${{ inputs.working-directory }}/package.json"));
   assert.ok(pnpmStep.includes("run_install: false"));
-  assert.ok(workflowStep("actions/setup-node@v4").includes("cache: ${{ steps.node-cache.outputs.cache }}"));
+  assert.ok(workflowStep("actions/setup-node").includes("cache: ${{ steps.node-cache.outputs.cache }}"));
 });
 
 test("Go cache includes backend go.sum and is disabled when no checksum file exists", () => {
-  const goStep = workflowStep("actions/setup-go@v5");
+  const goStep = workflowStep("actions/setup-go");
   assert.ok(goStep.includes("cache-dependency-path: ${{ inputs.working-directory }}/**/go.sum"));
   assert.ok(goStep.includes("cache: ${{ hashFiles(format('{0}/**/go.sum', inputs.working-directory)) != '' }}"));
   assert.ok(goStep.includes("if: inputs.go-version != ''"));
 });
 
 test("source-built CLI still gets Rust when the plugin does not need it", () => {
-  const rustStep = workflowStep("dtolnay/rust-toolchain@stable");
+  const rustStep = workflowStep("dtolnay/rust-toolchain");
   assert.ok(rustStep.includes("if: inputs.rust-toolchain != '' || (inputs.install-plugin-cli && inputs.install-plugin-cli-from-source)"));
   assert.ok(rustStep.includes("toolchain: ${{ inputs.rust-toolchain || 'stable' }}"));
 });

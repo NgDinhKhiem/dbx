@@ -2,7 +2,7 @@ import { UPDATE_RESTORE_KEY, assertUpdateAllowsInteraction } from "@/lib/app/upd
 import { defineStore } from "pinia";
 import { isRedisMonitorCommand, startRedisMonitor } from "@/lib/redis/redisMonitor";
 import { uuid } from "@/lib/common/utils";
-import { computed, markRaw, nextTick, onScopeDispose, reactive, ref, toRaw, watch } from "vue";
+import { computed, markRaw, nextTick, onScopeDispose, reactive, ref, toRaw, watch, type ComputedRef } from "vue";
 import { useI18n } from "vue-i18n";
 import { useToast } from "@/composables/useToast";
 import { savedSqlErrorMessage } from "@/lib/savedSql/savedSqlErrors";
@@ -32,7 +32,8 @@ import { buildExplainSql, parseExplainResult, parseDamengExplainText, parseOracl
 import { mysqlExplainCompatibilityHint } from "@/lib/diagram/mysqlExplainCompatibility";
 import { allEditableColumnsWriteable, allPrimaryKeysPresent, analyzeEditableQueryEditability, analyzeSelectStructureForDisplay, resolveMetadataColumnName, resolveSourceColumnsByOrdinal, sourceColumnsForResult, type EditableQueryInfo, type EditableQuerySource } from "@/lib/sql/sqlAnalysis";
 import { buildQueryWithHiddenPrimaryKeys, hiddenResultColumnIndexes, type HiddenPrimaryKeyProjection } from "@/lib/sql/editableQueryHiddenKeys";
-import { ACTIVE_TAB_STORAGE_KEY, OPEN_TABS_STORAGE_KEY, restoreOpenTabsPayload, restoreOpenTabsState, serializeOpenTabs, type OpenTabsStatePayload } from "@/lib/app/openTabsPersistence";
+import { ACTIVE_TAB_STORAGE_KEY, OPEN_TABS_STORAGE_KEY, restoreOpenTabsPayload, restoreOpenTabsState, serializeOpenTabs, type OpenTabsStatePayload, type SavedOpenTab } from "@/lib/app/openTabsPersistence";
+import { openTabsPersistDebounceMs } from "@/lib/tabs/openTabsPersistSchedule";
 import {
   evaluateMongoAggregateSafety,
   evaluateMongoWriteSafety,
@@ -853,10 +854,10 @@ let persistGeneration = 0;
 /** Monotonic id for content-search jump requests; lets repeated clicks on the same result re-trigger the editor reveal. */
 let contentRevealSeq = 0;
 
-function saveTabs(tabs: QueryTab[], activeTabId: string | null, workspace?: EditorWorkspacePersistState): Promise<void> {
+function saveTabs(tabs: QueryTab[], activeTabId: string | null, workspace?: EditorWorkspacePersistState, serializedTabs?: SavedOpenTab[]): Promise<void> {
   if (isDetachedWindow()) return Promise.resolve();
   const payload: OpenTabsStatePayload = {
-    tabs: serializeOpenTabs(tabs),
+    tabs: serializedTabs ?? serializeOpenTabs(tabs),
     activeTabId,
     ...(workspace && tabs.length > 0
       ? {
@@ -2483,66 +2484,50 @@ export const useQueryStore = defineStore("query", () => {
     scheduleResultCacheMaintenance();
   }
 
-  const _persistSnapshot = computed(() =>
-    tabs.value.map((t) => ({
-      id: t.id,
-      title: t.title,
-      connectionId: t.connectionId,
-      database: t.database,
-      schema: t.schema,
-      sql: t.sql,
-      editorViewport: t.editorViewport,
-      editorSelection: t.editorSelection,
-      savedSqlId: t.savedSqlId,
-      externalSqlPath: t.externalSqlPath,
-      externalSqlFileVersion: t.externalSqlFileVersion,
-      externalSqlIgnoredFileVersion: t.externalSqlIgnoredFileVersion,
-      externalSqlFileMissing: t.externalSqlFileMissing,
-      lastExecutedSql: t.lastExecutedSql,
-      resultBaseSql: t.resultBaseSql,
-      resultSortedSql: t.resultSortedSql,
-      resultSortColumn: t.resultSortColumn,
-      resultSortColumnIndex: t.resultSortColumnIndex,
-      resultSortDirection: t.resultSortDirection,
-      resultSortMode: t.resultSortMode,
-      orderByInput: t.orderByInput,
-      whereInput: t.whereInput,
-      pinned: t.pinned,
-      mode: t.mode,
-      detachedConnectionName: t.detachedConnectionName,
-      autoCommit: t.autoCommit,
-      resultAutoSave: t.resultAutoSave,
-      uiState: t.uiState,
-      structureTableName: t.structureTableName,
-      structureTableType: t.structureTableType,
-      structureDraft: t.structureDraft,
-      objectBrowser: t.objectBrowser,
-      objectSource: t.objectSource,
-      sourceView: t.sourceView,
-      tableMeta: t.tableMeta,
-      mongoEditTarget: t.mongoEditTarget,
-      resultEvicted: t.resultEvicted,
-      resultCacheKey: t.resultCacheKey,
-      // Keep the watch dependency limited to the metadata that is serialized
-      // for each result run, without tracking the potentially large payload.
-      resultRuns: t.resultRuns?.map((run) => ({
-        id: run.id,
-        title: run.title,
-        sequence: run.sequence,
-        sql: run.sql,
-        createdAt: run.createdAt,
-        pinned: run.pinned,
-        activeResultIndex: run.activeResultIndex,
-        resultCacheKey: run.resultCacheKey,
-        resultEvicted: run.resultEvicted,
-      })),
-      activeResultRunId: t.activeResultRunId,
-    })),
+  // Per-tab serialized snapshot, memoized by the tab's own reactive reads: an
+  // edit in one tab re-serializes only that tab, so typing in a large script
+  // no longer rebuilds every other tab's snapshot. The backend save API takes
+  // the whole payload, so unchanged tabs are reused rather than skipped.
+  const serializedTabCache = new Map<string, { tab: QueryTab; serialized: ComputedRef<SavedOpenTab | undefined> }>();
+  function serializedTabFor(tab: QueryTab): SavedOpenTab | undefined {
+    const raw = toRaw(tab);
+    let entry = serializedTabCache.get(raw.id);
+    if (!entry || entry.tab !== raw) {
+      entry = { tab: raw, serialized: computed<SavedOpenTab | undefined>(() => serializeOpenTabs([tab])[0]) };
+      serializedTabCache.set(raw.id, entry);
+    }
+    return entry.serialized.value;
+  }
+
+  const _persistSnapshot = computed(() => {
+    const liveIds = new Set<string>();
+    const saved: SavedOpenTab[] = [];
+    for (const tab of tabs.value) {
+      liveIds.add(tab.id);
+      const serialized = serializedTabFor(tab);
+      if (serialized) saved.push(serialized);
+    }
+    for (const id of serializedTabCache.keys()) {
+      if (!liveIds.has(id)) serializedTabCache.delete(id);
+    }
+    return saved;
+  });
+
+  // Result-cache bookkeeping the serializer omits for some tab modes but a
+  // detached-window handoff still depends on. Small scalars only.
+  const _persistResultTriggers = computed(() =>
+    tabs.value.map((t) => [
+      t.id,
+      t.resultEvicted,
+      t.resultCacheKey,
+      t.activeResultRunId,
+      t.resultRuns?.map((run) => [run.id, run.title, run.sequence, run.sql, run.createdAt, run.pinned, run.activeResultIndex, run.resultCacheKey, run.resultEvicted]),
+    ]),
   );
 
   const storePersistGeneration = ++persistGeneration;
   watch(
-    [_persistSnapshot, activeTabId, groups, focusedGroupId, orientation, sizes],
+    [_persistSnapshot, _persistResultTriggers, activeTabId, groups, focusedGroupId, orientation, sizes],
     () => {
       if (storePersistGeneration !== persistGeneration) return;
       if (persistTimer) clearTimeout(persistTimer);
@@ -2550,11 +2535,13 @@ export const useQueryStore = defineStore("query", () => {
         if (isDetachedWindow()) {
           void flushDetachedTabPersistence(activeTabId.value ?? undefined).catch(() => {});
         } else {
-          void saveTabs(tabs.value, activeTabId.value, { groups: groups.value, focusedGroupId: focusedGroupId.value, orientation: orientation.value, sizes: sizes.value }).catch(() => {});
+          void saveTabs(tabs.value, activeTabId.value, { groups: groups.value, focusedGroupId: focusedGroupId.value, orientation: orientation.value, sizes: sizes.value }, _persistSnapshot.value).catch(() => {});
         }
         persistTimer = null;
-      }, 300);
+      }, openTabsPersistDebounceMs(_persistSnapshot.value));
     },
+    // Deep so in-place edits of nested tab state (tableMeta, objectBrowser,
+    // editor viewport, ...) referenced by the serialized tabs still persist.
     { flush: "post", deep: true },
   );
 
@@ -2580,7 +2567,7 @@ export const useQueryStore = defineStore("query", () => {
       clearTimeout(persistTimer);
       persistTimer = null;
     }
-    return saveTabs(tabs.value, activeTabId.value, { groups: groups.value, focusedGroupId: focusedGroupId.value, orientation: orientation.value, sizes: sizes.value });
+    return saveTabs(tabs.value, activeTabId.value, { groups: groups.value, focusedGroupId: focusedGroupId.value, orientation: orientation.value, sizes: sizes.value }, _persistSnapshot.value);
   }
 
   async function prepareDetachedTab(tabId: string, runtime: DetachedTabRuntimeState = {}): Promise<DetachedTabHandoff> {

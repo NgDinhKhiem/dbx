@@ -810,7 +810,16 @@ async fn collect_first_result_limited(
                     rows.push(values);
                     spatial_values.push(srids);
                 } else {
+                    // Stop at the first row past the limit instead of decoding
+                    // (and discarding) the rest of a potentially huge result.
+                    // Dropping the unfinished stream is protocol-safe: tiberius
+                    // flushes the leftover packets (raw, without decoding rows)
+                    // before the next request on this client. SET ROWCOUNT is
+                    // not used because it would also cap DML inside EXEC'd
+                    // procedures, and rebuilding the client here would roll
+                    // back an open user transaction.
                     truncated = true;
+                    break;
                 }
             }
             QueryItem::Row(_) => {}
@@ -4755,6 +4764,17 @@ mod tests {
 
         assert!(execute_query.contains("sqlserver_dml_output_returns_rows(sql)"));
         assert!(execute_query.contains("client.query(query.sql.as_str(), &[])"));
+    }
+
+    #[test]
+    fn sqlserver_first_result_stops_reading_once_the_row_limit_is_exceeded() {
+        let source = include_str!("sqlserver.rs");
+        let collect = source.split("async fn collect_first_result_limited(").nth(1).unwrap();
+        let collect = collect.split("struct SqlServerResultSet").next().unwrap();
+        let overflow = collect.split("if rows.len() < row_limit {").nth(1).unwrap();
+        let overflow = overflow.split("QueryItem::Row(_) => {}").next().unwrap();
+        assert!(overflow.contains("truncated = true;"));
+        assert!(overflow.contains("break;"), "rows past the limit must not be pulled from the stream");
     }
 
     #[test]
