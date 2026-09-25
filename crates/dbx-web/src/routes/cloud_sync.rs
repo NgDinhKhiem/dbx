@@ -10,9 +10,9 @@ use dbx_core::cloud_sync::{
     save_webdav_password, save_webdav_sync_secrets_preference as core_save_webdav_sync_secrets_preference,
     snippet_saved_token_status, snippet_sync_settings_for_instance as core_snippet_sync_settings,
     webdav_saved_password_status, webdav_sync_secrets_status as core_webdav_sync_secrets_status, ApplySnapshotOptions,
-    ApplySnapshotSummary, SnippetProvider, SnippetSyncClient, SnippetSyncConfig, SnippetSyncSettings,
-    SnippetSyncSummary, SnippetTokenStatus, WebDavClient, WebDavConfig, WebDavPasswordStatus, WebDavSyncSecretsStatus,
-    WebDavSyncSummary,
+    ApplySnapshotSummary, EndpointChangePolicy, SnippetProvider, SnippetSyncClient, SnippetSyncConfig,
+    SnippetSyncSettings, SnippetSyncSummary, SnippetTokenStatus, WebDavClient, WebDavConfig, WebDavPasswordStatus,
+    WebDavSyncSecretsStatus, WebDavSyncSummary,
 };
 use dbx_core::storage::DesktopSettings;
 use serde::{Deserialize, Serialize};
@@ -237,6 +237,7 @@ pub async fn webdav_sync_download(
         ApplySnapshotOptions {
             secrets_passphrase: explicit_passphrase.or(saved_passphrase.as_deref()),
             restore_secrets: req.restore_secrets,
+            endpoint_change_policy: EndpointChangePolicy::DropLocalSecrets,
         },
     )
     .await
@@ -367,6 +368,7 @@ pub async fn snippet_sync_download(
         ApplySnapshotOptions {
             secrets_passphrase: req.secrets_passphrase.as_deref(),
             restore_secrets: req.restore_secrets,
+            endpoint_change_policy: EndpointChangePolicy::DropLocalSecrets,
         },
     )
     .await

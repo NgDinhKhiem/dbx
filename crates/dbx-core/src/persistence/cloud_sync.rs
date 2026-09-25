@@ -519,7 +519,10 @@ async fn verify_snapshot_document(
 }
 
 /// Parses and verifies a WebDAV snapshot document.
-pub async fn verify_sync_snapshot_bytes(bytes: &[u8], passphrase: Option<&str>) -> Result<VerifiedSyncSnapshot, String> {
+pub async fn verify_sync_snapshot_bytes(
+    bytes: &[u8],
+    passphrase: Option<&str>,
+) -> Result<VerifiedSyncSnapshot, String> {
     let document: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
     verify_snapshot_document(document, bytes_token(bytes), false, passphrase).await
 }
@@ -624,7 +627,12 @@ fn endpoint_like_key(key: &str) -> bool {
         .any(|marker| key.contains(marker))
 }
 
-fn collect_external_endpoints(prefix: &str, value: &serde_json::Value, depth: usize, output: &mut Vec<(String, String)>) {
+fn collect_external_endpoints(
+    prefix: &str,
+    value: &serde_json::Value,
+    depth: usize,
+    output: &mut Vec<(String, String)>,
+) {
     if depth > 6 {
         return;
     }
@@ -1633,9 +1641,13 @@ impl SnippetSyncClient {
             .ok_or_else(|| "Snippet id is required for download".to_string())?;
         let content = self.load_snippet_content(snippet_id).await?;
         let (document, envelope_authenticated) = parse_snippet_document(&content, snippet_passphrase)?;
-        let verified =
-            verify_snapshot_document(document, bytes_token(content.as_bytes()), envelope_authenticated, secrets_passphrase)
-                .await?;
+        let verified = verify_snapshot_document(
+            document,
+            bytes_token(content.as_bytes()),
+            envelope_authenticated,
+            secrets_passphrase,
+        )
+        .await?;
         let summary = SnippetSyncSummary {
             provider: self.config.provider,
             snippet_id: snippet_id.to_string(),
@@ -2411,7 +2423,10 @@ fn encrypt_snippet_snapshot(snapshot: &SyncSnapshot, passphrase: &str) -> Result
 
 /// Returns the snapshot JSON document of snippet content and whether it was
 /// inside an authenticated (AES-GCM) envelope.
-fn parse_snippet_document(content: &str, snippet_passphrase: Option<&str>) -> Result<(serde_json::Value, bool), String> {
+fn parse_snippet_document(
+    content: &str,
+    snippet_passphrase: Option<&str>,
+) -> Result<(serde_json::Value, bool), String> {
     if is_encrypted_snippet_snapshot(content) {
         let envelope: EncryptedSnippetSnapshot = serde_json::from_str(content).map_err(|e| e.to_string())?;
         if envelope.format != ENCRYPTED_SNIPPET_SNAPSHOT_FORMAT {
@@ -2579,7 +2594,10 @@ fn decrypt_passphrase_blob(blob: &EncryptedSecretsBlob, passphrase: &str, contex
     let key = params.derive_key(passphrase.as_bytes(), &salt)?;
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| e.to_string())?;
     cipher
-        .decrypt(Nonce::from_slice(&nonce), aes_gcm::aead::Payload { msg: ciphertext.as_ref(), aad: context.as_bytes() })
+        .decrypt(
+            Nonce::from_slice(&nonce),
+            aes_gcm::aead::Payload { msg: ciphertext.as_ref(), aad: context.as_bytes() },
+        )
         .map_err(|_| "Failed to decrypt synced secrets.".to_string())
 }
 
@@ -2892,6 +2910,8 @@ fn parent_collection_paths(remote_path: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use super::*;
     use super::{
         apply_sensitive_payload, apply_sync_snapshot, build_sensitive_payload, build_sync_snapshot,
         build_sync_snapshot_with_options, build_sync_snapshot_with_saved_secrets, decrypt_sensitive_payload,
@@ -3604,9 +3624,9 @@ mod tests {
             ai_configs: None,
             ai_config: None,
         };
-        let encrypted = encrypt_sensitive_payload(&payload, "sync-pass").unwrap();
+        let encrypted = encrypt_sensitive_payload(&payload, "sync-passphrase-long").unwrap();
         assert_ne!(encrypted.ciphertext, "secret");
-        let decrypted = decrypt_sensitive_payload(&encrypted, "sync-pass").unwrap();
+        let decrypted = decrypt_sensitive_payload(&encrypted, "sync-passphrase-long").unwrap();
         assert_eq!(decrypted.connection_secrets[0].secret, "secret");
         assert_eq!(decrypted.connection_secrets[1].secret, "hop-secret");
     }
@@ -3625,7 +3645,7 @@ mod tests {
             ai_configs: None,
             ai_config: None,
         };
-        let encrypted = encrypt_sensitive_payload(&payload, "sync-pass").unwrap();
+        let encrypted = encrypt_sensitive_payload(&payload, "sync-passphrase-long").unwrap();
         assert!(decrypt_sensitive_payload(&encrypted, "wrong-pass").is_err());
     }
 
@@ -3644,9 +3664,9 @@ mod tests {
             ai_config: None,
         };
         let plaintext = serde_json::to_vec(&payload).unwrap();
-        let legacy_blob = super::encrypt_bytes_with_secret(&plaintext, "sync-pass").unwrap();
+        let legacy_blob = super::encrypt_bytes_with_secret(&plaintext, "sync-passphrase-long").unwrap();
         assert_eq!(legacy_blob.version, 1);
-        let restored = decrypt_sensitive_payload(&legacy_blob, "sync-pass").unwrap();
+        let restored = decrypt_sensitive_payload(&legacy_blob, "sync-passphrase-long").unwrap();
         assert_eq!(restored.connection_secrets[0].secret, "legacy-secret");
     }
 
@@ -3654,15 +3674,15 @@ mod tests {
     async fn encrypted_snippet_snapshot_hides_and_restores_the_full_snapshot() {
         let storage = Storage::open(&temp_db_path("encrypted-snippet-snapshot")).await.unwrap();
         storage.save_connections(&[postgres_connection("pg", "db-secret")]).await.unwrap();
-        let snapshot = build_sync_snapshot(&storage, "test-version", None, Some("sync-pass")).await.unwrap();
+        let snapshot = build_sync_snapshot(&storage, "test-version", None, Some("sync-passphrase-long")).await.unwrap();
 
-        let encrypted = encrypt_snippet_snapshot(&snapshot, "sync-pass").unwrap();
+        let encrypted = encrypt_snippet_snapshot(&snapshot, "sync-passphrase-long").unwrap();
         let content = serde_json::to_string(&encrypted).unwrap();
         assert!(!content.contains("127.0.0.1"));
         assert!(!content.contains("app_db"));
         assert!(!content.contains("db-secret"));
 
-        let restored = parse_snippet_snapshot(&content, Some("sync-pass")).unwrap();
+        let restored = parse_snippet_snapshot(&content, Some("sync-passphrase-long")).unwrap();
         assert_eq!(restored.connections[0].database.as_deref(), Some("app_db"));
         assert!(parse_snippet_snapshot(&content, Some("wrong-pass")).is_err());
         assert!(parse_snippet_snapshot(&content, None).is_err());
@@ -3684,7 +3704,11 @@ mod tests {
         let summary = apply_sync_snapshot(
             &target,
             &restored,
-            ApplySnapshotOptions { secrets_passphrase: None, restore_secrets: false, endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets },
+            ApplySnapshotOptions {
+                secrets_passphrase: None,
+                restore_secrets: false,
+                endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets,
+            },
         )
         .await
         .unwrap();
@@ -3709,7 +3733,11 @@ mod tests {
         let summary = apply_sync_snapshot(
             &target,
             &restored,
-            ApplySnapshotOptions { secrets_passphrase: None, restore_secrets: false, endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets },
+            ApplySnapshotOptions {
+                secrets_passphrase: None,
+                restore_secrets: false,
+                endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets,
+            },
         )
         .await
         .unwrap();
@@ -3872,8 +3900,9 @@ mod tests {
         let selected = snapshot_for_snippet_upload(&local_snapshot, Some(&parsed_legacy));
         assert_eq!(selected.app_version, "remote-version");
 
-        let encrypted = encrypt_snippet_snapshot(selected, "sync-pass").unwrap();
-        let restored = parse_snippet_snapshot(&serde_json::to_string(&encrypted).unwrap(), Some("sync-pass")).unwrap();
+        let encrypted = encrypt_snippet_snapshot(selected, "sync-passphrase-long").unwrap();
+        let restored =
+            parse_snippet_snapshot(&serde_json::to_string(&encrypted).unwrap(), Some("sync-passphrase-long")).unwrap();
         assert_eq!(restored.app_version, "remote-version");
         assert!(!is_legacy_dbx_snapshot(r#"{"schemaVersion":1,"connections":[]}"#));
         assert!(parse_legacy_dbx_snapshot(r#"{"schemaVersion":1,"connections":[]}"#).is_err());
@@ -3951,10 +3980,12 @@ mod tests {
         ] {
             assert!(gitlab_instance_url(Some(url)).is_err(), "accepted {url}");
         }
-        assert_eq!(gitlab_instance_url(Some("http://gitlab.internal:8080/")).unwrap(), "http://gitlab.internal:8080");
+        // Plain http is only accepted for loopback instances.
+        assert!(gitlab_instance_url(Some("http://gitlab.internal:8080/")).is_err());
+        assert_eq!(gitlab_instance_url(Some("http://localhost:8080/")).unwrap(), "http://localhost:8080");
         assert_ne!(
-            snippet_provider_storage_key(SnippetProvider::GitLab, Some("http://gitlab.example.com")).unwrap(),
-            snippet_provider_storage_key(SnippetProvider::GitLab, Some("https://gitlab.example.com")).unwrap()
+            snippet_provider_storage_key(SnippetProvider::GitLab, Some("http://localhost")).unwrap(),
+            snippet_provider_storage_key(SnippetProvider::GitLab, Some("https://localhost")).unwrap()
         );
         assert!(validate_snippet_id(SnippetProvider::GitLab, "12/evil").is_err());
         assert_eq!(snippet_response_id(&serde_json::json!({"id": 42})).as_deref(), Some("42"));
@@ -4004,7 +4035,7 @@ mod tests {
     async fn gitlab_create_and_download_use_private_personal_snippet_and_raw_file() {
         let storage = Storage::open(&temp_db_path("gitlab-create-download")).await.unwrap();
         let snapshot = build_sync_snapshot(&storage, "test-version", None, None).await.unwrap();
-        let encrypted = encrypt_snippet_snapshot(&snapshot, "password").unwrap();
+        let encrypted = encrypt_snippet_snapshot(&snapshot, "snippet-password-long").unwrap();
         let (base, server) = spawn_gitlab_server(vec![
             serde_json::json!({"id": 42}).to_string(),
             serde_json::json!({"files": [{"path": "dbx-sync.json"}]}).to_string(),
@@ -4019,11 +4050,11 @@ mod tests {
             replace_legacy_snippet: false,
         };
         let client = SnippetSyncClient::with_api_base(config.clone(), base.clone());
-        let summary = client.put_snapshot(&snapshot, Some("password"), None).await.unwrap();
+        let summary = client.put_snapshot(&snapshot, Some("snippet-password-long"), None).await.unwrap();
         assert_eq!(summary.snippet_id, "42");
         let download =
             SnippetSyncClient::with_api_base(SnippetSyncConfig { snippet_id: Some("42".to_string()), ..config }, base);
-        let (restored, _) = download.get_snapshot(Some("password")).await.unwrap();
+        let (restored, _) = download.get_snapshot(Some("snippet-password-long")).await.unwrap();
         assert_eq!(restored.app_version, snapshot.app_version);
         let requests = server.await.unwrap();
         assert!(requests[0].starts_with("POST /api/v4/snippets HTTP/1.1"));
@@ -4040,7 +4071,8 @@ mod tests {
     async fn gitlab_download_uses_snippet_raw_url_branch() {
         let storage = Storage::open(&temp_db_path("gitlab-raw-url-branch")).await.unwrap();
         let snapshot = build_sync_snapshot(&storage, "test-version", None, None).await.unwrap();
-        let encrypted = serde_json::to_string(&encrypt_snippet_snapshot(&snapshot, "password").unwrap()).unwrap();
+        let encrypted =
+            serde_json::to_string(&encrypt_snippet_snapshot(&snapshot, "snippet-password-long").unwrap()).unwrap();
         let (base, server) = spawn_gitlab_server_with_status(vec![
             (
                 200,
@@ -4059,7 +4091,7 @@ mod tests {
             },
             base,
         );
-        let (restored, _) = client.get_snapshot(Some("password")).await.unwrap();
+        let (restored, _) = client.get_snapshot(Some("snippet-password-long")).await.unwrap();
         assert_eq!(restored.app_version, snapshot.app_version);
         let requests = server.await.unwrap();
         assert_eq!(requests.len(), 2);
@@ -4264,12 +4296,15 @@ mod tests {
         assert!(!status.has_saved_passphrase);
         assert_eq!(resolve_webdav_sync_secrets_passphrase(&storage).await.unwrap(), None);
 
-        save_webdav_sync_secrets_preference(&storage, true, Some("sync-pass")).await.unwrap();
+        save_webdav_sync_secrets_preference(&storage, true, Some("sync-passphrase-long")).await.unwrap();
 
         let status = webdav_sync_secrets_status(&storage).await.unwrap();
         assert!(status.enabled);
         assert!(status.has_saved_passphrase);
-        assert_eq!(resolve_webdav_sync_secrets_passphrase(&storage).await.unwrap().as_deref(), Some("sync-pass"));
+        assert_eq!(
+            resolve_webdav_sync_secrets_passphrase(&storage).await.unwrap().as_deref(),
+            Some("sync-passphrase-long")
+        );
 
         forget_webdav_sync_secrets_passphrase(&storage).await.unwrap();
         let status = webdav_sync_secrets_status(&storage).await.unwrap();
@@ -4288,13 +4323,13 @@ mod tests {
         assert!(plain_snapshot.encrypted_secrets.is_none());
         assert_eq!(plain_snapshot.connections[0].password, "");
 
-        save_webdav_sync_secrets_preference(&storage, true, Some("sync-pass")).await.unwrap();
+        save_webdav_sync_secrets_preference(&storage, true, Some("sync-passphrase-long")).await.unwrap();
         let encrypted_snapshot =
             build_sync_snapshot_with_saved_secrets(&storage, "test-version", None, None).await.unwrap();
 
         assert_eq!(encrypted_snapshot.connections[0].password, "");
         let encrypted = encrypted_snapshot.encrypted_secrets.as_ref().expect("encrypted secrets");
-        let decrypted = decrypt_sensitive_payload(encrypted, "sync-pass").unwrap();
+        let decrypted = decrypt_sensitive_payload(encrypted, "sync-passphrase-long").unwrap();
         assert!(decrypted.connection_secrets.iter().any(|secret| {
             secret.connection_id == "pg" && secret.key == "password" && secret.secret == "db-secret"
         }));
@@ -4333,7 +4368,11 @@ mod tests {
         apply_sync_snapshot(
             &target,
             &snapshot,
-            ApplySnapshotOptions { secrets_passphrase: Some("transport-pass"), restore_secrets: true, endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets },
+            ApplySnapshotOptions {
+                secrets_passphrase: Some("transport-pass"),
+                restore_secrets: true,
+                endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets,
+            },
         )
         .await
         .unwrap();
@@ -4350,7 +4389,11 @@ mod tests {
             apply_sync_snapshot(
                 &target,
                 &snapshot,
-                ApplySnapshotOptions { secrets_passphrase: Some("transport-pass"), restore_secrets, endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets },
+                ApplySnapshotOptions {
+                    secrets_passphrase: Some("transport-pass"),
+                    restore_secrets,
+                    endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets,
+                },
             )
             .await
             .unwrap();
@@ -4406,7 +4449,11 @@ mod tests {
         apply_sync_snapshot(
             &target,
             &snapshot,
-            ApplySnapshotOptions { secrets_passphrase: None, restore_secrets: false, endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets },
+            ApplySnapshotOptions {
+                secrets_passphrase: None,
+                restore_secrets: false,
+                endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets,
+            },
         )
         .await
         .unwrap();
@@ -4444,7 +4491,11 @@ mod tests {
             apply_sync_snapshot(
                 &locked_target,
                 &snapshot,
-                ApplySnapshotOptions { secrets_passphrase: None, restore_secrets: false, endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets },
+                ApplySnapshotOptions {
+                    secrets_passphrase: None,
+                    restore_secrets: false,
+                    endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets
+                },
             )
             .await
             .unwrap_err(),
@@ -4460,7 +4511,11 @@ mod tests {
         apply_sync_snapshot(
             &locked_target,
             &without_url_params,
-            ApplySnapshotOptions { secrets_passphrase: None, restore_secrets: false, endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets },
+            ApplySnapshotOptions {
+                secrets_passphrase: None,
+                restore_secrets: false,
+                endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets,
+            },
         )
         .await
         .unwrap();
@@ -4471,7 +4526,11 @@ mod tests {
         apply_sync_snapshot(
             &unlocked_target,
             &snapshot,
-            ApplySnapshotOptions { secrets_passphrase: None, restore_secrets: false, endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets },
+            ApplySnapshotOptions {
+                secrets_passphrase: None,
+                restore_secrets: false,
+                endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets,
+            },
         )
         .await
         .unwrap();
@@ -4517,7 +4576,11 @@ mod tests {
         apply_sync_snapshot(
             &target,
             &snapshot,
-            ApplySnapshotOptions { secrets_passphrase: Some("transport-pass"), restore_secrets: true, endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets },
+            ApplySnapshotOptions {
+                secrets_passphrase: Some("transport-pass"),
+                restore_secrets: true,
+                endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets,
+            },
         )
         .await
         .unwrap();
@@ -4549,7 +4612,11 @@ mod tests {
         apply_sync_snapshot(
             &target,
             &empty_snapshot,
-            ApplySnapshotOptions { secrets_passphrase: Some("transport-pass"), restore_secrets: true, endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets },
+            ApplySnapshotOptions {
+                secrets_passphrase: Some("transport-pass"),
+                restore_secrets: true,
+                endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets,
+            },
         )
         .await
         .unwrap();
@@ -4571,11 +4638,11 @@ mod tests {
         config.connection_secrets.insert("api_token".to_string(), "plugin-secret".to_string());
         storage.save_connections(std::slice::from_ref(&config)).await.unwrap();
 
-        let snapshot = build_sync_snapshot(&storage, "test-version", None, Some("sync-pass")).await.unwrap();
+        let snapshot = build_sync_snapshot(&storage, "test-version", None, Some("sync-passphrase-long")).await.unwrap();
         let public_json = serde_json::to_string(&snapshot.connections).unwrap();
         assert!(!public_json.contains("plugin-secret"));
         let encrypted = snapshot.encrypted_secrets.as_ref().expect("encrypted secrets");
-        let decrypted = decrypt_sensitive_payload(encrypted, "sync-pass").unwrap();
+        let decrypted = decrypt_sensitive_payload(encrypted, "sync-passphrase-long").unwrap();
         assert!(decrypted.connection_secrets.iter().any(|secret| {
             secret.connection_id == "plugin"
                 && secret.key == format!("{PLUGIN_CONNECTION_SECRET_PREFIX}api_token")
@@ -4600,7 +4667,7 @@ mod tests {
             None,
             SyncExportOptions {
                 include_secrets: true,
-                sync_passphrase: Some("sync-pass"),
+                sync_passphrase: Some("sync-passphrase-long"),
                 include_ai_secrets: false,
                 include_tunnel_secrets: false,
                 include_plugin_secrets: true,
@@ -4608,7 +4675,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let decrypted = decrypt_sensitive_payload(snapshot.encrypted_secrets.as_ref().unwrap(), "sync-pass").unwrap();
+        let decrypted =
+            decrypt_sensitive_payload(snapshot.encrypted_secrets.as_ref().unwrap(), "sync-passphrase-long").unwrap();
         assert!(decrypted.connection_secrets.iter().any(|secret| {
             secret.connection_id == "plugin-no-password"
                 && secret.key == format!("{PLUGIN_CONNECTION_SECRET_PREFIX}api_token")
@@ -4631,7 +4699,7 @@ mod tests {
             None,
             SyncExportOptions {
                 include_secrets: true,
-                sync_passphrase: Some("sync-pass"),
+                sync_passphrase: Some("sync-passphrase-long"),
                 include_ai_secrets: false,
                 include_tunnel_secrets: false,
                 include_plugin_secrets: false,
@@ -4648,7 +4716,11 @@ mod tests {
         apply_sync_snapshot(
             &target,
             &snapshot,
-            ApplySnapshotOptions { secrets_passphrase: Some("sync-pass"), restore_secrets: true, endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets },
+            ApplySnapshotOptions {
+                secrets_passphrase: Some("sync-passphrase-long"),
+                restore_secrets: true,
+                endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets,
+            },
         )
         .await
         .unwrap();
@@ -4662,14 +4734,19 @@ mod tests {
     async fn sync_restore_does_not_revive_password_when_connection_disables_saving() {
         let source = Storage::open(&temp_db_path("sync-no-save-password-source")).await.unwrap();
         source.save_connections(&[postgres_connection("pg", "remote-secret")]).await.unwrap();
-        let mut snapshot = build_sync_snapshot(&source, "test-version", None, Some("sync-pass")).await.unwrap();
+        let mut snapshot =
+            build_sync_snapshot(&source, "test-version", None, Some("sync-passphrase-long")).await.unwrap();
         snapshot.connections[0].save_password = false;
 
         let target = Storage::open(&temp_db_path("sync-no-save-password-target")).await.unwrap();
         apply_sync_snapshot(
             &target,
             &snapshot,
-            ApplySnapshotOptions { secrets_passphrase: Some("sync-pass"), restore_secrets: true, endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets },
+            ApplySnapshotOptions {
+                secrets_passphrase: Some("sync-passphrase-long"),
+                restore_secrets: true,
+                endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets,
+            },
         )
         .await
         .unwrap();
@@ -4690,7 +4767,11 @@ mod tests {
         assert!(apply_sync_snapshot(
             &target,
             &snapshot,
-            ApplySnapshotOptions { secrets_passphrase: Some("wrong-pass"), restore_secrets: true, endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets },
+            ApplySnapshotOptions {
+                secrets_passphrase: Some("wrong-pass"),
+                restore_secrets: true,
+                endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets
+            },
         )
         .await
         .is_err());
@@ -4712,7 +4793,11 @@ mod tests {
         apply_sync_snapshot(
             &target,
             &snapshot,
-            ApplySnapshotOptions { secrets_passphrase: None, restore_secrets: true, endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets },
+            ApplySnapshotOptions {
+                secrets_passphrase: None,
+                restore_secrets: true,
+                endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets,
+            },
         )
         .await
         .unwrap();
@@ -4723,7 +4808,11 @@ mod tests {
         apply_sync_snapshot(
             &metadata_only_target,
             &snapshot,
-            ApplySnapshotOptions { secrets_passphrase: None, restore_secrets: false, endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets },
+            ApplySnapshotOptions {
+                secrets_passphrase: None,
+                restore_secrets: false,
+                endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets,
+            },
         )
         .await
         .unwrap();
@@ -4752,7 +4841,7 @@ mod tests {
         let storage = Storage::open(&temp_db_path("saved-sync-nacos-snapshot")).await.unwrap();
         storage.save_connections(&[nacos_connection("nacos", "nacos-secret")]).await.unwrap();
 
-        save_webdav_sync_secrets_preference(&storage, true, Some("sync-pass")).await.unwrap();
+        save_webdav_sync_secrets_preference(&storage, true, Some("sync-passphrase-long")).await.unwrap();
         let encrypted_snapshot =
             build_sync_snapshot_with_saved_secrets(&storage, "test-version", None, None).await.unwrap();
 
@@ -4760,7 +4849,7 @@ mod tests {
         let public_json = serde_json::to_string(&encrypted_snapshot.connections).unwrap();
         assert!(!public_json.contains("nacos-secret"));
         let encrypted = encrypted_snapshot.encrypted_secrets.as_ref().expect("encrypted secrets");
-        let decrypted = decrypt_sensitive_payload(encrypted, "sync-pass").unwrap();
+        let decrypted = decrypt_sensitive_payload(encrypted, "sync-passphrase-long").unwrap();
         assert!(decrypted.connection_secrets.iter().any(|secret| {
             secret.connection_id == "nacos" && secret.key == NACOS_AUTH_PASSWORD_KEY && secret.secret == "nacos-secret"
         }));
@@ -4824,7 +4913,7 @@ mod tests {
         });
         storage.save_tunnel_profiles(std::slice::from_ref(&profile)).await.unwrap();
 
-        let snapshot = build_sync_snapshot(&storage, "test-version", None, Some("sync-pass")).await.unwrap();
+        let snapshot = build_sync_snapshot(&storage, "test-version", None, Some("sync-passphrase-long")).await.unwrap();
 
         // The plain snapshot carries the profiles with secrets scrubbed.
         let public_profiles = snapshot.tunnel_profiles.as_ref().expect("tunnel profiles in snapshot");
@@ -4836,7 +4925,11 @@ mod tests {
         apply_sync_snapshot(
             &target,
             &snapshot,
-            ApplySnapshotOptions { secrets_passphrase: Some("sync-pass"), restore_secrets: true, endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets },
+            ApplySnapshotOptions {
+                secrets_passphrase: Some("sync-passphrase-long"),
+                restore_secrets: true,
+                endpoint_change_policy: EndpointChangePolicy::KeepLocalSecrets,
+            },
         )
         .await
         .unwrap();
