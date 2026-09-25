@@ -251,7 +251,10 @@ pub fn decrypt_connection_export(payload: &serde_json::Value, passphrase: &str) 
 
 /// Runs [`decrypt_connection_export`] on the blocking pool: key derivation is
 /// deliberately expensive and must not stall an async worker.
-pub async fn decrypt_connection_export_blocking(payload: serde_json::Value, passphrase: String) -> Result<String, String> {
+pub async fn decrypt_connection_export_blocking(
+    payload: serde_json::Value,
+    passphrase: String,
+) -> Result<String, String> {
     tokio::task::spawn_blocking(move || decrypt_connection_export(&payload, &passphrase))
         .await
         .map_err(|error| error.to_string())?
@@ -430,7 +433,8 @@ mod tests {
         .unwrap();
         config.save_password = true;
         storage.save_connections(&[config.clone()]).await.unwrap();
-        let mut redacted = redact_connection_for_client(&storage.load_connection("prod").await.unwrap().unwrap()).unwrap();
+        let mut redacted =
+            redact_connection_for_client(&storage.load_connection("prod").await.unwrap().unwrap()).unwrap();
         redacted["connect_timeout_inherit"] = serde_json::json!(true);
         let bundle = serde_json::json!({ "connections": [redacted] });
         let file = storage.export_connections_encrypted(bundle, "a sufficiently long passphrase").await.unwrap();

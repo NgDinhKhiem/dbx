@@ -696,6 +696,28 @@ pub async fn close_database_connection(
     state.app.close_database_pool(&body.connection_id, database).await.map(Json).map_err(AppError::from)
 }
 
+#[derive(Deserialize)]
+pub struct ExportConnectionsEncryptedRequest {
+    pub bundle: serde_json::Value,
+    pub passphrase: String,
+}
+
+/// Builds the encrypted (v2) connection export. The client sends redacted
+/// configs; stored secrets are filled in by id on the server and never reach
+/// the browser.
+pub async fn export_connections_encrypted(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<ExportConnectionsEncryptedRequest>,
+) -> Result<Json<String>, AppError> {
+    state
+        .app
+        .storage
+        .export_connections_encrypted(body.bundle, &body.passphrase)
+        .await
+        .map(Json)
+        .map_err(AppError::from)
+}
+
 pub async fn save_connections(
     State(state): State<Arc<WebState>>,
     headers: HeaderMap,
@@ -1919,6 +1941,13 @@ mod tests {
         state.app.session_credentials.record_pool_owner("conn-a", "token-a");
         let mut recreated = sqlite_config("conn-a", &dir.join("new.db").to_string_lossy());
         recreated.save_password = false;
+        // MCP is read-only until configured; this test exercises MCP connection changes.
+        state
+            .app
+            .storage
+            .save_mcp_global_policy(&dbx_core::storage::McpGlobalPolicy { read_only: false, ..Default::default() })
+            .await
+            .unwrap();
 
         let reused =
             mcp_add_connection(State(state.clone()), Json(McpAddConnectionRequest { config: recreated.clone() }))

@@ -518,6 +518,7 @@ async fn serve() {
         .route("/connection/identifier-quote", post(routes::connection::connection_identifier_quote))
         .route("/connection/close-database", post(routes::connection::close_database_connection))
         .route("/connection/save", post(routes::connection::save_connections))
+        .route("/connection/export-encrypted", post(routes::connection::export_connections_encrypted))
         .route("/connection/list", get(routes::connection::load_connections))
         .route("/connection/mcp/add", post(routes::connection::mcp_add_connection))
         .route("/connection/mcp/duplicate", post(routes::connection::mcp_duplicate_connection))

@@ -1,54 +1,31 @@
 import { strict as assert } from "node:assert";
 import { test } from "vitest";
-import { CONFIG_CRYPTO_UNAVAILABLE, encryptConfig, decryptConfig, isEncryptedConfig } from "../../apps/desktop/src/lib/backend/configCrypto.ts";
+import { isEncryptedConfig, MIN_EXPORT_PASSPHRASE_LENGTH, normalizeConfigCryptoError } from "../../apps/desktop/src/lib/backend/configCrypto.ts";
 
-test("encrypts and decrypts config round-trip", async () => {
-  const original = JSON.stringify([{ id: "1", name: "test", password: "secret123" }]);
-  const encrypted = await encryptConfig(original, "my-passphrase");
+// Encryption and decryption run on the backend (see
+// crates/dbx-core/src/persistence/connection_export.rs for the round-trip,
+// v1 compatibility and passphrase-length tests). The frontend only detects the
+// file format and maps backend error codes.
 
-  assert.equal(encrypted.format, "dbx-encrypted");
-  assert.equal(encrypted.version, 1);
-  assert.ok(encrypted.salt);
-  assert.ok(encrypted.iv);
-  assert.ok(encrypted.data);
-
-  const decrypted = await decryptConfig(encrypted, "my-passphrase");
-  assert.equal(decrypted, original);
-});
-
-test("fails to decrypt with wrong passphrase", async () => {
-  const encrypted = await encryptConfig('{"test":true}', "correct-passphrase");
-
-  await assert.rejects(
-    () => decryptConfig(encrypted, "wrong-passphrase"),
-    (err: Error) => err.message === "wrong_passphrase",
-  );
-});
-
-test("detects encrypted config format", () => {
+test("detects encrypted config formats", () => {
   assert.equal(isEncryptedConfig({ format: "dbx-encrypted", version: 1, salt: "a", iv: "b", data: "c" }), true);
+  assert.equal(isEncryptedConfig({ format: "dbx-encrypted", version: 2, kdf: { name: "argon2id" }, cipher: "aes-256-gcm", nonce: "n", data: "c" }), true);
+  assert.equal(isEncryptedConfig({ format: "dbx-encrypted", version: 2, kdf: null, nonce: "n", data: "c" }), false);
+  assert.equal(isEncryptedConfig({ format: "dbx-encrypted", version: 3, data: "c" }), false);
   assert.equal(isEncryptedConfig({ format: "dbx-config", version: 1, connections: [] }), false);
   assert.equal(isEncryptedConfig([{ id: "1" }]), false);
   assert.equal(isEncryptedConfig(null), false);
   assert.equal(isEncryptedConfig("string"), false);
 });
 
-test("reports crypto unavailable when Web Crypto is missing", async () => {
-  const originalCrypto = globalThis.crypto;
-  Object.defineProperty(globalThis, "crypto", {
-    configurable: true,
-    value: { getRandomValues: originalCrypto.getRandomValues.bind(originalCrypto) },
-  });
+test("maps backend error codes to plain error messages", () => {
+  assert.equal(normalizeConfigCryptoError("Error: wrong_passphrase").message, "wrong_passphrase");
+  assert.equal(normalizeConfigCryptoError(new Error("request failed: passphrase_too_short")).message, "passphrase_too_short");
+  assert.equal(normalizeConfigCryptoError({ message: "passphrase_required" }).message, "passphrase_required");
+  const other = new Error("disk full");
+  assert.equal(normalizeConfigCryptoError(other), other);
+});
 
-  try {
-    await assert.rejects(
-      () => encryptConfig("{}", "passphrase"),
-      (err: Error) => err.message === CONFIG_CRYPTO_UNAVAILABLE,
-    );
-  } finally {
-    Object.defineProperty(globalThis, "crypto", {
-      configurable: true,
-      value: originalCrypto,
-    });
-  }
+test("new exports require a long passphrase", () => {
+  assert.ok(MIN_EXPORT_PASSPHRASE_LENGTH >= 12);
 });
