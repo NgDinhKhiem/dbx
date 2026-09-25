@@ -308,6 +308,16 @@ function sidebarObjectGroupPageSize(): number {
  */
 export const SIDEBAR_TABLE_SEARCH_RESULT_BUDGET = 2000;
 
+/** Completion cache key holding the index list fetched by the sidebar tree. */
+function elasticsearchSidebarIndexSeedKey(connectionId: string): string {
+  return `${connectionId}:__sidebar_indices__`;
+}
+
+/** Index names plus aliases, the same shape `elasticsearchListIndices` returns. */
+export function elasticsearchCompletionIndexNames(collections: readonly { name: string; aliases?: string[] | null }[]): string[] {
+  return [...new Set(collections.flatMap((collection) => [collection.name, ...(collection.aliases ?? [])].filter((name) => name.trim())))];
+}
+
 function isFlatMqConnection(config: ConnectionConfig | undefined): boolean {
   if (!config || config.db_type !== "mq") return false;
   if (config.driver_profile === "kafka" || config.driver_profile === "rocketmq" || config.driver_profile === "rabbitmq") return true;
@@ -3798,6 +3808,8 @@ export const useConnectionStore = defineStore("connection", () => {
     for (const key of Object.keys(elasticsearchCompletionIndicesCache.value)) {
       if (key === exactCacheKey || key.startsWith(cachePrefix)) delete elasticsearchCompletionIndicesCache.value[key];
     }
+    // The sidebar seed is database-independent, so any invalidation for the connection drops it.
+    delete elasticsearchCompletionIndicesCache.value[elasticsearchSidebarIndexSeedKey(connectionId)];
     for (const key of Object.keys(elasticsearchCompletionFieldsCache.value)) {
       if (key === exactCacheKey || key.startsWith(cachePrefix)) delete elasticsearchCompletionFieldsCache.value[key];
     }
@@ -5621,6 +5633,9 @@ export const useConnectionStore = defineStore("connection", () => {
       const collections = isMeilisearch
         ? sortSidebarNames(await withMetadataLoadTimeout(connectionId, api.meilisearchListIndexes(connectionId), "Meilisearch indexes")).map((name) => ({ name, aliases: [] as string[] }))
         : [...(await withMetadataLoadTimeout(connectionId, api.documentListCollections(connectionId, "default"), isSolr ? "Solr cores" : "Elasticsearch indices"))].sort((left, right) => compareSidebarNames(left.name, right.name));
+      // The sidebar already fetched every index and alias: seed the editor/console
+      // completion cache so autocomplete needs no second listing round trip.
+      if (!isMeilisearch && !isSolr) seedElasticsearchCompletionIndices(connectionId, collections);
       const indexNodes = collections.map((collection) => {
         const aliases = collection.aliases?.filter((alias) => alias.trim());
         return {
@@ -8406,16 +8421,24 @@ export const useConnectionStore = defineStore("connection", () => {
     });
   }
 
+  function seedElasticsearchCompletionIndices(connectionId: string, collections: readonly { name: string; aliases?: string[] | null }[]) {
+    elasticsearchCompletionIndicesCache.value[elasticsearchSidebarIndexSeedKey(connectionId)] = elasticsearchCompletionIndexNames(collections);
+    evictOldestCacheEntries(elasticsearchCompletionIndicesCache.value, COMPLETION_CACHE_MAX);
+  }
+
   async function listElasticsearchCompletionIndices(connectionId: string, database: string): Promise<string[]> {
     const cacheKey = `${connectionId}:${database}`;
-    if (elasticsearchCompletionIndicesCache.value[cacheKey]) {
-      return elasticsearchCompletionIndicesCache.value[cacheKey];
-    }
-    await ensureConnected(connectionId);
-    const indices = await api.elasticsearchListIndices(connectionId);
-    elasticsearchCompletionIndicesCache.value[cacheKey] = indices;
-    evictOldestCacheEntries(elasticsearchCompletionIndicesCache.value, COMPLETION_CACHE_MAX);
-    return elasticsearchCompletionIndicesCache.value[cacheKey];
+    // Index names do not depend on the editor's database; reuse the sidebar listing when present.
+    const cached = elasticsearchCompletionIndicesCache.value[cacheKey] ?? elasticsearchCompletionIndicesCache.value[elasticsearchSidebarIndexSeedKey(connectionId)];
+    if (cached) return cached;
+    // Concurrent editors/consoles share one listing request.
+    return withCompletionInFlight(`${connectionId}:es-indices`, async () => {
+      await ensureConnected(connectionId);
+      const indices = await api.elasticsearchListIndices(connectionId);
+      elasticsearchCompletionIndicesCache.value[cacheKey] = indices;
+      evictOldestCacheEntries(elasticsearchCompletionIndicesCache.value, COMPLETION_CACHE_MAX);
+      return indices;
+    });
   }
 
   async function listElasticsearchCompletionFields(connectionId: string, index: string): Promise<ElasticsearchCompletionField[]> {

@@ -784,6 +784,7 @@ function clearRememberedConnectionDatabases() {
 const editDataTabReuseMode = ref<DataTabReuseMode>(settingsStore.editorSettings.dataTabReuseMode);
 const editOpenDataTabsNextToActive = ref(settingsStore.editorSettings.openDataTabsNextToActive);
 const editPrefillNewQueryWithSelect = ref(settingsStore.editorSettings.prefillNewQueryWithSelect);
+const editPrewarmDrivers = ref(settingsStore.editorSettings.prewarmDrivers);
 const editGenerateSqlIncludeDatabaseName = ref(settingsStore.editorSettings.generateSqlIncludeDatabaseName);
 const editGenerateSqlQuoteIdentifiers = ref(settingsStore.editorSettings.generateSqlQuoteIdentifiers);
 const editFormatSqlOnSqlFileSave = ref(settingsStore.editorSettings.formatSqlOnSqlFileSave);
@@ -1049,6 +1050,7 @@ function currentEditorSettingsDraft(): EditorSettingsDraft {
     dataTabReuseMode: editDataTabReuseMode.value,
     openDataTabsNextToActive: editOpenDataTabsNextToActive.value,
     prefillNewQueryWithSelect: editPrefillNewQueryWithSelect.value,
+    prewarmDrivers: editPrewarmDrivers.value,
     generateSqlIncludeDatabaseName: editGenerateSqlIncludeDatabaseName.value,
     generateSqlQuoteIdentifiers: editGenerateSqlQuoteIdentifiers.value,
     formatSqlOnSqlFileSave: editFormatSqlOnSqlFileSave.value,
@@ -1694,6 +1696,7 @@ function syncEditorSettingsDraftFromStore() {
   editDataTabReuseMode.value = settingsStore.editorSettings.dataTabReuseMode;
   editOpenDataTabsNextToActive.value = settingsStore.editorSettings.openDataTabsNextToActive;
   editPrefillNewQueryWithSelect.value = settingsStore.editorSettings.prefillNewQueryWithSelect;
+  editPrewarmDrivers.value = settingsStore.editorSettings.prewarmDrivers;
   editGenerateSqlIncludeDatabaseName.value = settingsStore.editorSettings.generateSqlIncludeDatabaseName;
   editGenerateSqlQuoteIdentifiers.value = settingsStore.editorSettings.generateSqlQuoteIdentifiers;
   editFormatSqlOnSqlFileSave.value = settingsStore.editorSettings.formatSqlOnSqlFileSave;
@@ -1824,6 +1827,7 @@ const editorSettingsDraftRefs: EditorSettingsDraftRefMap = {
   dataTabReuseMode: editDataTabReuseMode,
   openDataTabsNextToActive: editOpenDataTabsNextToActive,
   prefillNewQueryWithSelect: editPrefillNewQueryWithSelect,
+  prewarmDrivers: editPrewarmDrivers,
   generateSqlIncludeDatabaseName: editGenerateSqlIncludeDatabaseName,
   generateSqlQuoteIdentifiers: editGenerateSqlQuoteIdentifiers,
   formatSqlOnSqlFileSave: editFormatSqlOnSqlFileSave,
@@ -2286,6 +2290,7 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editDataTabReuseMode.value = DEFAULT_EDITOR_SETTINGS.dataTabReuseMode;
     editOpenDataTabsNextToActive.value = DEFAULT_EDITOR_SETTINGS.openDataTabsNextToActive;
     editPrefillNewQueryWithSelect.value = DEFAULT_EDITOR_SETTINGS.prefillNewQueryWithSelect;
+    editPrewarmDrivers.value = DEFAULT_EDITOR_SETTINGS.prewarmDrivers;
     editGenerateSqlIncludeDatabaseName.value = DEFAULT_EDITOR_SETTINGS.generateSqlIncludeDatabaseName;
     editGenerateSqlQuoteIdentifiers.value = DEFAULT_EDITOR_SETTINGS.generateSqlQuoteIdentifiers;
     editFormatSqlOnSqlFileSave.value = DEFAULT_EDITOR_SETTINGS.formatSqlOnSqlFileSave;
@@ -2455,6 +2460,7 @@ function resetAllDefaults() {
   editDataTabReuseMode.value = DEFAULT_EDITOR_SETTINGS.dataTabReuseMode;
   editOpenDataTabsNextToActive.value = DEFAULT_EDITOR_SETTINGS.openDataTabsNextToActive;
   editPrefillNewQueryWithSelect.value = DEFAULT_EDITOR_SETTINGS.prefillNewQueryWithSelect;
+  editPrewarmDrivers.value = DEFAULT_EDITOR_SETTINGS.prewarmDrivers;
   editGenerateSqlIncludeDatabaseName.value = DEFAULT_EDITOR_SETTINGS.generateSqlIncludeDatabaseName;
   editGenerateSqlQuoteIdentifiers.value = DEFAULT_EDITOR_SETTINGS.generateSqlQuoteIdentifiers;
   editFormatSqlOnSqlFileSave.value = DEFAULT_EDITOR_SETTINGS.formatSqlOnSqlFileSave;
@@ -7402,6 +7408,16 @@ onUnmounted(() => {
                     </p>
                   </div>
                   <Switch id="editor-prefill-new-query" v-model="editPrefillNewQueryWithSelect" class="mt-0.5" />
+                </div>
+
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="space-y-1">
+                    <Label for="editor-prewarm-drivers">{{ t("settings.prewarmDrivers") }}</Label>
+                    <p class="text-xs text-muted-foreground">
+                      {{ t("settings.prewarmDriversDescription") }}
+                    </p>
+                  </div>
+                  <Switch id="editor-prewarm-drivers" v-model="editPrewarmDrivers" class="mt-0.5" />
                 </div>
               </div>
               <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">

@@ -55,12 +55,15 @@ const KAFKA_CAPABILITIES: MqCapabilities = MqCapabilities {
 pub struct KafkaAdmin {
     client: Arc<Mutex<AgentDriverClient>>,
     config: MqAdminConfig,
+    /// Whether the brokers run an authorizer, learned once per adapter from the
+    /// live admin client. Unset until a probe gives a definite answer.
+    acl_enabled: tokio::sync::OnceCell<bool>,
 }
 
 impl KafkaAdmin {
-    /// Spawn the Kafka Java agent, perform handshake, and connect.
+    /// Spawn the Kafka Java agent (or take a prewarmed one), perform handshake, and connect.
     pub async fn new(cfg: MqAdminConfig, launch: AgentLaunchSpec) -> Result<Self, String> {
-        let mut client = AgentDriverClient::spawn(launch).await?;
+        let mut client = crate::agent_prewarm::spawn_agent_client(launch).await?;
 
         // Handshake
         let _: serde_json::Value =
@@ -73,7 +76,30 @@ impl KafkaAdmin {
 
         log::info!("Kafka admin connected via agent (bootstrap servers: {})", bootstrap_servers(&cfg));
 
-        Ok(Self { client: Arc::new(Mutex::new(client)), config: cfg })
+        Ok(Self { client: Arc::new(Mutex::new(client)), config: cfg, acl_enabled: tokio::sync::OnceCell::new() })
+    }
+
+    /// ACL support of the connected cluster. Uses the agent's live admin client
+    /// (`mq_list_acls`) instead of the agent `test_connection` RPC, which builds
+    /// and tears down a whole new AdminClient (new TCP/TLS/SASL sessions) per call.
+    /// Only definite answers are cached; transient failures keep the capability on.
+    async fn acl_enabled(&self) -> bool {
+        if let Some(enabled) = self.acl_enabled.get() {
+            return *enabled;
+        }
+        let probe = self.call::<serde_json::Value>("mq_list_acls", serde_json::json!({})).await;
+        match kafka_acl_probe_outcome(probe.as_ref().map(|_| ()).map_err(String::as_str)) {
+            Some(enabled) => {
+                let _ = self.acl_enabled.set(enabled);
+                enabled
+            }
+            None => {
+                if let Err(err) = &probe {
+                    log::warn!("Kafka ACL capability probe failed; leaving the capability enabled: {err}");
+                }
+                true
+            }
+        }
     }
 
     /// Send a JSON-RPC call to the Kafka agent and deserialize the result.
@@ -114,17 +140,23 @@ impl MessageQueueAdmin for KafkaAdmin {
         MqSystemKind::Kafka
     }
 
+    /// `connect` already verifies the cluster with `describeCluster`.
+    fn build_includes_connect_test(&self) -> bool {
+        true
+    }
+
     async fn test_connection(&self) -> Result<MqClusterInfo, String> {
-        let conn_params = build_connection_params(&self.config);
-        let result: serde_json::Value =
-            self.call("test_connection", serde_json::json!({ "connection": conn_params })).await?;
+        // Probe through the agent's connected AdminClient: one metadata round trip on
+        // pooled broker connections. This also serves keepalive and the admin console,
+        // so it must not open fresh broker sessions each time.
+        let result: serde_json::Value = self.call("mq_describe_cluster", serde_json::json!({})).await?;
 
         let cluster_id = result.get("clusterId").and_then(|v| v.as_str()).map(String::from);
         let brokers = result.get("brokers").cloned().unwrap_or(serde_json::json!([]));
 
         // When the broker has no authorizer configured, disable permissions in the UI
         // so the frontend hides the tab instead of showing raw errors.
-        let acl_enabled = result.get("aclEnabled").and_then(|v| v.as_bool()).unwrap_or(true);
+        let acl_enabled = self.acl_enabled().await;
         let mut caps = KAFKA_CAPABILITIES;
         if !acl_enabled {
             caps.supports_permissions = false;
@@ -596,6 +628,17 @@ impl MessageQueueAdmin for KafkaAdmin {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Classify the ACL probe (`describeAcls` on the live admin client):
+/// `Some(true)` when ACLs are listable, `Some(false)` when the broker has no
+/// authorizer, `None` when the answer is unknown (timeouts, missing rights).
+fn kafka_acl_probe_outcome(result: Result<(), &str>) -> Option<bool> {
+    match result {
+        Ok(()) => Some(true),
+        Err(message) if message.contains("SecurityDisabled") || message.contains("No Authorizer") => Some(false),
+        Err(_) => None,
+    }
+}
 
 /// Extract Kafka bootstrap servers from MqAdminConfig.extra.
 fn bootstrap_servers(cfg: &MqAdminConfig) -> String {
@@ -1335,6 +1378,77 @@ mod tests {
         assert!(!partitions.map(|p| p > 0).unwrap_or(false));
     }
 
+    #[test]
+    fn acl_probe_outcome_only_caches_definite_answers() {
+        assert_eq!(kafka_acl_probe_outcome(Ok(())), Some(true));
+        assert_eq!(
+            kafka_acl_probe_outcome(Err(
+                "org.apache.kafka.common.errors.SecurityDisabledException: No Authorizer is configured on the broker"
+            )),
+            Some(false)
+        );
+        assert_eq!(kafka_acl_probe_outcome(Err("Timed out waiting for a node assignment")), None);
+        assert_eq!(kafka_acl_probe_outcome(Err("ClusterAuthorizationException: not authorized")), None);
+    }
+
+    #[tokio::test]
+    async fn test_connection_reuses_the_live_admin_client_and_caches_acl_support() {
+        let dir = std::env::temp_dir().join(format!("dbx-kafka-live-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let log_path = dir.join("calls.log");
+        let script_path = dir.join("agent.py");
+        std::fs::write(
+            &script_path,
+            format!(
+                r#"import json
+import sys
+
+log = open({log:?}, "a")
+print(json.dumps({{"ready": True}}), flush=True)
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request["method"]
+    log.write(method + "\n")
+    log.flush()
+    if method == "mq_describe_cluster":
+        reply = {{"result": {{"clusterId": "c1", "brokers": [{{"id": 1, "host": "b1", "port": 9092}}], "nodeCount": 1}}}}
+    elif method == "mq_list_acls":
+        reply = {{"error": {{"code": -1, "message": "org.apache.kafka.common.errors.SecurityDisabledException: No Authorizer is configured on the broker"}}}}
+    else:
+        reply = {{"error": {{"code": -1, "message": "unexpected " + method}}}}
+    reply.update({{"jsonrpc": "2.0", "id": request["id"]}})
+    print(json.dumps(reply), flush=True)
+"#,
+                log = log_path.to_string_lossy()
+            ),
+        )
+        .expect("write test agent script");
+
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let client = AgentDriverClient::spawn(
+            AgentLaunchSpec::new(python).with_args([script_path.to_string_lossy().to_string()]),
+        )
+        .await
+        .expect("spawn test agent");
+        let config = kafka_config(serde_json::json!({ "bootstrapServers": "broker:9092" }), MqAuth::None, false);
+        let admin =
+            KafkaAdmin { client: Arc::new(Mutex::new(client)), config, acl_enabled: tokio::sync::OnceCell::new() };
+
+        assert!(admin.build_includes_connect_test(), "connect already runs describeCluster");
+        let first = admin.test_connection().await.expect("first probe");
+        let second = admin.test_connection().await.expect("second probe");
+        drop(admin);
+        let calls = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(!first.capabilities.supports_permissions, "no authorizer disables the permissions tab");
+        assert!(!second.capabilities.supports_permissions);
+        assert_eq!(first.extra["clusterId"], "c1");
+        assert_eq!(first.extra["brokers"][0]["host"], "b1");
+        let calls = calls.lines().collect::<Vec<_>>();
+        assert_eq!(calls, vec!["mq_describe_cluster", "mq_list_acls", "mq_describe_cluster"]);
+    }
+
     #[tokio::test]
     async fn topic_listing_does_not_preempt_agent_timeout_fallback() {
         let script_path = std::env::temp_dir().join(format!("dbx-kafka-topic-timeout-{}.py", uuid::Uuid::new_v4()));
@@ -1367,7 +1481,8 @@ for line in sys.stdin:
         // The delayed response models the Kafka agent returning its fallback after metadata timeout.
         let mut config = kafka_config(serde_json::json!({ "bootstrapServers": "broker:9092" }), MqAuth::None, false);
         config.query_timeout_secs = 1;
-        let admin = KafkaAdmin { client: Arc::new(Mutex::new(client)), config };
+        let admin =
+            KafkaAdmin { client: Arc::new(Mutex::new(client)), config, acl_enabled: tokio::sync::OnceCell::new() };
 
         let result = admin
             .list_topics(

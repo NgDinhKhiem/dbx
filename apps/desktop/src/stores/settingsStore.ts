@@ -903,6 +903,7 @@ export interface EditorSettings {
   dataTabReuseMode: DataTabReuseMode;
   openDataTabsNextToActive: boolean;
   prefillNewQueryWithSelect: boolean;
+  prewarmDrivers: boolean;
   generateSqlIncludeDatabaseName: boolean;
   generateSqlQuoteIdentifiers: boolean;
   formatSqlOnSqlFileSave: boolean;
@@ -1176,6 +1177,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   dataTabReuseMode: DEFAULT_DATA_TAB_REUSE_MODE,
   openDataTabsNextToActive: false,
   prefillNewQueryWithSelect: true,
+  prewarmDrivers: true,
   generateSqlIncludeDatabaseName: false,
   generateSqlQuoteIdentifiers: true,
   formatSqlOnSqlFileSave: false,
@@ -1754,6 +1756,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     ),
     openDataTabsNextToActive: typeof settings.openDataTabsNextToActive === "boolean" ? settings.openDataTabsNextToActive : DEFAULT_EDITOR_SETTINGS.openDataTabsNextToActive,
     prefillNewQueryWithSelect: typeof settings.prefillNewQueryWithSelect === "boolean" ? settings.prefillNewQueryWithSelect : DEFAULT_EDITOR_SETTINGS.prefillNewQueryWithSelect,
+    prewarmDrivers: typeof settings.prewarmDrivers === "boolean" ? settings.prewarmDrivers : DEFAULT_EDITOR_SETTINGS.prewarmDrivers,
     generateSqlIncludeDatabaseName: settings.generateSqlIncludeDatabaseName === true,
     generateSqlQuoteIdentifiers: typeof settings.generateSqlQuoteIdentifiers === "boolean" ? settings.generateSqlQuoteIdentifiers : DEFAULT_EDITOR_SETTINGS.generateSqlQuoteIdentifiers,
     formatSqlOnSqlFileSave: settings.formatSqlOnSqlFileSave === true,
@@ -2552,6 +2555,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.dataTabReuseMode !== undefined) editorSettings.value.dataTabReuseMode = normalizeDataTabReuseMode(partial.dataTabReuseMode);
     if (partial.openDataTabsNextToActive !== undefined) editorSettings.value.openDataTabsNextToActive = partial.openDataTabsNextToActive === true;
     if (partial.prefillNewQueryWithSelect !== undefined) editorSettings.value.prefillNewQueryWithSelect = partial.prefillNewQueryWithSelect;
+    if (partial.prewarmDrivers !== undefined) editorSettings.value.prewarmDrivers = partial.prewarmDrivers;
     if (partial.generateSqlIncludeDatabaseName !== undefined) editorSettings.value.generateSqlIncludeDatabaseName = partial.generateSqlIncludeDatabaseName === true;
     if (partial.generateSqlQuoteIdentifiers !== undefined) editorSettings.value.generateSqlQuoteIdentifiers = partial.generateSqlQuoteIdentifiers === true;
     if (partial.formatSqlOnSqlFileSave !== undefined) editorSettings.value.formatSqlOnSqlFileSave = partial.formatSqlOnSqlFileSave === true;

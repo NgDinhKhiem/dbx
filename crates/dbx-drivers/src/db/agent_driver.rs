@@ -1001,7 +1001,7 @@ impl PooledAgentClient {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AgentLaunchSpec {
     pub program: PathBuf,
     pub args: Vec<String>,
@@ -3022,6 +3022,18 @@ impl AgentDriverClient {
     }
 
     /// Forcefully kill the agent process.
+    /// Whether the owned agent process has already exited. Shared-session
+    /// clients report the runtime's failure state instead.
+    pub fn has_exited(&mut self) -> bool {
+        if let Some(runtime) = &self.shared_runtime {
+            return runtime.is_failed();
+        }
+        match self.child.as_mut() {
+            Some(child) => !matches!(child.try_wait(), Ok(None)),
+            None => true,
+        }
+    }
+
     pub fn kill(&mut self) {
         if let Some(runtime) = &self.shared_runtime {
             runtime.kill();

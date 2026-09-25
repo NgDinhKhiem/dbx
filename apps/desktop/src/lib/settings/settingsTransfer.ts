@@ -99,6 +99,7 @@ const SETTINGS_TRANSFER_CATEGORY_KEYS: Record<SettingsTransferCategoryId, readon
     "appCloseUnsavedTabsMode",
     "savedSqlOpenTargetMode",
     "prefillNewQueryWithSelect",
+    "prewarmDrivers",
     "generateSqlIncludeDatabaseName",
     "generateSqlQuoteIdentifiers",
     "formatSqlOnSqlFileSave",

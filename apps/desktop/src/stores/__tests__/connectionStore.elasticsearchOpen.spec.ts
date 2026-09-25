@@ -260,4 +260,43 @@ describe("connectionStore Elasticsearch open/expand", () => {
         .sort(),
     ).toEqual(["books", "movies"]);
   });
+
+  it("seeds the completion index cache from the sidebar listing and dedupes concurrent loads", async () => {
+    const documentListCollections = vi.fn().mockResolvedValue([
+      { name: "orders", id: "orders", kind: "index", aliases: ["orders-write"] },
+      { name: "users", id: "users", kind: "index" },
+    ]);
+    const elasticsearchListIndices = vi.fn().mockResolvedValue(["fresh"]);
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+      documentListCollections,
+      elasticsearchListIndices,
+      deleteSchemaCachePrefix: vi.fn().mockResolvedValue(undefined),
+      loadSchemaCache: vi.fn().mockResolvedValue(null),
+      saveSchemaCache: vi.fn().mockResolvedValue(undefined),
+      saveConnections: vi.fn().mockResolvedValue(undefined),
+      saveSidebarLayout: vi.fn().mockResolvedValue(undefined),
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    store.addEphemeralConnection(esConnection());
+    store.addEphemeralConnection(esConnection("elasticsearch", "es-2"));
+    seedConnectionNode(store);
+    seedConnectionNode(store, "es-2");
+
+    await store.loadElasticsearchIndices("es-1");
+    // Console ("") and editor ("default") completion reuse the sidebar listing: no extra request.
+    await expect(store.listElasticsearchCompletionIndices("es-1", "")).resolves.toEqual(["orders", "orders-write", "users"]);
+    await expect(store.listElasticsearchCompletionIndices("es-1", "default")).resolves.toEqual(["orders", "orders-write", "users"]);
+    expect(elasticsearchListIndices).not.toHaveBeenCalled();
+
+    // Invalidation drops the seed so completion refetches.
+    store.invalidateCompletionCache("es-1", "default");
+    const [first, second] = await Promise.all([store.listElasticsearchCompletionIndices("es-1", "default"), store.listElasticsearchCompletionIndices("es-1", "")]);
+    expect(first).toEqual(["fresh"]);
+    expect(second).toEqual(["fresh"]);
+    expect(elasticsearchListIndices).toHaveBeenCalledTimes(1);
+  });
 });

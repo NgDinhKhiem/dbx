@@ -105,7 +105,7 @@ impl RocketMqAdmin {
     /// Callers must probe NameServer reachability before invoking this so the
     /// connect-timeout wall covers only process spawn + handshake + connect.
     pub async fn new(cfg: MqAdminConfig, launch: AgentLaunchSpec) -> Result<Self, String> {
-        let mut client = AgentDriverClient::spawn(launch).await?;
+        let mut client = crate::agent_prewarm::spawn_agent_client(launch).await?;
 
         // Handshake / connect use Advanced connect timeout; ops RPC keep query timeout.
         let _: serde_json::Value =

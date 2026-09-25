@@ -59,6 +59,11 @@ export async function mqTestConnection(connectionId: string): Promise<MqClusterI
   return invoke("mq_test_connection", { connectionId });
 }
 
+/** Start the agent runtime (JVM) for an agent-backed MQ connection without connecting to the broker. */
+export async function mqPrewarmAgent(connectionId: string): Promise<boolean> {
+  return invoke("mq_prewarm_agent", { connectionId });
+}
+
 // Exchanges / Bindings (RabbitMQ)
 export async function mqListExchanges(connectionId: string, ns: NamespaceRef): Promise<MqExchangeInfo[]> {
   return invoke("mq_list_exchanges", { connectionId, ns });

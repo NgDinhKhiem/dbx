@@ -8310,6 +8310,8 @@ export default {
     savedSqlOpenTargetCurrentDescription: "Use the active tab’s connection, database, schema, and catalog when available; otherwise use the saved target.",
     prefillNewQueryWithSelect: "Prefill new query with SELECT *",
     prefillNewQueryWithSelectDescription: "When creating a new query, prefill the editor with SELECT * FROM <table> based on the active table tab or the table selected in the sidebar.",
+    prewarmDrivers: "Prewarm driver runtimes",
+    prewarmDriversDescription: "Start driver processes (such as the Kafka agent JVM) in the background shortly after launch and when hovering a connection, so the first connect is faster. Never connects to a database or broker.",
     generateSqlIncludeDatabaseName: "Include database name in generated SQL",
     generateSqlIncludeDatabaseNameDescription: "When supported by the database, generated table SQL uses the qualified name (database.schema.table on SQL Server) instead of only the table name.",
     generateSqlQuoteIdentifiers: "Quote identifiers in generated SQL",

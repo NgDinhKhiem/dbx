@@ -12,6 +12,11 @@ pub struct EasysearchClient {
 }
 
 impl EasysearchClient {
+    /// See [`EsClient::recently_verified`].
+    pub fn recently_verified(&self) -> bool {
+        self.inner.recently_verified()
+    }
+
     pub fn from_config(
         url: &str,
         username: Option<&str>,

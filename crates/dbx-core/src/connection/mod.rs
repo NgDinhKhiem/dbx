@@ -4324,6 +4324,10 @@ impl AppState {
                         }
                     }
                 }
+                // Stateless HTTP pools: a check within the probe TTL is trusted, so request
+                // bursts (sidebar, Discover, completion) do not each pay a `GET /` round trip.
+                PoolKind::Elasticsearch(client) if client.recently_verified() => false,
+                PoolKind::Easysearch(client) if client.recently_verified() => false,
                 PoolKind::Elasticsearch(client) => {
                     let mut client = client.clone();
                     let timeout = crate::db::connection_timeout();
@@ -7582,6 +7586,49 @@ mod tests {
         assert!(!uses_bare_mysql_pool(&DatabaseType::Databend));
         assert!(database_capabilities::is_agent_type(&DatabaseType::Databend));
         assert!(super::uses_agent_connection_pool(&DatabaseType::ZooKeeper));
+    }
+
+    #[tokio::test]
+    async fn recently_verified_elasticsearch_pool_is_reused_without_a_probe() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            // Serve exactly one `GET /`, then stop listening.
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = [0u8; 2048];
+            let _ = socket.read(&mut buf).await;
+            let body = r#"{"version":{"number":"8.15.0"}}"#;
+            let response =
+                format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+        let mut client = db::elasticsearch_driver::EsClient::new(
+            &format!("http://{address}"),
+            None,
+            None,
+            false,
+            Duration::from_secs(2),
+        );
+        db::elasticsearch_driver::test_connection(&mut client, Duration::from_secs(2)).await.expect("initial check");
+        server.await.expect("server task");
+
+        let (state, dir) = test_app_state().await;
+        state.connections.write().await.insert("es".to_string(), PoolKind::Elasticsearch(client));
+        // The server is gone: a probe would fail and drop the pool.
+        assert!(!state.remove_stale_connection_pool("es").await);
+        assert!(matches!(state.connections.read().await.get("es"), Some(PoolKind::Elasticsearch(_))));
+
+        let unverified = db::elasticsearch_driver::EsClient::new(
+            &format!("http://{address}"),
+            None,
+            None,
+            false,
+            Duration::from_millis(500),
+        );
+        state.connections.write().await.insert("es-cold".to_string(), PoolKind::Elasticsearch(unverified));
+        assert!(state.remove_stale_connection_pool("es-cold").await, "an unverified pool is still probed");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

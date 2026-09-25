@@ -236,6 +236,7 @@ fn comma_separated_env(name: &str) -> Vec<String> {
 fn add_mq_routes(router: Router<Arc<WebState>>) -> Router<Arc<WebState>> {
     router
         .route("/mq/test-connection", post(routes::mq::test_connection))
+        .route("/mq/prewarm-agent", post(routes::mq::prewarm_agent))
         .route("/mq/tenants/list", post(routes::mq::list_tenants))
         .route("/mq/tenants/get", post(routes::mq::get_tenant))
         .route("/mq/tenants/create", post(routes::mq::create_tenant))

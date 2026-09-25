@@ -740,6 +740,7 @@ export const hbaseDeleteTable = forward("hbaseDeleteTable");
 
 // Message Queue
 export const mqTestConnection = forward("mqTestConnection");
+export const mqPrewarmAgent = forward("mqPrewarmAgent");
 export const mqListTenants = forward("mqListTenants");
 export const mqGetTenant = forward("mqGetTenant");
 export const mqCreateTenant = forward("mqCreateTenant");

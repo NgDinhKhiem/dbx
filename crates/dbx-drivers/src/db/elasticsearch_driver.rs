@@ -6,9 +6,9 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{apply_tls_certificates, http_client_builder, with_connection_timeout};
 use crate::db::document_result::DocumentQueryResult;
@@ -42,6 +42,15 @@ const ELASTICSEARCH_REST_TABLE_MAX_CELLS: usize = 200_000;
 const ELASTICSEARCH_MAPPING_MAX_DEPTH: u8 = 32;
 const ELASTICSEARCH_MAPPING_MAX_COLUMNS: usize = 2_000;
 const ELASTICSEARCH_MAPPING_THREAD_STACK: usize = 16 * 1024 * 1024;
+/// A pooled client that passed a connectivity check this recently is reused
+/// without another `GET /` probe. The probe used to run before every request,
+/// doubling round trips (and costly behind TLS-inspecting proxies).
+pub const ELASTICSEARCH_HEALTH_PROBE_TTL: Duration = Duration::from_secs(30);
+/// Keep idle keep-alive connections longer than reqwest's 90 s default so a
+/// user reading results does not pay a new TCP/TLS handshake on the next query.
+const ELASTICSEARCH_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// TCP keepalive stops NATs/proxies from silently dropping idle pooled sockets.
+const ELASTICSEARCH_TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ElasticsearchTransportMode {
@@ -76,6 +85,8 @@ pub struct EsClient {
     /// OpenSearch 的 SQL 插件是否只有旧的 `/_opendistro/_sql` 路径（`/_plugins/_sql`
     /// 不存在时按连接记住，后续请求直接走旧路径）。
     opensearch_sql_uses_legacy_path: Arc<AtomicBool>,
+    /// Unix ms of the last successful connectivity check (0 = never). Shared by clones.
+    last_verified_at_ms: Arc<AtomicU64>,
 }
 
 /// Distribution and version reported by the cluster root endpoint (`GET /`).
@@ -150,7 +161,10 @@ impl EsClient {
             (Some(u), Some(p)) if !u.is_empty() => Some((u.to_string(), p.to_string())),
             _ => None,
         };
-        let mut builder = http_client_builder(timeout).danger_accept_invalid_certs(accept_invalid_certs);
+        let mut builder = http_client_builder(timeout)
+            .danger_accept_invalid_certs(accept_invalid_certs)
+            .pool_idle_timeout(ELASTICSEARCH_POOL_IDLE_TIMEOUT)
+            .tcp_keepalive(ELASTICSEARCH_TCP_KEEPALIVE);
         builder = apply_tls_certificates(builder, ca_cert_path, client_cert_path, client_key_path)?;
         if let Some(addrs) = elasticsearch_localhost_resolve_addrs(&base_url, connectivity_check_disabled) {
             builder = builder.resolve_to_addrs("localhost", &addrs);
@@ -171,6 +185,7 @@ impl EsClient {
             sql_endpoint_uses_put: Arc::new(AtomicBool::new(false)),
             cluster_info: Arc::new(tokio::sync::OnceCell::new()),
             opensearch_sql_uses_legacy_path: Arc::new(AtomicBool::new(false)),
+            last_verified_at_ms: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -293,6 +308,20 @@ impl EsClient {
         self.cluster_info.get()
     }
 
+    fn mark_verified(&self) {
+        self.last_verified_at_ms.store(unix_millis_now(), Ordering::Relaxed);
+    }
+
+    /// Whether a connectivity check succeeded within [`ELASTICSEARCH_HEALTH_PROBE_TTL`],
+    /// so pool reuse can skip another probe round trip.
+    pub fn recently_verified(&self) -> bool {
+        verification_is_fresh(
+            self.last_verified_at_ms.load(Ordering::Relaxed),
+            unix_millis_now(),
+            ELASTICSEARCH_HEALTH_PROBE_TTL,
+        )
+    }
+
     fn remember_cluster_info(&self, info: ElasticsearchClusterInfo) {
         // A concurrent probe may have stored the same answer first; either value is fine.
         let _ = self.cluster_info.set(info);
@@ -315,8 +344,18 @@ impl Clone for EsClient {
             sql_endpoint_uses_put: Arc::clone(&self.sql_endpoint_uses_put),
             cluster_info: Arc::clone(&self.cluster_info),
             opensearch_sql_uses_legacy_path: Arc::clone(&self.opensearch_sql_uses_legacy_path),
+            last_verified_at_ms: Arc::clone(&self.last_verified_at_ms),
         }
     }
+}
+
+fn unix_millis_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|elapsed| elapsed.as_millis() as u64).unwrap_or(0)
+}
+
+/// `last_ms == 0` means never verified; a clock that moved backwards forces a new probe.
+fn verification_is_fresh(last_ms: u64, now_ms: u64, ttl: Duration) -> bool {
+    last_ms != 0 && now_ms >= last_ms && now_ms - last_ms < ttl.as_millis() as u64
 }
 
 fn elasticsearch_kibana_base_path(external_config: Option<&Value>) -> Option<String> {
@@ -465,6 +504,7 @@ pub async fn test_connection(client: &mut EsClient, timeout: Duration) -> Result
                 }
             }
         }
+        client.mark_verified();
         return Ok(());
     }
 
@@ -700,6 +740,9 @@ fn index_aliases_from_pairs(pairs: impl Iterator<Item = (String, String)>) -> BT
 async fn list_raw_indices(client: &EsClient, include_aliases: bool) -> Result<ListedIndexNames, String> {
     // 主路径 `_cat/indices` 需要集群级 `monitor` 权限。仅有索引级权限的账号
     // （例如日志采集用户）会在这里拿到 401/403，此时降级到索引级元数据端点。
+    // `_alias` stays sequential on purpose: issuing it concurrently forces a second
+    // pooled connection (a new TCP/TLS handshake), which costs more than the saved
+    // round trip behind TLS-inspecting proxies.
     let resp = client
         .get("/_cat/indices?format=json&h=index")
         .send()
@@ -3680,10 +3723,46 @@ mod tests {
     use super::{
         build_count_documents_body, build_find_documents_body, elasticsearch_accept_invalid_certs,
         elasticsearch_base_url_fallbacks, elasticsearch_index_grouping, group_index_names, merge_index_entries,
-        normalize_index_names, redact_elasticsearch_url, ElasticsearchIndexEntry, EsClient, SearchResponse,
+        normalize_index_names, redact_elasticsearch_url, test_connection, verification_is_fresh,
+        ElasticsearchClusterInfo, ElasticsearchIndexEntry, EsClient, SearchResponse,
     };
     use serde_json::json;
     use std::time::Duration;
+
+    #[test]
+    fn verification_freshness_follows_the_probe_ttl() {
+        let ttl = Duration::from_secs(30);
+        assert!(!verification_is_fresh(0, 10_000, ttl), "never verified");
+        assert!(verification_is_fresh(10_000, 10_000, ttl));
+        assert!(verification_is_fresh(10_000, 39_999, ttl));
+        assert!(!verification_is_fresh(10_000, 40_000, ttl));
+        assert!(!verification_is_fresh(10_000, 9_000, ttl), "clock moved backwards");
+    }
+
+    #[tokio::test]
+    async fn successful_connectivity_check_marks_client_and_clones_verified() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = [0u8; 2048];
+            let _ = socket.read(&mut buf).await;
+            let body = r#"{"version":{"number":"1.3.19","distribution":"opensearch"}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+        let mut client = EsClient::new(&format!("http://{addr}"), None, None, false, Duration::from_secs(5));
+        let pooled = client.clone();
+        assert!(!pooled.recently_verified());
+        test_connection(&mut client, Duration::from_secs(5)).await.expect("connectivity check");
+        assert!(pooled.recently_verified(), "clones share the verification timestamp");
+        assert!(pooled.cached_cluster_info().is_some_and(ElasticsearchClusterInfo::is_opensearch));
+    }
 
     async fn read_http_request(socket: &mut tokio::net::TcpStream) -> String {
         use tokio::io::AsyncReadExt;

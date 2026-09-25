@@ -43,6 +43,7 @@ import {
 import OracleDatabaseLinksDialog from "@/components/objects/OracleDatabaseLinksDialog.vue";
 const showDatabaseLinks = ref(false);
 import { useConnectionStore } from "@/stores/connectionStore";
+import { requestDriverPrewarm } from "@/lib/connection/driverPrewarmRuntime";
 import { useQueryStore } from "@/stores/queryStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useToast } from "@/composables/useToast";
@@ -165,6 +166,8 @@ function scheduleLabelOverflowMeasure() {
 }
 
 function handleMouseEnter() {
+  // Hovering a connection signals intent: warm its driver runtime (no connect).
+  if (props.node.type === "connection") requestDriverPrewarm(props.node.connectionId);
   if (!shouldMeasureLabelOverflow()) {
     labelOverflowing.value = false;
     return;

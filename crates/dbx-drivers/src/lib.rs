@@ -11,6 +11,7 @@ pub mod agent_catalog;
 pub mod agent_connection;
 pub mod agent_manager;
 pub mod agent_offline_export;
+pub mod agent_prewarm;
 pub mod agent_recovery;
 pub mod agent_registry_signature;
 pub mod agent_runtime;

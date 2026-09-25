@@ -21,6 +21,7 @@ pub use dbx_drivers::agent_catalog;
 pub use dbx_drivers::agent_connection;
 pub use dbx_drivers::agent_manager;
 pub use dbx_drivers::agent_offline_export;
+pub use dbx_drivers::agent_prewarm;
 pub use dbx_drivers::agent_recovery;
 pub use dbx_drivers::agent_runtime;
 pub use dbx_drivers::agent_service;

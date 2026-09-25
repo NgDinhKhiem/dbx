@@ -61,7 +61,7 @@ pub struct RabbitMqAdmin {
 impl RabbitMqAdmin {
     /// Spawn the RabbitMQ native agent, perform handshake, and connect.
     pub async fn new(cfg: MqAdminConfig, launch: AgentLaunchSpec) -> Result<Self, String> {
-        let mut client = AgentDriverClient::spawn(launch).await?;
+        let mut client = crate::agent_prewarm::spawn_agent_client(launch).await?;
 
         // Handshake
         let _: serde_json::Value =

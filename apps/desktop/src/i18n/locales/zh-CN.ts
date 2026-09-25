@@ -8279,6 +8279,8 @@ export default withEnglishFallback({
     savedSqlOpenTargetCurrentDescription: "优先使用当前标签页的连接、数据库、Schema 和 Catalog；不可用时回退到保存时的目标。",
     prefillNewQueryWithSelect: "新建查询时预填充 SELECT 语句",
     prefillNewQueryWithSelectDescription: "新建查询时，根据当前激活的数据表标签页或侧边栏选中的表，自动在编辑器中填充 SELECT * FROM <表名>。",
+    prewarmDrivers: "预热驱动运行时",
+    prewarmDriversDescription: "启动后稍候及鼠标悬停连接时，在后台预先启动驱动进程（如 Kafka Agent JVM），加快首次连接。不会自动连接任何数据库或消息服务。",
     generateSqlIncludeDatabaseName: "生成 SQL 时包含数据库名",
     generateSqlIncludeDatabaseNameDescription: "数据库支持时，生成的表 SQL 将使用限定名（SQL Server 为“数据库名.schema.表名”），而不只包含表名。",
     generateSqlQuoteIdentifiers: "生成 SQL 时为标识符添加引号",

@@ -1,4 +1,4 @@
-import { elasticsearchRawRequest } from "@/lib/backend/api";
+import { elasticsearchClusterInfo, elasticsearchRawRequest } from "@/lib/backend/api";
 import type { ClusterDistribution } from "./types";
 
 export type DiscoverHttpMethod = "GET" | "POST" | "PUT" | "DELETE" | "HEAD" | "PATCH";
@@ -24,8 +24,18 @@ export function isSuccessStatus(status: number): boolean {
   return status >= 200 && status < 300;
 }
 
-/** Detect OpenSearch vs Elasticsearch from `GET /` (`version.distribution`). */
+/**
+ * Detect OpenSearch vs Elasticsearch. The backend caches the distribution learned
+ * by the connect-time `GET /` check, so this normally costs no cluster round trip;
+ * a raw `GET /` is only the fallback (older backends, restricted accounts).
+ */
 export async function detectDistribution(connectionId: string): Promise<ClusterDistribution> {
+  try {
+    const info = await elasticsearchClusterInfo(connectionId);
+    if (info?.distribution) return info.distribution.toLowerCase() === "opensearch" ? "opensearch" : "elasticsearch";
+  } catch {
+    // Fall back to reading the cluster root directly.
+  }
   try {
     const response = await discoverRequest(connectionId, { method: "GET", path: "/" });
     if (!isSuccessStatus(response.status)) return "elasticsearch";
