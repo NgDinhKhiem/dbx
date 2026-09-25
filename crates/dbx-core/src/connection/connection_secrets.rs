@@ -917,7 +917,7 @@ fn external_object<'a>(
     config.external_config.as_ref()?.get(key)?.as_object()
 }
 
-fn external_kind<'a>(object: &'a serde_json::Map<String, serde_json::Value>) -> Option<&'a str> {
+fn external_kind(object: &serde_json::Map<String, serde_json::Value>) -> Option<&str> {
     object.get("kind").and_then(serde_json::Value::as_str)
 }
 
@@ -984,11 +984,9 @@ fn connection_secret_slots(config: &ConnectionConfig) -> Vec<SecretSlot> {
                 slots.push(external_slot("rnacosConsoleAuth", "password"));
             }
         }
-        DatabaseType::Cassandra => {
-            if external_object(config, "tls").is_some() {
-                slots.push(external_slot("tls", "truststore_password"));
-                slots.push(external_slot("tls", "keystore_password"));
-            }
+        DatabaseType::Cassandra if external_object(config, "tls").is_some() => {
+            slots.push(external_slot("tls", "truststore_password"));
+            slots.push(external_slot("tls", "keystore_password"));
         }
         _ => {}
     }

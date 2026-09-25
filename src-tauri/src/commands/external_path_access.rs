@@ -568,11 +568,12 @@ pub async fn request_external_path_access(app: AppHandle, paths: Vec<String>, di
     if !confirm_access(&app, &normalized, directory, AccessKind::Read, None).await {
         return Ok(false);
     }
-    let granted = normalized
+    // Grant every path (no short-circuit), then report whether all succeeded.
+    let results: Vec<bool> = normalized
         .iter()
         .map(|path| if directory { access.grant_directory(path) } else { access.grant_file(path) })
-        .fold(true, |all, granted| all && granted);
-    Ok(granted)
+        .collect();
+    Ok(results.into_iter().all(|granted| granted))
 }
 
 /// Native file picker whose selection is granted to the external file commands.

@@ -158,10 +158,8 @@ fn is_backslash_escaped_sql_string_literal(value: &str) -> bool {
                     return false;
                 }
             }
-            '\'' => {
-                if chars.next() != Some('\'') {
-                    return false;
-                }
+            '\'' if chars.next() != Some('\'') => {
+                return false;
             }
             _ => {}
         }

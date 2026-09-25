@@ -402,7 +402,7 @@ mod tests {
         assert!(encrypt_connection_export("{}", "short-pass").unwrap_err().starts_with("passphrase_too_short"));
         let payload = encrypt_connection_export("{}", "a sufficiently long passphrase").unwrap();
         assert_eq!(payload["kdf"]["memoryKib"], Argon2Params::for_new_data().memory_kib);
-        assert!(Argon2Params::STRONG.memory_kib >= 64 * 1024 && Argon2Params::STRONG.iterations >= 3);
+        const _: () = assert!(Argon2Params::STRONG.memory_kib >= 64 * 1024 && Argon2Params::STRONG.iterations >= 3);
         assert!(Argon2Params::STRONG.validate().is_ok());
     }
 

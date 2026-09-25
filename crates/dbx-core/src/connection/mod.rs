@@ -6632,6 +6632,8 @@ async fn close_pool_kind(pool: PoolKind) -> Result<(), String> {
     Ok(())
 }
 
+// The pool is handed back on failure so the caller can keep using it.
+#[allow(clippy::result_large_err)]
 async fn close_reclaimed_agent_pool(pool: PoolKind) -> Result<(), (PoolKind, String)> {
     let client = match pool {
         PoolKind::Agent(client) => client,

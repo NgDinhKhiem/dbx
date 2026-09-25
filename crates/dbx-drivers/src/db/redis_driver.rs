@@ -4380,7 +4380,7 @@ where
     }
 
     let mut items = Vec::with_capacity(entries.len() / 2);
-    for pair in entries.chunks_exact(2) {
+    for pair in entries.as_chunks::<2>().0 {
         let member = redis_value_to_bytes(pair[0].clone())
             .map(|bytes| redis_blob_from_bytes(&bytes))
             .ok_or_else(|| "Invalid ZRANGE member payload".to_string())?;

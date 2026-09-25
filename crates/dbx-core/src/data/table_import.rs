@@ -10258,7 +10258,7 @@ mod tests {
             let batches = postgres_import_batches(vec![vec![serde_json::json!("1,234.56")]], &[("amount", data_type)]);
             assert_eq!(
                 batches[0].sql,
-                format!("INSERT INTO \"issue_6491\" (\"amount\") VALUES\n('1,234.56')"),
+                "INSERT INTO \"issue_6491\" (\"amount\") VALUES\n('1,234.56')".to_string(),
                 "{data_type}"
             );
         }

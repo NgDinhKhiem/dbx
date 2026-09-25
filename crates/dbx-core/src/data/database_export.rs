@@ -1087,7 +1087,7 @@ fn decode_mysql_spatial_export_wkb(hex: &str) -> Option<Vec<u8>> {
         }
     }
 
-    hex.as_bytes().chunks_exact(2).map(|pair| Some((nibble(pair[0])? << 4) | nibble(pair[1])?)).collect()
+    hex.as_bytes().as_chunks::<2>().0.iter().map(|pair| Some((nibble(pair[0])? << 4) | nibble(pair[1])?)).collect()
 }
 
 fn format_mysql_binary_export_literal(value: &Value) -> Option<String> {

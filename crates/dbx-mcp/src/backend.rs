@@ -712,8 +712,7 @@ impl LocalBackend {
                      tools via the DBX_SECRET_KEY_FILE / DBX_SECRET_KEY environment variables. Otherwise open \
                      DBX Desktop or Web to complete the data security upgrade first.",
                     migration.error_code.as_deref().unwrap_or("KEY_PROVIDER_UNAVAILABLE")
-                )
-                .into());
+                ));
             }
             return Err("DATA_MIGRATION_REQUIRED: open DBX Desktop or Web to complete the data security upgrade".into());
         }

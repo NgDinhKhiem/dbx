@@ -210,10 +210,8 @@ pub(crate) fn mysql_literal_is_single_token(sql: &str, backslash_escapes: bool) 
                     return false;
                 }
             }
-            '\'' => {
-                if chars.next() != Some('\'') {
-                    return false;
-                }
+            '\'' if chars.next() != Some('\'') => {
+                return false;
             }
             _ => {}
         }

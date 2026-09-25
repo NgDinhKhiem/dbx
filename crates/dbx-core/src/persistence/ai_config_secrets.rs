@@ -409,7 +409,7 @@ mod tests {
             is_default: true,
             config: config("sk-secret"),
         };
-        storage.save_ai_configs(&[item.clone()]).await.unwrap();
+        storage.save_ai_configs(std::slice::from_ref(&item)).await.unwrap();
 
         let redacted = redact_ai_config_item_for_client(&storage.load_ai_configs().await.unwrap()[0]).unwrap();
         assert!(!redacted.to_string().contains("sk-secret"));
