@@ -7,20 +7,25 @@ on:
         description: "Version to submit (e.g. 0.5.3)"
         required: true
 
+# Least privilege: read-only by default; jobs that write request it explicitly.
+permissions:
+  contents: read
+
 jobs:
   submit:
     runs-on: ubuntu-latest
     env:
       REPO_OWNER: t8y2
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Submit to 1Panel App Store
         env:
           TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
           GH_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
-          VERSION="${{ github.event.inputs.version }}"
+          VERSION="${INPUT_VERSION}"
 
           git clone --depth 1 -b localApps \
             "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/${REPO_OWNER}/appstore-1panel.git" \
@@ -30,12 +35,12 @@ jobs:
           APP_DIR="apps/dbx"
           mkdir -p "${APP_DIR}/latest"
 
-          cp "${{ github.workspace }}/deploy/1panel/data.yml" "${APP_DIR}/data.yml"
-          cp "${{ github.workspace }}/deploy/1panel/README.md" "${APP_DIR}/README.md"
-          if [ -f "${{ github.workspace }}/deploy/1panel/logo.png" ]; then
-            cp "${{ github.workspace }}/deploy/1panel/logo.png" "${APP_DIR}/logo.png"
+          cp "${GITHUB_WORKSPACE}/deploy/1panel/data.yml" "${APP_DIR}/data.yml"
+          cp "${GITHUB_WORKSPACE}/deploy/1panel/README.md" "${APP_DIR}/README.md"
+          if [ -f "${GITHUB_WORKSPACE}/deploy/1panel/logo.png" ]; then
+            cp "${GITHUB_WORKSPACE}/deploy/1panel/logo.png" "${APP_DIR}/logo.png"
           fi
-          cp -r "${{ github.workspace }}/deploy/1panel/latest/." "${APP_DIR}/latest/"
+          cp -r "${GITHUB_WORKSPACE}/deploy/1panel/latest/." "${APP_DIR}/latest/"
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"

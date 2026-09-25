@@ -6,7 +6,7 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CNB_REPOSITORY: "dbxio.com/dbx"
@@ -15,6 +15,8 @@ env:
 
 jobs:
   release-ready:
+    permissions:
+      contents: write
     name: Verify draft release
     runs-on: ubuntu-latest
     steps:
@@ -43,7 +45,7 @@ jobs:
     runs-on: ubuntu-22.04
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
@@ -59,7 +61,7 @@ jobs:
       new_version: ${{ steps.bump.outputs.new_version }}
       prev_tag: ${{ steps.prev-tag.outputs.prev_tag }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
           token: ${{ secrets.MCP_RELEASE_TOKEN }}
@@ -78,14 +80,18 @@ jobs:
       - name: Detect JDBC plugin changes and bump version
         id: bump
         shell: bash
+        env:
+          STEP_PREV_TAG_PREV_TAG: ${{ steps.prev-tag.outputs.prev_tag }}
         run: |
-          BUMP_OUTPUT="$(node .github/scripts/bump-jdbc-plugin-version.mjs "${{ steps.prev-tag.outputs.prev_tag }}" HEAD --write)"
+          BUMP_OUTPUT="$(node .github/scripts/bump-jdbc-plugin-version.mjs "${STEP_PREV_TAG_PREV_TAG}" HEAD --write)"
           echo "$BUMP_OUTPUT"
           echo "$BUMP_OUTPUT" >> "$GITHUB_OUTPUT"
 
       - name: Commit JDBC plugin version bump
         if: steps.bump.outputs.changed == 'true'
         shell: bash
+        env:
+          STEP_BUMP_NEW_VERSION: ${{ steps.bump.outputs.new_version }}
         run: |
           TMP_DIR="$(mktemp -d)"
           cp plugins/jdbc/build.gradle "$TMP_DIR/build.gradle"
@@ -100,7 +106,7 @@ jobs:
           cp "$TMP_DIR/manifest.json" plugins/jdbc/manifest.json
           git add plugins/jdbc/build.gradle plugins/jdbc/manifest.json
           if git diff --cached --quiet; then
-            echo "JDBC plugin version ${{ steps.bump.outputs.new_version }} is already on main."
+            echo "JDBC plugin version ${STEP_BUMP_NEW_VERSION} is already on main."
             exit 0
           fi
           git commit -m "chore(jdbc): bump plugin version [skip ci]"
@@ -117,6 +123,8 @@ jobs:
           done
 
   build:
+    permissions:
+      contents: write
     # Explicit name keeps matrix-only fields such as asset_pattern from being
     # appended to the generated job display name.
     name: build (${{ matrix.platform }}, ${{ matrix.target }})
@@ -147,22 +155,23 @@ jobs:
       # Keep releases working until the shared S3 secrets are configured.
       SCCACHE_GHA_ENABLED: ${{ secrets.SCCACHE_S3_BUCKET == '' && 'true' || 'false' }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
 
       - name: Install frontend dependencies
         run: pnpm install
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.97.1
+        uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
         with:
+          toolchain: 1.97.1
           targets: ${{ matrix.target }}
 
       - name: Setup sccache
@@ -223,7 +232,7 @@ jobs:
           }
 
       - name: Rust cache
-        uses: swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: "./ -> target"
           shared-key: release-${{ matrix.target }}-${{ steps.deps-hash.outputs.hash }}
@@ -256,20 +265,27 @@ jobs:
           # instead of loading potentially incompatible modules from the host.
           sudo apt-get install -y fcitx5-frontend-gtk3 ibus-gtk3 libwebkit2gtk-4.1-dev libgtk-3-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev xdg-utils
 
+      # The updater key is written to a private file and handed only to the steps
+      # that sign (via step-level env), never exported through $GITHUB_ENV.
+      # Tauri's build/bundle accept TAURI_SIGNING_PRIVATE_KEY as a path; the file
+      # holds the same normalized base64 value that used to be exported.
       - name: Setup Tauri signing key
         shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY_BASE64: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_BASE64 }}
         run: |
-          echo "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_BASE64 }}" | base64 --decode > "$RUNNER_TEMP/updater.key"
-          KEY_B64=$(base64 < "$RUNNER_TEMP/updater.key" | tr -d '\r\n')
-          echo "TAURI_SIGNING_PRIVATE_KEY=$KEY_B64" >> "$GITHUB_ENV"
-          if [ -n "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}" ]; then
-            echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}" >> "$GITHUB_ENV"
-          fi
+          set -euo pipefail
+          umask 077
+          printf '%s\n' "${TAURI_SIGNING_PRIVATE_KEY_BASE64}" | base64 --decode > "$RUNNER_TEMP/updater.key.raw"
+          base64 < "$RUNNER_TEMP/updater.key.raw" | tr -d '\r\n' > "$RUNNER_TEMP/updater.key"
+          rm -f "$RUNNER_TEMP/updater.key.raw"
 
       - name: Build Tauri app
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ runner.temp }}/updater.key
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ startsWith(matrix.platform, 'macos') && secrets.APPLE_SIGNING_IDENTITY || '' }}
           APPLE_ID: ${{ startsWith(matrix.platform, 'macos') && secrets.APPLE_ID || '' }}
           APPLE_PASSWORD: ${{ startsWith(matrix.platform, 'macos') && secrets.APPLE_PASSWORD || '' }}
@@ -292,7 +308,15 @@ jobs:
         shell: bash
         run: ${SCCACHE_PATH} --show-stats
 
+      - name: Remove Tauri signing key
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/updater.key" "$RUNNER_TEMP/updater.key.raw"
+
   build-windows:
+    permissions:
+      contents: write
     needs: release-ready
     environment: release-signing
     strategy:
@@ -313,22 +337,23 @@ jobs:
       VSIGN_SERVER: ${{ vars.VSIGN_SERVER }}
       VSIGN_TOOL_SHA256: ${{ vars.VSIGN_TOOL_SHA256 }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
 
       - name: Install frontend dependencies
         run: pnpm install
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.97.1
+        uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
         with:
+          toolchain: 1.97.1
           targets: ${{ matrix.target }}
 
       - name: Setup sccache
@@ -389,7 +414,7 @@ jobs:
           }
 
       - name: Rust cache
-        uses: swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: "./ -> target"
           shared-key: release-${{ matrix.target }}-${{ steps.deps-hash.outputs.hash }}
@@ -397,15 +422,20 @@ jobs:
           cache-targets: false
           cache-on-failure: true
 
+      # The updater key is written to a private file and handed only to the steps
+      # that sign (via step-level env), never exported through $GITHUB_ENV.
+      # Tauri's build/bundle accept TAURI_SIGNING_PRIVATE_KEY as a path; the file
+      # holds the same normalized base64 value that used to be exported.
       - name: Setup Tauri signing key
         shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY_BASE64: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_BASE64 }}
         run: |
-          echo "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_BASE64 }}" | base64 --decode > "$RUNNER_TEMP/updater.key"
-          KEY_B64=$(base64 < "$RUNNER_TEMP/updater.key" | tr -d '\r\n')
-          echo "TAURI_SIGNING_PRIVATE_KEY=$KEY_B64" >> "$GITHUB_ENV"
-          if [ -n "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}" ]; then
-            echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}" >> "$GITHUB_ENV"
-          fi
+          set -euo pipefail
+          umask 077
+          printf '%s\n' "${TAURI_SIGNING_PRIVATE_KEY_BASE64}" | base64 --decode > "$RUNNER_TEMP/updater.key.raw"
+          base64 < "$RUNNER_TEMP/updater.key.raw" | tr -d '\r\n' > "$RUNNER_TEMP/updater.key"
+          rm -f "$RUNNER_TEMP/updater.key.raw"
 
       - name: Setup TrustAsia VSign
         shell: pwsh
@@ -415,9 +445,11 @@ jobs:
         run: ./.github/scripts/setup-vsign.ps1
 
       - name: Build and sign Tauri app
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ runner.temp }}/updater.key
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           SSIGNCODE_OPERATOR_PWD: ${{ secrets.VSIGN_OPERATOR_PWD }}
           VSIGN_KEY_PIN: ${{ secrets.VSIGN_KEY_PIN }}
         with:
@@ -452,6 +484,9 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # tauri bundle creates signed updater artifacts for this installer too.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ runner.temp }}/updater.key
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           SSIGNCODE_OPERATOR_PWD: ${{ secrets.VSIGN_OPERATOR_PWD }}
           VSIGN_KEY_PIN: ${{ secrets.VSIGN_KEY_PIN }}
         run: |
@@ -487,6 +522,9 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # `tauri signer sign` reads a key file from *_PATH (not from TAURI_SIGNING_PRIVATE_KEY).
+          TAURI_SIGNING_PRIVATE_KEY_PATH: ${{ runner.temp }}/updater.key
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           SSIGNCODE_OPERATOR_PWD: ${{ secrets.VSIGN_OPERATOR_PWD }}
           VSIGN_KEY_PIN: ${{ secrets.VSIGN_KEY_PIN }}
         run: |
@@ -560,7 +598,15 @@ jobs:
             Remove-Item -LiteralPath $workDir -Recurse -Force
           }
 
+      - name: Remove Tauri signing key
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/updater.key" "$RUNNER_TEMP/updater.key.raw"
+
   build-windows-7-offline:
+    permissions:
+      contents: write
     needs: release-ready
     runs-on: windows-2022
     environment: release-signing
@@ -577,21 +623,21 @@ jobs:
       VSIGN_SERVER: ${{ vars.VSIGN_SERVER }}
       VSIGN_TOOL_SHA256: ${{ vars.VSIGN_TOOL_SHA256 }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
 
       - name: Install frontend dependencies
         run: pnpm install
 
       - name: Setup Rust for Windows 7
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly
         with:
           toolchain: nightly-2026-07-22
           components: rust-src
@@ -613,7 +659,7 @@ jobs:
         run: ./.github/scripts/assert-webview2-win7-runtime.ps1
 
       - name: Rust cache
-        uses: swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: "./ -> target"
           shared-key: release-x86_64-win7-windows-msvc
@@ -704,6 +750,8 @@ jobs:
           }
 
   static-browser:
+    permissions:
+      contents: write
     # Fully static musl builds of the browser (dbx-web) variant. No glibc
     # dependency, so the tarball runs on any Linux distribution (verified in
     # the oldest pullable Ubuntu container for each arch).
@@ -728,22 +776,23 @@ jobs:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: ${{ secrets.SCCACHE_S3_BUCKET == '' && 'true' || 'false' }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
 
       - name: Install frontend dependencies
         run: pnpm install
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.97.1
+        uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
         with:
+          toolchain: 1.97.1
           targets: ${{ matrix.target }}
 
       - name: Install cargo-zigbuild
@@ -785,7 +834,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Rust cache
-        uses: swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: "./ -> target"
           shared-key: static-browser-${{ matrix.target }}
@@ -850,6 +899,8 @@ jobs:
         run: ${SCCACHE_PATH} --show-stats
 
   cleanup-release-signatures:
+    permissions:
+      contents: write
     needs: [build, build-windows, build-windows-7-offline]
     runs-on: ubuntu-latest
     steps:
@@ -878,15 +929,17 @@ jobs:
           done
 
   jdbc-plugin:
+    permissions:
+      contents: write
     needs: [cleanup-release-signatures, bump-jdbc-plugin-version]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
 
       - name: Setup Java
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
         with:
           distribution: temurin
           java-version: "21"
@@ -894,7 +947,9 @@ jobs:
 
       - name: Apply automatic JDBC plugin version bump
         shell: bash
-        run: node .github/scripts/bump-jdbc-plugin-version.mjs "${{ needs.bump-jdbc-plugin-version.outputs.prev_tag }}" HEAD --write
+        env:
+          NEEDS_BUMP_JDBC_PLUGIN_VERSION_PREV_TAG: ${{ needs.bump-jdbc-plugin-version.outputs.prev_tag }}
+        run: node .github/scripts/bump-jdbc-plugin-version.mjs "${NEEDS_BUMP_JDBC_PLUGIN_VERSION_PREV_TAG}" HEAD --write
 
       - name: Read JDBC plugin version
         id: jdbc-plugin
@@ -909,9 +964,10 @@ jobs:
       - name: Upload JDBC plugin asset
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STEP_JDBC_PLUGIN_VERSION: ${{ steps.jdbc-plugin.outputs.version }}
         run: |
           gh release upload "${GITHUB_REF_NAME}" \
-            "plugins/jdbc/dist/dbx-jdbc-plugin-${{ steps.jdbc-plugin.outputs.version }}.zip" \
+            "plugins/jdbc/dist/dbx-jdbc-plugin-${STEP_JDBC_PLUGIN_VERSION}.zip" \
             "plugins/jdbc/dist/dbx-jdbc-plugin-latest.zip" \
             --repo "${GITHUB_REPOSITORY}" \
             --clobber
@@ -919,6 +975,7 @@ jobs:
       - name: Add JDBC plugin metadata to latest.json
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STEP_JDBC_PLUGIN_VERSION: ${{ steps.jdbc-plugin.outputs.version }}
         shell: bash
         run: |
           mkdir -p "$RUNNER_TEMP/latest-json"
@@ -928,7 +985,7 @@ jobs:
             --dir "$RUNNER_TEMP/latest-json"
           node .github/scripts/augment-latest-json-jdbc-plugin.mjs \
             "$RUNNER_TEMP/latest-json/latest.json" \
-            "${{ steps.jdbc-plugin.outputs.version }}" \
+            "${STEP_JDBC_PLUGIN_VERSION}" \
             "1" \
             "https://github.com/t8y2/dbx/releases/latest/download/dbx-jdbc-plugin-latest.zip"
           gh release upload "${GITHUB_REF_NAME}" \
@@ -937,6 +994,8 @@ jobs:
             --clobber
 
   publish:
+    permissions:
+      contents: write
     # Keep the release as a draft until every release-blocking platform job passes.
     # Nix packaging is advisory and runs independently from publication.
     needs: [cleanup-release-signatures, docker-manifest, jdbc-plugin, static-browser]
@@ -945,7 +1004,7 @@ jobs:
       - name: Publish draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release edit ${{ github.ref_name }} --repo ${{ github.repository }} --draft=false --prerelease
+        run: gh release edit ${GITHUB_REF_NAME} --repo ${GITHUB_REPOSITORY} --draft=false --prerelease
 
   sync-release-to-cnb:
     name: Sync release to CNB
@@ -953,7 +1012,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Download GitHub release assets
         env:
@@ -1001,7 +1060,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Send release card to Feishu
         continue-on-error: true
@@ -1010,7 +1069,7 @@ jobs:
           FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
           FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
           FEISHU_CHAT_ID: ${{ secrets.FEISHU_CHAT_ID }}
-        run: python3 scripts/notify_feishu.py "${{ github.ref_name }}"
+        run: python3 scripts/notify_feishu.py "${GITHUB_REF_NAME}"
 
   docker:
     runs-on: ubuntu-latest
@@ -1019,22 +1078,22 @@ jobs:
       matrix:
         platform: [linux/amd64, linux/arm64]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Login to Docker Hub
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Login to CNB Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ${{ env.CNB_REGISTRY }}
           username: cnb
@@ -1042,7 +1101,7 @@ jobs:
 
       - name: Build and push Docker Hub by digest
         id: build-dockerhub
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: deploy/Dockerfile
@@ -1053,7 +1112,7 @@ jobs:
 
       - name: Build and push CNB by digest
         id: build-cnb
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: deploy/Dockerfile
@@ -1065,15 +1124,18 @@ jobs:
           provenance: false
 
       - name: Export digests
+        env:
+          STEP_BUILD_DOCKERHUB_DIGEST: ${{ steps.build-dockerhub.outputs.digest }}
+          STEP_BUILD_CNB_DIGEST: ${{ steps.build-cnb.outputs.digest }}
         run: |
           mkdir -p /tmp/digests/dockerhub /tmp/digests/cnb
-          dockerhub_digest="${{ steps.build-dockerhub.outputs.digest }}"
-          cnb_digest="${{ steps.build-cnb.outputs.digest }}"
+          dockerhub_digest="${STEP_BUILD_DOCKERHUB_DIGEST}"
+          cnb_digest="${STEP_BUILD_CNB_DIGEST}"
           touch "/tmp/digests/dockerhub/${dockerhub_digest#sha256:}"
           touch "/tmp/digests/cnb/${cnb_digest#sha256:}"
 
       - name: Upload Docker Hub digest
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dockerhub-digests-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
           path: /tmp/digests/dockerhub/*
@@ -1081,7 +1143,7 @@ jobs:
           retention-days: 1
 
       - name: Upload CNB digest
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: cnb-digests-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
           path: /tmp/digests/cnb/*
@@ -1093,30 +1155,30 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download Docker Hub digests
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: /tmp/digests/dockerhub
           pattern: dockerhub-digests-*
           merge-multiple: true
 
       - name: Download CNB digests
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: /tmp/digests/cnb
           pattern: cnb-digests-*
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Login to Docker Hub
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Login to CNB Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ${{ env.CNB_REGISTRY }}
           username: cnb
@@ -1127,13 +1189,16 @@ jobs:
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
       - name: Create manifest list and push
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          STEP_VERSION_VERSION: ${{ steps.version.outputs.version }}
         run: |
           docker buildx imagetools create \
-            -t ${{ secrets.DOCKERHUB_USERNAME }}/dbx:${{ steps.version.outputs.version }} \
-            -t ${{ secrets.DOCKERHUB_USERNAME }}/dbx:latest \
-            $(cd /tmp/digests/dockerhub && printf '${{ secrets.DOCKERHUB_USERNAME }}/dbx@sha256:%s ' *)
+            -t "${DOCKERHUB_USERNAME}"/dbx:${STEP_VERSION_VERSION} \
+            -t "${DOCKERHUB_USERNAME}"/dbx:latest \
+            $(cd /tmp/digests/dockerhub && printf "${DOCKERHUB_USERNAME}/dbx@sha256:%s " *)
 
           docker buildx imagetools create \
-            -t ${{ env.CNB_REGISTRY }}/${{ env.CNB_REPOSITORY }}:${{ steps.version.outputs.version }} \
-            -t ${{ env.CNB_REGISTRY }}/${{ env.CNB_REPOSITORY }}:latest \
-            $(cd /tmp/digests/cnb && printf '${{ env.CNB_REGISTRY }}/${{ env.CNB_REPOSITORY }}@sha256:%s ' *)
+            -t ${CNB_REGISTRY}/${CNB_REPOSITORY}:${STEP_VERSION_VERSION} \
+            -t ${CNB_REGISTRY}/${CNB_REPOSITORY}:latest \
+            $(cd /tmp/digests/cnb && printf "${CNB_REGISTRY}/${CNB_REPOSITORY}@sha256:%s " *)

@@ -13,6 +13,11 @@ concurrency:
 env:
   RUSTFLAGS: -C debuginfo=line-tables-only
 
+# Least privilege. dorny/paths-filter lists PR files through the API.
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
   frontend-checks:
     needs: changes
@@ -22,15 +27,15 @@ jobs:
       # The workspace intentionally contains platform-specific CLI/MCP packages for every release target.
       NPM_CONFIG_LOGLEVEL: error
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
           version: 10.27.0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22.13.0
           cache: pnpm
@@ -69,15 +74,15 @@ jobs:
     env:
       NPM_CONFIG_LOGLEVEL: error
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
           version: 10.27.0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22.13.0
           cache: pnpm
@@ -100,15 +105,15 @@ jobs:
         shard: [1, 2]
     name: frontend-test (${{ matrix.shard }}/2)
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
           version: 10.27.0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22.13.0
           cache: pnpm
@@ -135,9 +140,9 @@ jobs:
     if: always()
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22.13.0
       - name: Check selected frontend jobs
@@ -150,10 +155,10 @@ jobs:
     if: needs.changes.outputs.github_scripts == 'true'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22.13.0
 
@@ -173,15 +178,15 @@ jobs:
       # (see rust-fmt-clippy) and lean on the rust-cache restore from main.
       RUSTC_WRAPPER: ${{ secrets.SCCACHE_S3_BUCKET != '' && 'sccache' || '' }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
           version: 10.27.0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22.13.0
           cache: pnpm
@@ -206,7 +211,9 @@ jobs:
         run: npm ci --prefix plugins/sdk/dev-host
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.97.1
+        uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+        with:
+          toolchain: 1.97.1
 
       - name: Install nextest
         uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.68.13
@@ -247,7 +254,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Rust cache
-        uses: swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: "./ -> target"
           shared-key: ci-packages-x86_64-unknown-linux-gnu
@@ -285,10 +292,12 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
       SCCACHE_GHA_VERSION: windows-standard-v1
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Rust for standard Windows
-        uses: dtolnay/rust-toolchain@1.97.1
+        uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+        with:
+          toolchain: 1.97.1
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
@@ -320,15 +329,15 @@ jobs:
       # prebuilt AWS-LC cache key must move together.
       WIN7_NIGHTLY_TOOLCHAIN: nightly-2026-07-22
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
           version: 10.27.0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22.13.0
           cache: pnpm
@@ -337,7 +346,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Setup Rust for Windows 7
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly
         with:
           toolchain: ${{ env.WIN7_NIGHTLY_TOOLCHAIN }}
           components: rust-src
@@ -348,7 +357,7 @@ jobs:
 
       - name: Restore prebuilt Win7 AWS-LC
         id: aws-lc-cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ${{ runner.temp }}/win7-aws-lc-install
           # Key covers the workspace Cargo.lock too: a main-workspace aws-lc-sys
@@ -425,6 +434,8 @@ jobs:
 
       - name: Configure prebuilt Win7 AWS-LC
         shell: pwsh
+        env:
+          STEP_AWS_LC_CACHE_CACHE_HIT: ${{ steps.aws-lc-cache.outputs.cache-hit }}
         run: |
           $installRoot = Join-Path $env:RUNNER_TEMP "win7-aws-lc-install"
           $requiredFiles = @(
@@ -442,11 +453,11 @@ jobs:
           "AWS_LC_SYS_SYSTEM_DIR=$installRoot" >> $env:GITHUB_ENV
           "AWS_LC_SYS_USE_SYSTEM=1" >> $env:GITHUB_ENV
           "AWS_LC_SYS_STATIC=1" >> $env:GITHUB_ENV
-          "AWS-LC cache hit: ${{ steps.aws-lc-cache.outputs.cache-hit }}" >> $env:GITHUB_STEP_SUMMARY
+          "AWS-LC cache hit: $env:STEP_AWS_LC_CACHE_CACHE_HIT" >> $env:GITHUB_STEP_SUMMARY
 
       - name: Restore prebuilt Win7 OpenSSL
         id: openssl-cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ${{ runner.temp }}/win7-openssl-install
           key: win7-openssl-v1-${{ runner.os }}-${{ env.WIN7_NIGHTLY_TOOLCHAIN }}-${{ hashFiles('Cargo.lock', '.github/fixtures/win7-openssl-cache/Cargo.lock') }}
@@ -481,6 +492,8 @@ jobs:
 
       - name: Configure prebuilt Win7 OpenSSL
         shell: pwsh
+        env:
+          STEP_OPENSSL_CACHE_CACHE_HIT: ${{ steps.openssl-cache.outputs.cache-hit }}
         run: |
           $installRoot = Join-Path $env:RUNNER_TEMP "win7-openssl-install"
           if (!(Test-Path (Join-Path $installRoot "include/openssl/ssl.h"))) {
@@ -498,7 +511,7 @@ jobs:
           "OPENSSL_DIR=$installRoot" >> $env:GITHUB_ENV
           "OPENSSL_NO_VENDOR=1" >> $env:GITHUB_ENV
           "OPENSSL_STATIC=1" >> $env:GITHUB_ENV
-          "OpenSSL cache hit: ${{ steps.openssl-cache.outputs.cache-hit }}" >> $env:GITHUB_STEP_SUMMARY
+          "OpenSSL cache hit: $env:STEP_OPENSSL_CACHE_CACHE_HIT" >> $env:GITHUB_STEP_SUMMARY
 
       - name: Prepare Win7-compatible WebView2 loader
         shell: pwsh
@@ -523,7 +536,7 @@ jobs:
 
       - name: Upload Windows 7 Cargo timings
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: DBX-win7-cargo-timings
           path: target/cargo-timings/
@@ -566,7 +579,7 @@ jobs:
         run: sccache --show-stats
 
       - name: Upload Windows 7 test installer
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: DBX-win7-fixed-runtime-test
           path: target/x86_64-win7-windows-msvc/release/bundle/nsis/*.exe
@@ -589,10 +602,10 @@ jobs:
       CC: "sccache cl.exe"
       CXX: "sccache cl.exe"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Rust for Windows 7
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly
         with:
           toolchain: nightly-2026-07-22
           components: rust-src
@@ -602,7 +615,7 @@ jobs:
         with:
           arch: x64
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
 
@@ -638,7 +651,7 @@ jobs:
       # The fast lane skips only system font discovery while retaining the other default capabilities.
       RUST_FEATURE_MODE: ${{ github.event_name == 'pull_request' && needs.changes.outputs.rust_full != 'true' && 'fast' || 'full' }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install system dependencies
         run: |
@@ -646,8 +659,9 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libsecret-1-dev
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.97.1
+        uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
         with:
+          toolchain: 1.97.1
           components: clippy, rustfmt
 
       - name: Setup sccache
@@ -684,7 +698,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Rust cache
-        uses: swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: "./ -> target"
           shared-key: ci-rust-fmt-clippy-x86_64-unknown-linux-gnu
@@ -721,7 +735,7 @@ jobs:
       RUST_FEATURE_MODE: ${{ github.event_name == 'pull_request' && needs.changes.outputs.rust_full != 'true' && 'fast' || 'full' }}
       RUST_TEST_GROUP: ${{ matrix.group }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install system dependencies
         run: |
@@ -738,7 +752,9 @@ jobs:
           mold --version
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.97.1
+        uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+        with:
+          toolchain: 1.97.1
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
@@ -774,7 +790,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Rust cache
-        uses: swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: "./ -> target"
           shared-key: ci-rust-test-v2-x86_64-unknown-linux-gnu
@@ -819,9 +835,9 @@ jobs:
     if: always()
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22.13.0
       - name: Check selected rust jobs
@@ -834,12 +850,12 @@ jobs:
     if: needs.changes.outputs.jdbc == 'true'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Setup Java
-        uses: actions/setup-java@v6
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
           distribution: temurin
           java-version: "21"
@@ -862,17 +878,17 @@ jobs:
     if: needs.changes.outputs.offline_jdbc == 'true'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Java
-        uses: actions/setup-java@v6
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
           distribution: temurin
           java-version: "21"
           cache: gradle
 
       - name: Cache approved Maven assets
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cache/dbx-offline-jdbc-maven
           key: offline-jdbc-${{ hashFiles('apps/desktop/src/lib/database/managedJdbcAssets.json') }}
@@ -903,7 +919,7 @@ jobs:
     runs-on: ubuntu-24.04
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
@@ -937,12 +953,12 @@ jobs:
       agent_integration_changed: ${{ steps.plan.outputs.agent_integration_changed }}
       plan: ${{ steps.plan.outputs.plan }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Detect changed areas
-        uses: dorny/paths-filter@v4
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
         with:
           filters: |
@@ -1057,7 +1073,9 @@ jobs:
               - 'apps/desktop/src/types/database.ts'
               - 'crates/dbx-core/assets/database-drivers.manifest.json'
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.97.1
+        uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+        with:
+          toolchain: 1.97.1
       - name: Plan dependency-aware CI jobs
         id: plan
         env:
@@ -1078,9 +1096,9 @@ jobs:
     if: always()
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22.13.0
       - name: Check selected agents jobs
@@ -1092,17 +1110,18 @@ jobs:
     if: needs.changes.outputs.fast == 'true'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.97.1
+        uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
         with:
+          toolchain: 1.97.1
           components: rustfmt
         if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.agent_rust_changed == 'true'
       - name: Cargo fmt check
         if: needs.changes.outputs.rust == 'true'
         run: cargo fmt --check
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22.13.0
       - name: CI planner and gate tests
@@ -1112,7 +1131,7 @@ jobs:
         run: node --test scripts/core-architecture.test.mjs
       - name: Setup pnpm
         if: needs.changes.outputs.rust == 'true'
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
           version: 10.27.0
       - name: Install generator dependencies
@@ -1136,9 +1155,9 @@ jobs:
       run:
         working-directory: agents
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22.13.0
       - name: Install packaging tools
@@ -1159,16 +1178,16 @@ jobs:
       run:
         working-directory: agents
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Setup Java
-        uses: actions/setup-java@v6
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
           distribution: temurin
           java-version: |-
             8
             21
       - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v6
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
         with:
           cache-provider: basic
       - name: Install packaging tools
@@ -1193,14 +1212,16 @@ jobs:
       run:
         working-directory: agents
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install system dependencies
         if: matrix.driver == 'duckdb'
         run: |
           sudo apt-get update
           sudo apt-get install -y libdbus-1-dev pkg-config
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.97.1
+        uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+        with:
+          toolchain: 1.97.1
       # Pin mold because runner image updates can change bundled DuckDB C++ links.
       # See the packages job note for the pinned upstream build.
       - name: Install mold linker
@@ -1241,7 +1262,7 @@ jobs:
             echo "CXX=${SCCACHE_PATH} c++"
           } >> "$GITHUB_ENV"
       - name: Rust cache
-        uses: swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: agents/drivers/${{ matrix.driver }} -> target
           # A failed bundled native build can leave link-compatible but invalid artifacts.
@@ -1280,9 +1301,9 @@ jobs:
       run:
         working-directory: agents
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Setup Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: 1.25.x
           cache-dependency-path: agents/drivers/${{ matrix.driver }}/go.sum
@@ -1304,21 +1325,23 @@ jobs:
       run:
         working-directory: agents
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Setup RocketMQ server Java
         if: matrix.scenario == 'rocketmq'
-        uses: actions/setup-java@v6
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
           distribution: temurin
           java-version: "21"
       - name: Setup Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: 1.25.x
           cache-dependency-path: agents/drivers/${{ matrix.driver }}/go.sum
         if: matrix.driver != 'tdengine'
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.97.1
+        uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+        with:
+          toolchain: 1.97.1
         if: matrix.driver == 'tdengine'
       - name: Install nextest
         if: matrix.driver == 'tdengine'
@@ -1327,7 +1350,7 @@ jobs:
           tool: cargo-nextest@0.9.137
       - name: TDengine Rust cache
         if: matrix.driver == 'tdengine'
-        uses: swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: agents/drivers/tdengine -> target
           cache-on-failure: true
@@ -1361,9 +1384,9 @@ jobs:
     if: always()
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22.13.0
       - name: Check selected all jobs
