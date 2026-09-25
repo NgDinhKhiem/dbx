@@ -3,10 +3,13 @@ use std::sync::Arc;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::State;
 use axum::extract::{Query, WebSocketUpgrade};
-use axum::response::IntoResponse;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 
+use crate::auth::SessionRevocation;
+use crate::security::PeerAddr;
 use crate::state::WebState;
 
 #[derive(Deserialize)]
@@ -18,23 +21,45 @@ pub struct PubSubWsParams {
 }
 
 pub async fn ws_handler(
+    peer: PeerAddr,
+    headers: HeaderMap,
+    revocation: SessionRevocation,
     ws: WebSocketUpgrade,
     Query(params): Query<PubSubWsParams>,
     State(state): State<Arc<WebState>>,
-) -> impl IntoResponse {
+) -> Response {
+    // Cookies ride along on cross-site WebSocket handshakes, so a browser
+    // Origin must match this server (cross-site WebSocket hijacking).
+    if !state.security.websocket_origin_allowed(peer.ip(), &headers) {
+        return (StatusCode::FORBIDDEN, "WebSocket origin not allowed").into_response();
+    }
     let connection_id = params.connection_id;
     let owner = dbx_core::session_credentials::current_credential_owner();
+    let session_revoked = revocation.0;
     ws.on_upgrade(move |socket| async move {
-        if params.monitor {
-            dbx_core::session_credentials::with_credential_owner(
-                owner,
-                handle_monitor_socket(socket, state, connection_id),
-            )
-            .await;
-        } else {
-            handle_pubsub_socket(socket, state, connection_id).await;
+        let session = async move {
+            if params.monitor {
+                dbx_core::session_credentials::with_credential_owner(
+                    owner,
+                    handle_monitor_socket(socket, state, connection_id),
+                )
+                .await;
+            } else {
+                handle_pubsub_socket(socket, state, connection_id).await;
+            }
+        };
+        // Close the socket when the login session is revoked or expires.
+        match session_revoked {
+            Some(revoked) => {
+                tokio::select! {
+                    _ = session => {}
+                    _ = revoked.cancelled() => {}
+                }
+            }
+            None => session.await,
         }
     })
+    .into_response()
 }
 
 async fn handle_monitor_socket(mut socket: WebSocket, state: Arc<WebState>, connection_id: String) {

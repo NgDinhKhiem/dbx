@@ -1,12 +1,15 @@
 mod auth;
 mod demo;
 mod error;
+mod rate_limit;
 mod routes;
+mod security;
+mod session;
 mod sse;
 mod ssh_prompt;
 mod state;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -86,13 +89,12 @@ async fn migration_gate(
     request: Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> Response {
-    let suffix = auth::middleware_api_path_suffix(request.uri().path(), &state.public_base_path);
-    let allowed = suffix.is_some_and(|path| {
-        matches!(
-            path,
-            "migration/status" | "migration/start" | "migration/retry" | "migration/cleanup-backups" | "ping"
-        ) || path.starts_with("auth/")
-    });
+    // Runs on the nested `/api` router (and on `/mcp`): every path is an API path.
+    let path = auth::nested_api_path(request.uri().path());
+    let allowed = matches!(
+        path,
+        "migration/status" | "migration/start" | "migration/retry" | "migration/cleanup-backups" | "ping"
+    ) || path.starts_with("auth/");
     if !allowed && !state.migration_ready.load(Ordering::Acquire) {
         return (
             StatusCode::LOCKED,
@@ -313,6 +315,47 @@ fn add_mq_routes(router: Router<Arc<WebState>>) -> Router<Arc<WebState>> {
     router
 }
 
+/// `/api/auth/*`: small body limit and a request timeout (the global upload
+/// limit and the absence of a global timeout exist for other routes).
+fn auth_routes() -> Router<Arc<WebState>> {
+    Router::new()
+        .route("/auth/login", post(auth::login))
+        .route("/auth/check", get(auth::check))
+        .route("/auth/setup", post(auth::setup))
+        .route("/auth/change-password", post(auth::change_password))
+        .route("/auth/logout", post(auth::logout))
+        .layer(DefaultBodyLimit::max(auth::AUTH_BODY_LIMIT_BYTES))
+        .layer(middleware::from_fn(auth::auth_request_timeout))
+}
+
+/// Gates shared by every `/api` route. Order (outermost first): Host
+/// allowlist, session auth, demo gate, migration gate.
+fn layer_api_router(api: Router<Arc<WebState>>, web_state: &Arc<WebState>) -> Router {
+    api.layer(middleware::from_fn_with_state(web_state.clone(), migration_gate))
+        .layer(middleware::from_fn_with_state(web_state.clone(), demo::demo_mode_gate))
+        .layer(middleware::from_fn_with_state(web_state.clone(), auth::auth_middleware))
+        .layer(middleware::from_fn_with_state(web_state.clone(), security::host_allowlist))
+        .with_state(web_state.clone())
+}
+
+/// `DBX_HOST` (default `127.0.0.1`); IPv6 may be written with brackets.
+fn bind_host_from_value(value: Option<&str>) -> String {
+    let host = value.map(str::trim).filter(|host| !host.is_empty()).unwrap_or("127.0.0.1");
+    host.strip_prefix('[').and_then(|host| host.strip_suffix(']')).unwrap_or(host).to_string()
+}
+
+fn log_setup_token(token: &str) {
+    tracing::warn!("==================================================================");
+    tracing::warn!("DBX Web has no access password yet. To set one from another machine,");
+    tracing::warn!("open the web UI and enter this one-time setup token:");
+    tracing::warn!("");
+    tracing::warn!("    {token}");
+    tracing::warn!("");
+    tracing::warn!("A browser on this machine (http://localhost) can skip the token.");
+    tracing::warn!("Set DBX_PASSWORD to configure the password without a setup step.");
+    tracing::warn!("==================================================================");
+}
+
 fn main() {
     let runtime = dbx_core::scheduled_backup::worker_runtime().expect("Failed to build tokio runtime");
     runtime.block_on(serve());
@@ -376,6 +419,7 @@ async fn serve() {
         .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
 
+    let password_managed_by_env = !password_disabled && std::env::var_os("DBX_PASSWORD").is_some();
     let password_hash = if password_disabled {
         None
     } else if let Ok(pw) = std::env::var("DBX_PASSWORD") {
@@ -388,6 +432,10 @@ async fn serve() {
     let public_base_path = normalize_public_base_path(std::env::var("DBX_PUBLIC_BASE_PATH").ok());
 
     let demo_mode = demo::demo_mode_from_env();
+    let security = security::SecurityConfig::from_env(password_disabled)
+        .unwrap_or_else(|error| panic!("Invalid DBX Web security configuration: {error}"));
+    // First-run setup from a non-local client needs this one-time token.
+    let setup_token = (!password_disabled && password_hash.is_none()).then(|| session::random_hex_token(16));
 
     let migration_ready = storage_migration_ready(&app_state).await;
     let web_state = Arc::new(WebState {
@@ -397,20 +445,37 @@ async fn serve() {
         demo_mode,
         password_disabled,
         password_hash: RwLock::new(password_hash),
-        sessions: RwLock::new(HashSet::new()),
+        password_managed_by_env,
+        setup_token: setup_token.clone(),
+        sessions: session::SessionStore::new(session::SessionConfig::from_env()),
         sse_channels: RwLock::new(HashMap::new()),
         transfer_progress_channels: RwLock::new(HashMap::new()),
         table_import_channels: RwLock::new(HashMap::new()),
         sql_file_executions: RwLock::new(HashMap::new()),
         managed_sql_previews: Default::default(),
         nacos_imports: RwLock::new(HashMap::new()),
-        login_rate_limit: tokio::sync::Mutex::new(state::LoginRateLimit { fail_count: 0, locked_until: None }),
+        login_rate_limit: rate_limit::LoginRateLimiter::default(),
+        argon2_permits: Arc::new(tokio::sync::Semaphore::new(state::argon2_concurrency())),
+        security,
         export_files: RwLock::new(HashMap::new()),
         ssh_prompts: Arc::new(ssh_prompt::SshPromptHub::new()),
         migration_ready: Arc::new(AtomicBool::new(migration_ready)),
     });
 
     ssh_prompt::install_web_ssh_prompt_bridge(web_state.ssh_prompts.clone());
+    {
+        // Expire idle/old sessions (and their session credentials) even when
+        // nobody presents them again.
+        let sweep_state = Arc::downgrade(&web_state);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                let Some(state) = sweep_state.upgrade() else { break };
+                state.sweep_sessions();
+            }
+        });
+    }
     routes::sql_file::start_sql_file_cleanup(&web_state);
 
     let backup_root = std::env::var_os("DBX_BACKUP_ROOT")
@@ -430,12 +495,6 @@ async fn serve() {
         .route("/database-backups", post(routes::scheduled_backup::command))
         .route("/database-backups/{id}/files/{index}", get(routes::scheduled_backup::download))
         .route("/database-backups/{id}/files/{index}/restore", post(routes::scheduled_backup::prepare_restore))
-        // Auth
-        .route("/auth/login", post(auth::login))
-        .route("/auth/check", get(auth::check))
-        .route("/auth/setup", post(auth::setup))
-        .route("/auth/change-password", post(auth::change_password))
-        .route("/auth/logout", post(auth::logout))
         // Connection
         .route("/connection/test", post(routes::connection::test_connection))
         .route("/connection/test-info", post(routes::connection::test_connection_with_info))
@@ -1249,11 +1308,7 @@ async fn serve() {
     let api =
         api.route("/query/build-duckdb-attach-database-sql", post(routes::query::build_duckdb_attach_database_sql));
 
-    let api = add_mq_routes(api)
-        .layer(middleware::from_fn_with_state(web_state.clone(), migration_gate))
-        .layer(middleware::from_fn_with_state(web_state.clone(), demo::demo_mode_gate))
-        .layer(middleware::from_fn_with_state(web_state.clone(), auth::auth_middleware))
-        .with_state(web_state.clone());
+    let api = layer_api_router(add_mq_routes(api).merge(auth_routes()), &web_state);
 
     // Build app
     let mut app = Router::new()
@@ -1268,13 +1323,32 @@ async fn serve() {
     }
 
     let static_dir = std::env::var_os("DBX_STATIC_DIR").map(std::path::PathBuf::from);
-    app = mount_public_base_path(app, &public_base_path, static_dir.as_deref());
+    app = mount_public_base_path(app, &public_base_path, static_dir.as_deref())
+        .layer(middleware::from_fn_with_state(web_state.clone(), security::security_headers));
 
-    // Bind address
+    // Bind address: loopback unless DBX_HOST says otherwise (Docker sets 0.0.0.0).
     let port: u16 = std::env::var("DBX_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(4224);
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let host = bind_host_from_value(std::env::var("DBX_HOST").ok().as_deref());
+    let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await.expect("Failed to bind address");
+    let addr = listener.local_addr().expect("Failed to read bound address");
 
     tracing::info!("DBX Web server starting on http://{}", addr);
+    if !addr.ip().is_loopback() {
+        if password_disabled {
+            tracing::warn!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+            tracing::warn!(
+                "DBX Web listens on {addr} (not loopback) with DBX_DISABLE_PASSWORD set: anyone who can reach this port has full access to your databases."
+            );
+            tracing::warn!("Enable a password or bind to 127.0.0.1 with DBX_HOST.");
+            tracing::warn!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+        }
+        if web_state.security.trusted_proxies_configured() {
+            tracing::info!("Forwarded client headers are trusted from DBX_TRUSTED_PROXIES");
+        }
+    }
+    if let Some(token) = setup_token.as_deref() {
+        log_setup_token(token);
+    }
     if public_base_path != "/" {
         tracing::info!("Serving DBX Web under context path {}", public_base_path);
     }
@@ -1287,9 +1361,8 @@ async fn serve() {
         tracing::info!("Demo mode is enabled: connection/plugin/AI mutations are blocked");
     }
 
-    let listener = tokio::net::TcpListener::bind(addr).await.expect("Failed to bind address");
     let shutdown_state = web_state.app.clone();
-    axum::serve(listener, app)
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(async move {
             #[cfg(unix)]
             {
@@ -1320,22 +1393,28 @@ mod tests {
     use axum::http::{Response, StatusCode};
     use axum::routing::{get, post};
     use axum::Router;
+    use std::sync::Arc;
     use tower_http::compression::predicate::Predicate;
 
     #[tokio::test]
     async fn migration_http_gate_blocks_business_until_ready_but_allows_cleanup_handler() {
-        use std::sync::{atomic::Ordering, Arc};
+        use std::sync::atomic::Ordering;
         let directory = tempfile::tempdir().unwrap();
         let storage = dbx_core::storage::Storage::open_unmigrated(&directory.path().join("dbx.db")).await.unwrap();
         let app = Arc::new(dbx_core::connection::AppState::new(storage));
         let state = Arc::new(crate::state::WebState::for_tests(app, directory.path().to_path_buf()));
         state.migration_ready.store(false, Ordering::Release);
-        let router = Router::new()
-            .route("/api/migration/status", get(|| async { "status" }))
-            .route("/api/migration/cleanup-backups", post(|| async { "cleanup" }))
-            .route("/api/connection/list", get(|| async { "connections" }))
-            .route("/mcp", post(|| async { "mcp" }))
+        // Production layout: the gate runs on the nested `/api` router and on `/mcp`.
+        let api = Router::new()
+            .route("/migration/status", get(|| async { "status" }))
+            .route("/migration/cleanup-backups", post(|| async { "cleanup" }))
+            .route("/connection/list", get(|| async { "connections" }))
             .layer(axum::middleware::from_fn_with_state(state.clone(), super::migration_gate));
+        let router = Router::new().nest("/api", api).merge(
+            Router::new()
+                .route("/mcp", post(|| async { "mcp" }))
+                .layer(axum::middleware::from_fn_with_state(state.clone(), super::migration_gate)),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
@@ -1359,6 +1438,148 @@ mod tests {
             StatusCode::OK
         );
         server.abort();
+    }
+
+    async fn protected_state(
+        configure: impl FnOnce(&mut crate::state::WebState),
+    ) -> (Arc<crate::state::WebState>, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = dbx_core::storage::Storage::open_unmigrated(&directory.path().join("dbx.db")).await.unwrap();
+        let app = Arc::new(dbx_core::connection::AppState::new(storage));
+        let mut state = crate::state::WebState::for_tests(app, directory.path().to_path_buf());
+        *state.password_hash.get_mut() = Some("$argon2id$v=19$m=8,t=1,p=1$c2FsdHNhbHQ$aGFzaA".to_string());
+        configure(&mut state);
+        (Arc::new(state), directory)
+    }
+
+    /// Builds the real `/api` stack (auth routes + gates) mounted under `base`.
+    fn production_like_router(
+        state: &Arc<crate::state::WebState>,
+        base: &str,
+        static_dir: Option<&std::path::Path>,
+    ) -> Router {
+        let api = Router::new()
+            .route("/app-settings/config/decrypt", post(|| async { "decrypted" }))
+            .route("/query/execute", post(|| async { "executed" }))
+            .route("/data-compare/prepare", post(|| async { "compared" }))
+            .route("/connection/list", get(|| async { "connections" }))
+            .merge(super::auth_routes());
+        let app = Router::new().nest("/api", super::layer_api_router(api, state));
+        mount_public_base_path(app, base, static_dir)
+            .layer(axum::middleware::from_fn_with_state(state.clone(), crate::security::security_headers))
+    }
+
+    async fn serve_with_connect_info(router: Router) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
+        });
+        (address, server)
+    }
+
+    #[tokio::test]
+    async fn api_routes_require_a_session_under_base_paths_that_prefix_route_names() {
+        let (state, _directory) = protected_state(|_| {}).await;
+        let client = reqwest::Client::new();
+        for base in ["/app", "/query", "/data", "/"] {
+            let (address, server) = serve_with_connect_info(production_like_router(&state, base, None)).await;
+            let prefix = if base == "/" { String::new() } else { base.to_string() };
+            for (method, path) in [
+                (reqwest::Method::POST, "/api/app-settings/config/decrypt"),
+                (reqwest::Method::POST, "/api/query/execute"),
+                (reqwest::Method::POST, "/api/data-compare/prepare"),
+                (reqwest::Method::GET, "/api/connection/list"),
+            ] {
+                let response =
+                    client.request(method.clone(), format!("http://{address}{prefix}{path}")).send().await.unwrap();
+                assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED, "base {base} {method} {path}");
+            }
+            let check = client.get(format!("http://{address}{prefix}/api/auth/check")).send().await.unwrap();
+            assert_eq!(check.status(), reqwest::StatusCode::OK, "base {base}");
+            let change = client
+                .post(format!("http://{address}{prefix}/api/auth/change-password"))
+                .json(&serde_json::json!({"old_password": "a", "new_password": "b"}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(change.status(), reqwest::StatusCode::UNAUTHORIZED, "base {base}");
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_routes_reject_oversized_bodies() {
+        let (state, _directory) = protected_state(|_| {}).await;
+        let (address, server) = serve_with_connect_info(production_like_router(&state, "/", None)).await;
+        let password = "x".repeat(crate::auth::AUTH_BODY_LIMIT_BYTES + 1);
+        let response = reqwest::Client::new()
+            .post(format!("http://{address}/api/auth/login"))
+            .json(&serde_json::json!({ "password": password }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn host_allowlist_blocks_dns_rebinding_when_password_is_disabled() {
+        let (state, _directory) = protected_state(|state| {
+            state.password_disabled = true;
+            *state.password_hash.get_mut() = None;
+            state.security = crate::security::SecurityConfig::from_values(None, None, None, None, None, true).unwrap();
+        })
+        .await;
+        let (address, server) = serve_with_connect_info(production_like_router(&state, "/", None)).await;
+        let client = reqwest::Client::new();
+        let allowed = client.get(format!("http://{address}/api/connection/list")).send().await.unwrap();
+        assert_eq!(allowed.status(), reqwest::StatusCode::OK);
+        let rebound = client
+            .get(format!("http://{address}/api/connection/list"))
+            .header("host", format!("attacker.example:{}", address.port()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rebound.status(), reqwest::StatusCode::FORBIDDEN);
+        assert_eq!(rebound.json::<serde_json::Value>().await.unwrap()["code"], "HOST_NOT_ALLOWED");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn responses_carry_security_headers_and_the_spa_gets_a_csp() {
+        let (state, _directory) = protected_state(|_| {}).await;
+        let static_dir = tempfile::tempdir().unwrap();
+        std::fs::write(static_dir.path().join("index.html"), "<!doctype html><title>DBX</title>").unwrap();
+        std::fs::write(static_dir.path().join("app.js"), "console.log(1)").unwrap();
+        let (address, server) =
+            serve_with_connect_info(production_like_router(&state, "/", Some(static_dir.path()))).await;
+        let client = reqwest::Client::new();
+
+        let index = client.get(format!("http://{address}/")).send().await.unwrap();
+        let headers = index.headers();
+        assert_eq!(headers["x-content-type-options"], "nosniff");
+        assert_eq!(headers["referrer-policy"], "same-origin");
+        assert_eq!(headers["x-frame-options"], "SAMEORIGIN");
+        let csp = headers["content-security-policy"].to_str().unwrap();
+        assert!(csp.contains("frame-ancestors 'self'"));
+        assert!(csp.contains(&format!("ws://127.0.0.1:{}", address.port())));
+
+        let asset = client.get(format!("http://{address}/app.js")).send().await.unwrap();
+        assert_eq!(asset.headers()["x-content-type-options"], "nosniff");
+        assert!(asset.headers().get("content-security-policy").is_none());
+
+        let api = client.get(format!("http://{address}/api/connection/list")).send().await.unwrap();
+        assert_eq!(api.headers()["x-frame-options"], "SAMEORIGIN");
+        server.abort();
+    }
+
+    #[test]
+    fn bind_host_defaults_to_loopback() {
+        assert_eq!(super::bind_host_from_value(None), "127.0.0.1");
+        assert_eq!(super::bind_host_from_value(Some(" ")), "127.0.0.1");
+        assert_eq!(super::bind_host_from_value(Some("0.0.0.0")), "0.0.0.0");
+        assert_eq!(super::bind_host_from_value(Some("[::]")), "::");
     }
 
     fn compression_response(content_type: &str) -> Response<Body> {

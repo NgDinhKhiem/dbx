@@ -13,6 +13,7 @@ use dbx_core::sql_file_import::{
 };
 use futures::stream::Stream;
 use serde::Deserialize;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -195,24 +196,51 @@ pub async fn preview_sql_file(
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let tmp_dir = state.data_dir.join("tmp").join("sql_file");
-    std::fs::create_dir_all(&tmp_dir).map_err(|e| AppError::from(e.to_string()))?;
+    tokio::fs::create_dir_all(&tmp_dir).await.map_err(|e| AppError::from(e.to_string()))?;
     state.managed_sql_previews.cleanup(&tmp_dir, SQL_FILE_UPLOAD_MAX_AGE, false);
 
     if let Some(field) = multipart.next_field().await.map_err(|e| AppError::from(e.to_string()))? {
         let file_name = field.file_name().unwrap_or("upload.sql").to_string();
-        let data = field.bytes().await.map_err(|e| AppError::from(e.to_string()))?;
         let upload_limit = sql_file_upload_limit(&state).await;
-        if data.len() > upload_limit {
-            return Err(AppError::from(format!("File too large: {} bytes (max {} bytes)", data.len(), upload_limit)));
-        }
-
         let file_path = safe_uploaded_sql_path(&tmp_dir, &file_name)?;
-        std::fs::write(&file_path, &data).map_err(|e| AppError::from(e.to_string()))?;
+        let size_bytes = write_upload_field_to_file(field, &file_path, upload_limit).await?;
 
-        return preview_uploaded_sql_file(&file_path, &file_name, data.len() as u64).await.map(Json);
+        return preview_uploaded_sql_file(&file_path, &file_name, size_bytes).await.map(Json);
     }
 
     Err(AppError::from("No file uploaded".to_string()))
+}
+
+/// Streams one multipart field to `file_path` chunk by chunk, enforcing
+/// `limit` while receiving. The partial file is removed on any error.
+async fn write_upload_field_to_file(
+    field: axum::extract::multipart::Field<'_>,
+    file_path: &Path,
+    limit: usize,
+) -> Result<u64, AppError> {
+    let result = stream_upload_chunks(field, file_path, limit).await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(file_path).await;
+    }
+    result
+}
+
+async fn stream_upload_chunks(
+    mut field: axum::extract::multipart::Field<'_>,
+    file_path: &Path,
+    limit: usize,
+) -> Result<u64, AppError> {
+    let mut file = tokio::fs::File::create(file_path).await.map_err(|e| AppError::from(e.to_string()))?;
+    let mut written: u64 = 0;
+    while let Some(chunk) = field.chunk().await.map_err(|e| AppError::from(e.to_string()))? {
+        written = written.saturating_add(chunk.len() as u64);
+        if written > limit as u64 {
+            return Err(AppError::from(format!("File too large: {written} bytes received (max {limit} bytes)")));
+        }
+        file.write_all(&chunk).await.map_err(|e| AppError::from(e.to_string()))?;
+    }
+    file.flush().await.map_err(|e| AppError::from(e.to_string()))?;
+    Ok(written)
 }
 
 async fn preview_uploaded_sql_file(
@@ -497,6 +525,55 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[tokio::test]
+    async fn sql_upload_streams_to_disk_and_enforces_the_limit_while_receiving() {
+        use axum::extract::Multipart;
+        use axum::routing::post;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("upload.sql");
+        let handler_target = target.clone();
+        let router = axum::Router::new().route(
+            "/upload",
+            post(move |mut multipart: Multipart| {
+                let target = handler_target.clone();
+                async move {
+                    let field = multipart.next_field().await.unwrap().unwrap();
+                    match write_upload_field_to_file(field, &target, 8).await {
+                        Ok(size) => size.to_string(),
+                        Err(error) => error.message,
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let boundary = "dbx-sql-boundary";
+        let body = |content: &str| {
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.sql\"\r\n\r\n{content}\r\n--{boundary}--\r\n"
+            )
+        };
+        let client = reqwest::Client::new();
+        let send = |content: String| {
+            client
+                .post(format!("http://{address}/upload"))
+                .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+                .body(content)
+                .send()
+        };
+
+        let accepted = send(body("SELECT 1")).await.unwrap().text().await.unwrap();
+        assert_eq!(accepted, "8");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "SELECT 1");
+
+        let rejected = send(body("SELECT 12")).await.unwrap().text().await.unwrap();
+        assert_eq!(rejected, "File too large: 9 bytes received (max 8 bytes)");
+        assert!(!target.exists());
+        server.abort();
+    }
 
     async fn restore_state(directory: &Path) -> WebState {
         let storage = dbx_core::storage::Storage::open(&directory.join("dbx.db")).await.unwrap();

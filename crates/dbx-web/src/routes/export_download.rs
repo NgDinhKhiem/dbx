@@ -1,4 +1,64 @@
 use std::fmt::Write;
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use axum::body::{Body, Bytes};
+use futures::Stream;
+use tokio_util::io::ReaderStream;
+
+/// Streams a finished temp export file and deletes it once the response body
+/// is dropped (fully sent, failed, or the client disconnected). The file handle
+/// is closed before deletion so this also works on Windows.
+pub(crate) struct TempFileStream {
+    inner: Option<ReaderStream<tokio::fs::File>>,
+    path: PathBuf,
+}
+
+impl TempFileStream {
+    /// Opens `path`; the file is removed when the returned stream is dropped,
+    /// even if it is never polled. Returns the stream and the file length.
+    pub(crate) async fn open(path: impl Into<PathBuf>) -> std::io::Result<(Self, u64)> {
+        let path = path.into();
+        let opened = async {
+            let file = tokio::fs::File::open(&path).await?;
+            let length = file.metadata().await?.len();
+            Ok::<_, std::io::Error>((file, length))
+        }
+        .await;
+        match opened {
+            Ok((file, length)) => Ok((Self { inner: Some(ReaderStream::new(file)), path }, length)),
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&path).await;
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn into_body(self) -> Body {
+        Body::from_stream(self)
+    }
+}
+
+impl Stream for TempFileStream {
+    type Item = std::io::Result<Bytes>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match this.inner.as_mut() {
+            Some(inner) => Pin::new(inner).poll_next(cx),
+            None => Poll::Ready(None),
+        }
+    }
+}
+
+impl Drop for TempFileStream {
+    fn drop(&mut self) {
+        // Close the handle first; unlinking an open file fails on Windows.
+        drop(self.inner.take());
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
 
 pub(crate) fn export_download_filename(requested_path: &str, fallback_base: &str, extension: &str) -> String {
     let requested_name = requested_path.rsplit(['/', '\\']).next().unwrap_or_default().trim();
@@ -60,6 +120,26 @@ fn encode_rfc5987_value(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn temp_file_stream_streams_and_deletes_the_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("export.csv");
+        std::fs::write(&path, b"id\n1\n").unwrap();
+        let (stream, length) = TempFileStream::open(&path).await.unwrap();
+        assert_eq!(length, 5);
+        let bytes = axum::body::to_bytes(stream.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(bytes.as_ref(), b"id\n1\n");
+        assert!(!path.exists());
+
+        // Dropping an unread stream (client went away) also removes the file.
+        std::fs::write(&path, b"abc").unwrap();
+        let (stream, _) = TempFileStream::open(&path).await.unwrap();
+        drop(stream);
+        assert!(!path.exists());
+
+        assert!(TempFileStream::open(directory.path().join("missing.csv")).await.is_err());
+    }
 
     #[test]
     fn export_download_names_keep_the_requested_basename_and_expected_extension() {
