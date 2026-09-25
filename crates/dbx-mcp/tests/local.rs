@@ -420,6 +420,11 @@ async fn local_backend_replaces_pool_after_connection_is_deleted_and_recreated()
     }))
     .expect("initial connection config");
     storage.save_connections(std::slice::from_ref(&connection)).await.expect("save initial connection");
+    // MCP is read-only until configured; this test exercises MCP connection changes.
+    storage
+        .save_mcp_global_policy(&dbx_core::storage::McpGlobalPolicy { read_only: false, ..Default::default() })
+        .await
+        .expect("allow MCP connection changes");
 
     let backend = LocalBackend::open(&db_path).await.expect("open local backend");
     let initial_result = backend

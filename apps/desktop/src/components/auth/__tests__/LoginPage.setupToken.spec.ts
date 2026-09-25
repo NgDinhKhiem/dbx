@@ -2,6 +2,7 @@
 
 import { createApp, nextTick, type App } from "vue";
 import { createI18n } from "vue-i18n";
+import { createPinia } from "pinia";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import LoginPage from "../LoginPage.vue";
 
@@ -23,6 +24,7 @@ async function mountSetup(fetchMock: ReturnType<typeof vi.fn>) {
   const container = document.createElement("div");
   document.body.append(container);
   const app = createApp(LoginPage, { setupMode: true });
+  app.use(createPinia());
   app.use(
     createI18n({
       legacy: false,

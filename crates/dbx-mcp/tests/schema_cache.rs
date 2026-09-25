@@ -18,6 +18,11 @@ async fn ddl_schema_cache_mcp_query_and_automatic_batch_dispatch() {
         "port": 0, "username": "", "password": "", "database": "main"
     }))
     .unwrap();
+    // MCP is read-only until configured; this test exercises MCP connection changes.
+    storage
+        .save_mcp_global_policy(&dbx_core::storage::McpGlobalPolicy { read_only: false, ..Default::default() })
+        .await
+        .unwrap();
     storage.add_connection_for_mcp(config).await.unwrap();
     storage
         .save_mcp_global_policy(&McpGlobalPolicy { read_only: false, allow_dangerous_sql: true, ..Default::default() })
