@@ -45,3 +45,22 @@ export function resolveTableVGroupDropTarget(x: number, y: number, treeNodes: Tr
   }
   return null;
 }
+
+/**
+ * Resolve where dragged database rows are released: a database group of the
+ * same connection (move in), or the connection row itself (take them out of
+ * their group). Anything else, including table groups, is ignored.
+ */
+export function resolveDatabaseVGroupDropTarget(x: number, y: number, treeNodes: TreeNode[], connectionId: string): TableVGroupDropTarget | null {
+  const elements = typeof document.elementsFromPoint === "function" ? document.elementsFromPoint(x, y) : [];
+  for (const element of elements) {
+    const row = element.closest("[data-node-id]");
+    const nodeId = row?.getAttribute("data-node-id");
+    if (!nodeId) continue;
+    const node = findTreeNodeById(treeNodes, nodeId);
+    if (!node || node.connectionId !== connectionId) continue;
+    if (node.type === "table-vgroup" && node.vgroupId && node.vgroupKind === "databases") return { node, groupId: node.vgroupId };
+    if (node.type === "connection") return { node, groupId: null };
+  }
+  return null;
+}
