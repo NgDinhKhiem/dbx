@@ -58,11 +58,11 @@ describe("startup theme", () => {
     expect(matchMedia).toHaveBeenCalledWith("(prefers-color-scheme: dark)");
   });
 
-  it("uses the current light default when no preference exists", () => {
+  it("uses the dark default when no preference exists", () => {
     const { root, toggle } = runStartupTheme();
 
-    expect(toggle).toHaveBeenCalledWith("dark", false);
-    expect(root.style.colorScheme).toBe("light");
+    expect(toggle).toHaveBeenCalledWith("dark", true);
+    expect(root.style.colorScheme).toBe("dark");
   });
 
   it.each([
@@ -77,19 +77,19 @@ describe("startup theme", () => {
     expect(root.dataset.cornerStyle).toBe(expected);
   });
 
-  it("falls back to light when localStorage is unavailable", () => {
-    const { root, toggle } = runStartupTheme({ storageError: true, prefersDark: true });
+  it("falls back to dark when localStorage is unavailable", () => {
+    const { root, toggle } = runStartupTheme({ storageError: true, prefersDark: false });
 
-    expect(toggle).toHaveBeenCalledWith("dark", false);
-    expect(root.style.colorScheme).toBe("light");
+    expect(toggle).toHaveBeenCalledWith("dark", true);
+    expect(root.style.colorScheme).toBe("dark");
     expect(root.dataset.cornerStyle).toBe("large");
   });
 
-  it("falls back to light for an invalid persisted mode", () => {
-    const { root, toggle } = runStartupTheme({ mode: "invalid", prefersDark: true });
+  it("falls back to dark for an invalid persisted mode", () => {
+    const { root, toggle } = runStartupTheme({ mode: "invalid", prefersDark: false });
 
-    expect(toggle).toHaveBeenCalledWith("dark", false);
-    expect(root.style.colorScheme).toBe("light");
+    expect(toggle).toHaveBeenCalledWith("dark", true);
+    expect(root.style.colorScheme).toBe("dark");
   });
 
   it("falls back to light when system appearance detection is unavailable", () => {
