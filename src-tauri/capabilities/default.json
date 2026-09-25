@@ -33,7 +33,11 @@
     "dialog:default",
     "dialog:allow-save",
     "dialog:allow-open",
-    "fs:default",
+    "fs:deny-default",
+    {
+      "identifier": "fs:scope",
+      "deny": [{ "path": "$APPDATA" }, { "path": "$APPDATA/**" }, { "path": "$APPLOCALDATA/**" }, { "path": "$APPCONFIG/**" }]
+    },
     {
       "identifier": "fs:allow-exists",
       "allow": [{ "path": "$HOME/.dbx/ui-tuning.json" }]

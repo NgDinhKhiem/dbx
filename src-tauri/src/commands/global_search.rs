@@ -232,8 +232,25 @@ fn search_root(request: &GlobalSearchRequest, root: &str) -> Vec<GlobalSearchMat
     results
 }
 
+/// Content search returns file text, so it only walks roots the user granted
+/// (picked through a backend folder dialog or confirmed in a native prompt);
+/// other roots are skipped silently.
 #[tauri::command]
-pub async fn global_search(request: GlobalSearchRequest) -> Result<Vec<GlobalSearchMatch>, String> {
+pub async fn global_search(
+    app: tauri::AppHandle,
+    mut request: GlobalSearchRequest,
+) -> Result<Vec<GlobalSearchMatch>, String> {
+    let mut granted_roots = Vec::with_capacity(request.roots.len());
+    for root in std::mem::take(&mut request.roots) {
+        if super::external_path_access::ensure_directory_access(&app, Path::new(&root)).await.is_ok() {
+            granted_roots.push(root);
+        }
+    }
+    request.roots = granted_roots;
+    search_granted_roots(request).await
+}
+
+async fn search_granted_roots(request: GlobalSearchRequest) -> Result<Vec<GlobalSearchMatch>, String> {
     if request.roots.is_empty() {
         return Ok(Vec::new());
     }
@@ -286,7 +303,7 @@ mod tests {
         let file = root.join("data.sql");
         std::fs::write(&file, "SELECT id\nFROM users\nWHERE name = 'alice';\n").unwrap();
         let r = req(&[root.to_str().unwrap()], "users");
-        let results = global_search(r).await.unwrap();
+        let results = search_granted_roots(r).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].line, 2);
         assert_eq!(results[0].match_text, "users");
@@ -300,7 +317,7 @@ mod tests {
         std::fs::write(root.join("a.sql"), "SELECT user, users FROM t;\n").unwrap();
         let mut r = req(&[root.to_str().unwrap()], "user");
         r.whole_word = Some(true);
-        let results = global_search(r).await.unwrap();
+        let results = search_granted_roots(r).await.unwrap();
         // "user" as a whole word appears once (in "user"), "users" is not a whole-word match.
         assert!(!results.is_empty());
         assert!(results.iter().any(|m| m.match_text == "user"));
@@ -313,12 +330,12 @@ mod tests {
         std::fs::write(root.join("a.sql"), "SELECT USERS FROM t;\n").unwrap();
         let mut r = req(&[root.to_str().unwrap()], "users");
         r.case_sensitive = Some(true);
-        let results = global_search(r).await.unwrap();
+        let results = search_granted_roots(r).await.unwrap();
         assert!(results.is_empty());
 
         let mut r2 = req(&[root.to_str().unwrap()], "USERS");
         r2.case_sensitive = Some(true);
-        let results2 = global_search(r2).await.unwrap();
+        let results2 = search_granted_roots(r2).await.unwrap();
         assert!(!results2.is_empty());
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -330,7 +347,7 @@ mod tests {
         std::fs::write(root.join("b.txt"), "needle here\n").unwrap();
         let mut r = req(&[root.to_str().unwrap()], "needle");
         r.extensions = Some(vec!["sql".to_string()]);
-        let results = global_search(r).await.unwrap();
+        let results = search_granted_roots(r).await.unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].path.ends_with("a.sql"));
         std::fs::remove_dir_all(&root).unwrap();
@@ -342,7 +359,7 @@ mod tests {
         std::fs::write(root.join("a.sql"), "SELECT needle;\nSELECT needle;\nSELECT needle;\n").unwrap();
         let mut r = req(&[root.to_str().unwrap()], "needle");
         r.limit = Some(2);
-        let results = global_search(r).await.unwrap();
+        let results = search_granted_roots(r).await.unwrap();
         assert_eq!(results.len(), 2);
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -355,7 +372,7 @@ mod tests {
         // "other.sql" has "users" in its body.
         std::fs::write(root.join("other.sql"), "SELECT users;\n").unwrap();
         let r = req(&[root.to_str().unwrap()], "users");
-        let results = global_search(r).await.unwrap();
+        let results = search_granted_roots(r).await.unwrap();
         assert!(
             results.iter().any(|m| m.file_name == "users_tbl.sql" && m.line == 0),
             "expected a filename-only match for users_tbl.sql with line 0"
@@ -372,7 +389,7 @@ mod tests {
         std::fs::write(nested.join("dep.sql"), "SELECT needle;\n").unwrap();
         std::fs::write(root.join("main.sql"), "SELECT needle;\n").unwrap();
         let r = req(&[root.to_str().unwrap()], "needle");
-        let results = global_search(r).await.unwrap();
+        let results = search_granted_roots(r).await.unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].path.ends_with("main.sql"));
         std::fs::remove_dir_all(&root).unwrap();

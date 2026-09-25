@@ -8,6 +8,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::commands::connection::{ensure_connection_writable, AppState};
+use crate::commands::external_path_access::{self, AccessKind};
 use dbx_core::sql_file_import::{
     execute_sql_file_paths, mysql_like_sql_file_bootstrap_analysis, read_sql_file_preview, sql_file_progress,
     SqlFileProgressEmitter,
@@ -30,16 +31,40 @@ struct SqlFileSummary {
     failed_statement_index: Option<usize>,
 }
 
-#[tauri::command]
-pub async fn inspect_sql_file_tables(
-    file_path: String,
-) -> Result<Vec<dbx_core::sql_file_import::SqlFileTable>, String> {
-    dbx_core::sql_file_import::inspect_sql_file_tables(std::path::Path::new(&file_path)).await
+const SQL_FILE_PACKAGE_EXTENSIONS: &[&str] = &["sql", "gz", "zip"];
+
+fn ensure_sql_file_execution_extension(path: &std::path::Path) -> Result<(), String> {
+    let package = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| SQL_FILE_PACKAGE_EXTENSIONS.iter().any(|allowed| extension.eq_ignore_ascii_case(allowed)));
+    if package {
+        Ok(())
+    } else {
+        external_path_access::ensure_external_text_file_extension(path)
+    }
+}
+
+/// SQL file execution reads webview-supplied paths; only files the user picked,
+/// dropped, opened from the OS or confirmed in a native prompt are accepted.
+async fn authorized_sql_file_path(app: &AppHandle, file_path: &str, prompt: bool) -> Result<PathBuf, String> {
+    let path = PathBuf::from(file_path);
+    ensure_sql_file_execution_extension(&path)?;
+    external_path_access::ensure_file_access(app, &path, AccessKind::Read, prompt, None).await
 }
 
 #[tauri::command]
-pub async fn preview_sql_file(file_path: String) -> Result<SqlFilePreview, String> {
-    let path = PathBuf::from(&file_path);
+pub async fn inspect_sql_file_tables(
+    app: AppHandle,
+    file_path: String,
+) -> Result<Vec<dbx_core::sql_file_import::SqlFileTable>, String> {
+    let path = authorized_sql_file_path(&app, &file_path, false).await?;
+    dbx_core::sql_file_import::inspect_sql_file_tables(&path).await
+}
+
+#[tauri::command]
+pub async fn preview_sql_file(app: AppHandle, file_path: String) -> Result<SqlFilePreview, String> {
+    let path = authorized_sql_file_path(&app, &file_path, true).await?;
     let metadata = tokio::fs::metadata(&path).await.map_err(|e| e.to_string())?;
     if path
         .extension()
@@ -62,6 +87,11 @@ pub async fn preview_sql_file(file_path: String) -> Result<SqlFilePreview, Strin
         })
         .await
         .map_err(|error| format!("Failed to extract SQL ZIP package: {error}"))??;
+        // Extracted parts live in a fresh temp directory the backend created;
+        // allow them for this session so execution can read them.
+        for extracted in &extracted_paths {
+            external_path_access::grant_session_file(&app, std::path::Path::new(extracted));
+        }
         let prefix = read_sql_file_preview(PathBuf::from(&extracted_paths[0]).as_path(), 1_000_000).await?;
         let bootstrap_analysis = mysql_like_sql_file_bootstrap_analysis(&prefix);
         return Ok(SqlFilePreview {
@@ -111,6 +141,9 @@ pub async fn execute_sql_files(
     ensure_connection_writable(&state, &request.connection_id, "SQL file execution").await?;
     if file_paths.is_empty() {
         return Err("No SQL files selected".to_string());
+    }
+    for file_path in &file_paths {
+        authorized_sql_file_path(&app, file_path, false).await?;
     }
     let token = CancellationToken::new();
     {

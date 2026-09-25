@@ -88,10 +88,11 @@ async function pickFolder() {
     return;
   }
   try {
-    const { open } = await import("@tauri-apps/plugin-dialog");
-    const selected = await open({ directory: true, multiple: false });
+    // Backend picker: the folder is granted so its files can be listed,
+    // opened and saved through the authorized external-file commands.
+    const selected = await api.pickExternalDirectory();
     if (!selected) return;
-    const folderPath = selected as string;
+    const folderPath = selected;
     if (folders.value.some((f) => f.path === folderPath)) {
       toast(t("sqlFileTree.folderAlreadyOpen"), 2000);
       return;
@@ -287,6 +288,15 @@ function folderName(path: string): string {
 
 onMounted(async () => {
   const saved = loadSavedFolders();
+  if (isTauriRuntime() && saved.length > 0) {
+    // Folders saved by versions without backend path grants need one native
+    // confirmation; folders that are already granted never prompt.
+    try {
+      await api.requestExternalPathAccess(saved, true);
+    } catch (e: any) {
+      console.warn("[DBX] SQL folder access request failed:", e);
+    }
+  }
   for (const path of saved) {
     await addFolder(path);
   }

@@ -3,6 +3,8 @@ use serde::Serialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use super::external_path_access;
+
 const MAX_SCAN_DEPTH: usize = 10;
 const DEFAULT_FILE_FILTER: &str = "*.sql";
 
@@ -199,9 +201,13 @@ fn scan_sql_files(dir: &Path, depth: usize, visited: &mut HashSet<String>, file_
 
 #[tauri::command]
 pub async fn list_sql_files_in_folder(
+    app: tauri::AppHandle,
     folder_path: String,
     file_filter: Option<String>,
 ) -> Result<Vec<SqlFileEntry>, String> {
+    // Only folders the user picked through a backend dialog (or confirmed in
+    // a native prompt) can be browsed; the webview cannot name arbitrary ones.
+    external_path_access::ensure_directory_access(&app, Path::new(&folder_path)).await?;
     let path = Path::new(&folder_path).to_path_buf();
     let file_filter = compile_file_filter(file_filter.as_deref().unwrap_or(DEFAULT_FILE_FILTER))?;
     // Filesystem scanning is blocking work; run it on a thread pool so the
@@ -220,10 +226,16 @@ pub async fn list_sql_files_in_folder(
 
 #[tauri::command]
 pub async fn create_sql_file_in_folder(
+    app: tauri::AppHandle,
     root_path: String,
     directory_path: String,
     file_name: String,
 ) -> Result<String, String> {
+    external_path_access::ensure_directory_access(&app, Path::new(&root_path)).await?;
+    create_sql_file(root_path, directory_path, file_name).await
+}
+
+async fn create_sql_file(root_path: String, directory_path: String, file_name: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let file_name = validate_sql_file_name(&file_name)?.to_owned();
         let directory = managed_directory(&root_path, &directory_path)?;
@@ -243,12 +255,19 @@ pub async fn create_sql_file_in_folder(
 
 #[tauri::command]
 pub async fn rename_sql_file_in_folder(
+    app: tauri::AppHandle,
     root_path: String,
     file_path: String,
     file_name: String,
 ) -> Result<String, String> {
+    external_path_access::ensure_directory_access(&app, Path::new(&root_path)).await?;
+    rename_sql_file(root_path, file_path, file_name).await
+}
+
+async fn rename_sql_file(root_path: String, file_path: String, file_name: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let file_name = validate_file_name(&file_name)?.to_owned();
+        external_path_access::ensure_external_text_file_extension(Path::new(&file_name))?;
         let display_path = renamed_sql_file_display_path(&file_path, &file_name)?;
         let file = managed_file(&root_path, &file_path)?;
         let target =
@@ -268,7 +287,16 @@ pub async fn rename_sql_file_in_folder(
 }
 
 #[tauri::command]
-pub async fn delete_sql_file_in_folder(root_path: String, file_path: String) -> Result<(), String> {
+pub async fn delete_sql_file_in_folder(
+    app: tauri::AppHandle,
+    root_path: String,
+    file_path: String,
+) -> Result<(), String> {
+    external_path_access::ensure_directory_access(&app, Path::new(&root_path)).await?;
+    delete_sql_file(root_path, file_path).await
+}
+
+async fn delete_sql_file(root_path: String, file_path: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let file = managed_file(&root_path, &file_path)?;
         std::fs::remove_file(file).map_err(|error| format!("Failed to delete SQL file: {error}"))
@@ -378,7 +406,7 @@ mod tests {
         let source = root.join("script.sh");
         std::fs::write(&source, "echo hello").unwrap();
 
-        let renamed = rename_sql_file_in_folder(
+        let renamed = rename_sql_file(
             root.to_string_lossy().into_owned(),
             source.to_string_lossy().into_owned(),
             "script.py".to_string(),
@@ -387,7 +415,7 @@ mod tests {
         .unwrap();
         assert!(Path::new(&renamed).is_file());
 
-        delete_sql_file_in_folder(root.to_string_lossy().into_owned(), renamed.clone()).await.unwrap();
+        delete_sql_file(root.to_string_lossy().into_owned(), renamed.clone()).await.unwrap();
         assert!(!Path::new(&renamed).exists());
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -398,7 +426,7 @@ mod tests {
         let nested = root.join("queries");
         std::fs::create_dir_all(&nested).unwrap();
 
-        let created = create_sql_file_in_folder(
+        let created = create_sql_file(
             root.to_string_lossy().into_owned(),
             nested.to_string_lossy().into_owned(),
             "draft.sql".to_string(),
@@ -407,12 +435,12 @@ mod tests {
         .unwrap();
         assert!(Path::new(&created).is_file());
 
-        let renamed = rename_sql_file_in_folder(root.to_string_lossy().into_owned(), created, "report.sql".to_string())
+        let renamed = rename_sql_file(root.to_string_lossy().into_owned(), created, "report.sql".to_string())
             .await
             .unwrap();
         assert!(Path::new(&renamed).is_file());
 
-        delete_sql_file_in_folder(root.to_string_lossy().into_owned(), renamed.clone()).await.unwrap();
+        delete_sql_file(root.to_string_lossy().into_owned(), renamed.clone()).await.unwrap();
         assert!(!Path::new(&renamed).exists());
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -425,7 +453,7 @@ mod tests {
         let displayed_directory = nested.join(".");
         std::fs::create_dir_all(&nested).unwrap();
 
-        let created = create_sql_file_in_folder(
+        let created = create_sql_file(
             displayed_root.to_string_lossy().into_owned(),
             displayed_directory.to_string_lossy().into_owned(),
             "draft.sql".to_string(),
@@ -435,7 +463,7 @@ mod tests {
         assert_eq!(created, displayed_directory.join("draft.sql").to_string_lossy());
 
         let renamed =
-            rename_sql_file_in_folder(displayed_root.to_string_lossy().into_owned(), created, "report.sql".to_string())
+            rename_sql_file(displayed_root.to_string_lossy().into_owned(), created, "report.sql".to_string())
                 .await
                 .unwrap();
         assert_eq!(renamed, displayed_directory.join("report.sql").to_string_lossy());
@@ -450,7 +478,7 @@ mod tests {
         let source = root.join("draft.sql");
         std::fs::write(&source, "SELECT 1;").unwrap();
 
-        let renamed = rename_sql_file_in_folder(
+        let renamed = rename_sql_file(
             root.to_string_lossy().into_owned(),
             source.to_string_lossy().into_owned(),
             "DRAFT.sql".to_string(),

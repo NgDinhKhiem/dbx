@@ -2,6 +2,14 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+  <!--
+    Required: SQLite connections can load user-configured extensions
+    (`sqlite_extension=` URL parameter, e.g. mod_spatialite / sqlite-vec) with
+    sqlite3_load_extension, i.e. dlopen of third-party dylibs inside the
+    hardened-runtime process (crates/dbx-drivers/src/db/sqlite.rs). Library
+    validation would reject any dylib not signed by DBX's team ID. DuckDB and
+    JDBC/JRE run as separate processes and do not need this.
+  -->
   <key>com.apple.security.cs.disable-library-validation</key>
   <true/>
 </dict>

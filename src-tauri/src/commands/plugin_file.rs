@@ -4,8 +4,10 @@
 //! files dropped onto the window nor stream multi-gigabyte transfers through a
 //! one-shot IPC. The workbench host opens handles through this registry after
 //! the user picked the file in a native dialog or dropped it onto the plugin's
-//! workbench area — both are explicit user consent, and every open goes through
-//! the workbench-host TS layer, which is the only caller of these commands.
+//! workbench area. The backend enforces that consent: `plugin_file_open` only
+//! accepts paths granted by `external_path_access` (backend dialogs, OS drops)
+//! and otherwise asks the user in a native dialog naming the plugin. The
+//! plugin must be installed and ship a UI (workbench) entrypoint.
 //!
 //! Every handle is owned by the plugin that opened it: all operations carry the
 //! caller's plugin id and are rejected unless it matches, and ids come from
@@ -15,12 +17,15 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::Serialize;
 use tauri::State;
 use uuid::Uuid;
+
+use super::external_path_access::{self, AccessKind};
+use dbx_core::connection::AppState;
 
 /// Mirrors the bridge binary cap: one read/write chunk never exceeds it.
 pub const MAX_CHUNK_BYTES: usize = 8 * 1024 * 1024;
@@ -38,9 +43,11 @@ struct OpenFile {
     owner: String,
 }
 
-#[derive(Default)]
+/// Cheap to clone: handles live behind a shared lock so blocking file IO can
+/// run on the blocking pool instead of the main thread.
+#[derive(Default, Clone)]
 pub struct PluginFileState {
-    handles: Mutex<HashMap<String, OpenFile>>,
+    handles: Arc<Mutex<HashMap<String, OpenFile>>>,
 }
 
 impl PluginFileState {
@@ -244,45 +251,80 @@ pub fn close_plugin_file(state: &PluginFileState, plugin_id: &str, handle_id: &s
     })
 }
 
+async fn run_blocking<T: Send + 'static>(job: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(job).await.map_err(|error| format!("plugin file task failed: {error}"))?
+}
+
+/// The caller must be an installed plugin with a workbench UI: only its
+/// workbench bridge can reach these file operations.
+fn plugin_display_name(app_state: &AppState, plugin_id: &str) -> Result<String, String> {
+    let plugin = app_state
+        .plugins
+        .find_plugin(plugin_id)?
+        .ok_or_else(|| "plugin is not installed".to_string())?;
+    if plugin.manifest.entrypoints.ui.is_none() {
+        return Err("plugin has no workbench UI and cannot open local files".to_string());
+    }
+    Ok(if plugin.manifest.name.trim().is_empty() { plugin_id.to_string() } else { plugin.manifest.name.clone() })
+}
+
 #[tauri::command]
-pub fn plugin_file_open(
+pub async fn plugin_file_open(
+    app: tauri::AppHandle,
+    app_state: State<'_, Arc<AppState>>,
     state: State<'_, PluginFileState>,
     plugin_id: String,
     path: String,
     write: Option<bool>,
 ) -> Result<PluginFileHandle, String> {
-    open_plugin_file(&state, &plugin_id, &path, write == Some(true))
+    if plugin_id.trim().is_empty() {
+        return Err("plugin id is required".to_string());
+    }
+    let write = write == Some(true);
+    let plugin_name = {
+        let app_state = app_state.inner().clone();
+        let plugin_id = plugin_id.clone();
+        run_blocking(move || plugin_display_name(&app_state, &plugin_id)).await?
+    };
+    let kind = if write { AccessKind::Write } else { AccessKind::Read };
+    let authorized =
+        external_path_access::ensure_file_access(&app, Path::new(&path), kind, true, Some(&plugin_name)).await?;
+    let state = state.inner().clone();
+    run_blocking(move || open_plugin_file(&state, &plugin_id, &authorized.to_string_lossy(), write)).await
 }
 
 #[tauri::command]
-pub fn plugin_file_read(
+pub async fn plugin_file_read(
     state: State<'_, PluginFileState>,
     plugin_id: String,
     handle_id: String,
     offset: u64,
     length: Option<u32>,
 ) -> Result<PluginFileReadChunk, String> {
-    read_plugin_file_chunk(&state, &plugin_id, &handle_id, offset, length)
+    let state = state.inner().clone();
+    run_blocking(move || read_plugin_file_chunk(&state, &plugin_id, &handle_id, offset, length)).await
 }
 
 #[tauri::command]
-pub fn plugin_file_write(
+pub async fn plugin_file_write(
     state: State<'_, PluginFileState>,
     plugin_id: String,
     handle_id: String,
     offset: u64,
     data_base64: String,
 ) -> Result<PluginFileWriteResult, String> {
-    write_plugin_file_chunk(&state, &plugin_id, &handle_id, offset, &data_base64)
+    let state = state.inner().clone();
+    run_blocking(move || write_plugin_file_chunk(&state, &plugin_id, &handle_id, offset, &data_base64)).await
 }
 
 #[tauri::command]
-pub fn plugin_file_close(
+pub async fn plugin_file_close(
     state: State<'_, PluginFileState>,
     plugin_id: String,
     handle_id: String,
 ) -> Result<(), String> {
-    close_plugin_file(&state, &plugin_id, &handle_id)
+    let state = state.inner().clone();
+    run_blocking(move || close_plugin_file(&state, &plugin_id, &handle_id)).await
 }
 
 #[cfg(test)]

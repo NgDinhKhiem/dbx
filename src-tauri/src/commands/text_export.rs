@@ -36,7 +36,7 @@ pub async fn export_query_result_markdown(request: QueryResultTextExportRequest)
     tauri::async_runtime::spawn_blocking(move || {
         let file_path = request.file_path.clone();
         let content = format_markdown(&request.into_data());
-        std::fs::write(file_path, format!("\u{FEFF}{content}")).map_err(|err| err.to_string())
+        dbx_core::csv_export::write_text_file_with_utf8_bom(file_path, &content)
     })
     .await
     .map_err(|err| err.to_string())?

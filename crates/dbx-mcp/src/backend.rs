@@ -1268,8 +1268,21 @@ impl DbxBackend for LocalBackend {
         let port = tokio::fs::read_to_string(self.data_dir.join("mcp-bridge-port"))
             .await
             .map_err(|_| "DBX is not running. Please start DBX first.".to_string())?;
-        let response = reqwest::Client::new()
-            .post(format!("http://127.0.0.1:{}{}", port.trim(), path))
+        // The desktop bridge requires the per-launch bearer token it writes
+        // (owner-only) next to the port file.
+        let token = tokio::fs::read_to_string(self.data_dir.join("mcp-bridge-token"))
+            .await
+            .map_err(|_| "DBX is not running or is too old for this client. Please restart DBX.".to_string())?;
+        let port = port.trim();
+        if port.parse::<u16>().is_err() {
+            return Err("DBX is not running. Please start DBX first.".to_string());
+        }
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .map_err(|error| format!("Failed to create DBX bridge client: {error}"))?
+            .post(format!("http://127.0.0.1:{port}{path}"))
+            .bearer_auth(token.trim())
             .json(&body)
             .send()
             .await

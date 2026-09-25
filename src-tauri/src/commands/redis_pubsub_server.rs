@@ -5,27 +5,47 @@ use std::{net::Ipv4Addr, net::TcpListener};
 
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Query, State, WebSocketUpgrade};
-use axum::response::IntoResponse;
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use futures::{SinkExt, StreamExt};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tauri::async_runtime::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use dbx_core::connection::AppState;
 
-const DEFAULT_PUBSUB_PORT: u16 = 4224;
+use super::local_auth::{constant_time_eq, is_app_origin, random_token};
+
+/// Ephemeral by default: the webview learns the port (and the per-launch
+/// token) through `redis_pubsub_server_endpoint`, so nothing depends on a
+/// well-known port that other local software or web pages could target.
+const DEFAULT_PUBSUB_PORT: u16 = 0;
 
 pub struct PubSubServerState {
     port: Option<u16>,
+    token: Arc<str>,
     shutdown: CancellationToken,
     task: Mutex<Option<JoinHandle<()>>>,
 }
 
+#[derive(Clone)]
+struct PubSubRouterState {
+    app: Arc<AppState>,
+    token: Arc<str>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PubSubServerEndpoint {
+    port: u16,
+    token: String,
+}
+
 impl PubSubServerState {
     fn unavailable() -> Self {
-        Self { port: None, shutdown: CancellationToken::new(), task: Mutex::new(None) }
+        Self { port: None, token: Arc::from(""), shutdown: CancellationToken::new(), task: Mutex::new(None) }
     }
 
     fn get(&self) -> Result<u16, String> {
@@ -58,10 +78,25 @@ struct PubSubWsParams {
     connection_id: String,
     #[serde(default)]
     monitor: bool,
+    #[serde(default)]
+    token: String,
 }
 
-pub fn build_pubsub_router(state: Arc<AppState>) -> Router {
-    Router::new().route("/api/redis/pubsub/ws", get(ws_handler)).with_state(state)
+fn build_pubsub_router(state: Arc<AppState>, token: Arc<str>) -> Router {
+    Router::new().route("/api/redis/pubsub/ws", get(ws_handler)).with_state(PubSubRouterState { app: state, token })
+}
+
+/// Browsers attach an Origin to every WebSocket handshake, so any web page
+/// can reach a loopback port; only the DBX webview's origin is accepted.
+/// Non-browser clients (no Origin) still need the per-launch token.
+fn pubsub_request_allowed(headers: &HeaderMap, expected_token: &str, token: &str) -> bool {
+    if expected_token.is_empty() || !constant_time_eq(expected_token, token) {
+        return false;
+    }
+    match headers.get(header::ORIGIN) {
+        None => true,
+        Some(origin) => origin.to_str().is_ok_and(is_app_origin),
+    }
 }
 
 fn pubsub_server_port() -> u16 {
@@ -71,6 +106,14 @@ fn pubsub_server_port() -> u16 {
 #[tauri::command]
 pub fn redis_pubsub_server_port(state: tauri::State<'_, PubSubServerState>) -> Result<u16, String> {
     state.get()
+}
+
+/// Port plus the per-launch token the WebSocket handshake must carry.
+#[tauri::command]
+pub fn redis_pubsub_server_endpoint(
+    state: tauri::State<'_, PubSubServerState>,
+) -> Result<PubSubServerEndpoint, String> {
+    Ok(PubSubServerEndpoint { port: state.get()?, token: state.token.to_string() })
 }
 
 fn bind_pubsub_listener(preferred_port: u16) -> Result<TcpListener, String> {
@@ -91,9 +134,14 @@ fn bind_pubsub_listener(preferred_port: u16) -> Result<TcpListener, String> {
 
 async fn ws_handler(
     ws: WebSocketUpgrade,
+    headers: HeaderMap,
     Query(params): Query<PubSubWsParams>,
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+    State(router_state): State<PubSubRouterState>,
+) -> Response {
+    if !pubsub_request_allowed(&headers, &router_state.token, &params.token) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let state = router_state.app;
     let connection_id = params.connection_id;
     ws.on_upgrade(move |socket| async move {
         if params.monitor {
@@ -102,6 +150,7 @@ async fn ws_handler(
             handle_socket(socket, state, connection_id).await;
         }
     })
+    .into_response()
 }
 
 async fn handle_monitor_socket(mut socket: WebSocket, state: Arc<AppState>, connection_id: String) {
@@ -252,7 +301,8 @@ async fn handle_command(sink: &mut redis::aio::PubSubSink, text: &str) -> Result
 /// Start the embedded web server for PubSub WebSocket support.
 /// Runs on a background task using the shared AppState.
 pub fn start_pubsub_server(state: Arc<AppState>) -> PubSubServerState {
-    let router = build_pubsub_router(state);
+    let token: Arc<str> = Arc::from(random_token());
+    let router = build_pubsub_router(state, token.clone());
     let listener = match bind_pubsub_listener(pubsub_server_port()) {
         Ok(listener) => listener,
         Err(error) => {
@@ -272,13 +322,14 @@ pub fn start_pubsub_server(state: Arc<AppState>) -> PubSubServerState {
         return PubSubServerState::unavailable();
     }
 
-    start_pubsub_server_with_listener(listener, addr, router)
+    start_pubsub_server_with_listener(listener, addr, router, token)
 }
 
 fn start_pubsub_server_with_listener(
     listener: TcpListener,
     addr: std::net::SocketAddr,
     router: Router,
+    token: Arc<str>,
 ) -> PubSubServerState {
     let shutdown = CancellationToken::new();
     let shutdown_signal = shutdown.clone();
@@ -298,15 +349,35 @@ fn start_pubsub_server_with_listener(
         }
     });
 
-    PubSubServerState { port: Some(addr.port()), shutdown, task: Mutex::new(Some(task)) }
+    PubSubServerState { port: Some(addr.port()), token, shutdown, task: Mutex::new(Some(task)) }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{bind_pubsub_listener, start_pubsub_server_with_listener};
+    use super::{bind_pubsub_listener, pubsub_request_allowed, start_pubsub_server_with_listener};
+    use axum::http::{header, HeaderMap, HeaderValue};
     use axum::Router;
     use std::net::{Ipv4Addr, TcpListener};
+    use std::sync::Arc;
     use std::time::Duration;
+
+    fn origin(value: &'static str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ORIGIN, HeaderValue::from_static(value));
+        headers
+    }
+
+    #[test]
+    fn websocket_requires_token_and_app_origin() {
+        let token = "a".repeat(64);
+        assert!(pubsub_request_allowed(&origin("tauri://localhost"), &token, &token));
+        assert!(pubsub_request_allowed(&origin("http://tauri.localhost"), &token, &token));
+        assert!(pubsub_request_allowed(&HeaderMap::new(), &token, &token));
+        assert!(!pubsub_request_allowed(&origin("https://evil.example"), &token, &token));
+        assert!(!pubsub_request_allowed(&origin("tauri://localhost"), &token, ""));
+        assert!(!pubsub_request_allowed(&origin("tauri://localhost"), &token, &"b".repeat(64)));
+        assert!(!pubsub_request_allowed(&HeaderMap::new(), "", ""));
+    }
 
     #[test]
     fn falls_back_to_an_available_local_port_when_the_preferred_port_is_in_use() {
@@ -324,7 +395,7 @@ mod tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let addr = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
-        let state = start_pubsub_server_with_listener(listener, addr, Router::new());
+        let state = start_pubsub_server_with_listener(listener, addr, Router::new(), Arc::from("token"));
 
         state.shutdown(Duration::from_secs(1)).await;
 

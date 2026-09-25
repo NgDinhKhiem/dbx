@@ -209,14 +209,9 @@ async function importDirectoryIntoLibrary(targetFolder?: SavedSqlFolder) {
   }
 
   try {
-    const { open } = await import("@tauri-apps/plugin-dialog");
-    const selected = await open({
-      directory: true,
-      multiple: false,
-      recursive: true,
-      title: t("sqlLibrary.importDirectory"),
-    });
-    if (!selected || Array.isArray(selected)) return;
+    // Backend picker: the folder is granted so its files can be listed and read.
+    const selected = await api.pickExternalDirectory(t("sqlLibrary.importDirectory"));
+    if (!selected) return;
 
     const importFiles = await collectSqlFilesRecursively(selected);
     if (importFiles.length === 0) {
