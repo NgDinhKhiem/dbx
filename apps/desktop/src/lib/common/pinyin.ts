@@ -39,7 +39,7 @@ export function preloadPinyinWhenIdle(): void {
   if (pinyinImpl || pinyinLoad || typeof window === "undefined") return;
   const start = () => void loadPinyin().catch((error) => console.warn("[DBX][pinyin] Failed to load pinyin-pro:", error));
   if (typeof window.requestIdleCallback === "function") window.requestIdleCallback(start, { timeout: 10_000 });
-  else window.setTimeout(start, 2_000);
+  else if (typeof globalThis.setTimeout === "function") globalThis.setTimeout(start, 2_000);
 }
 
 const HAN_CHAR = /\p{Script=Han}/u;

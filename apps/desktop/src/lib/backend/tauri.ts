@@ -1,4 +1,5 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
+import { redisPubSubWebSocketUrl } from "@/lib/backend/redisPubSubUrl";
 import type { MongoDumpFormat, MongoDumpSourceInput, MongoDumpCatalog, MongoRestoreSourcePreview, MongoDatabaseDumpRequest, MongoDatabaseRestoreRequest, MongoDatabaseDumpProgress } from "./mongodbDumpTypes";
 import type { MongoRestoreUpload, MongoSourceReadOptions } from "./mongodbDumpTypes";
 import type { UserSkillRootSettings, UserSkillsListResult, UserSkillsReadResult } from "@/types/userSkills";
@@ -3415,11 +3416,6 @@ export async function redisLoadMore(connectionId: string, db: number, keyRaw: st
 
 export async function redisPubSubPublish(connectionId: string, db: number, channel: string, message: string): Promise<{ subscribers: number }> {
   return invoke("redis_pubsub_publish", { connectionId, db, channel, message });
-}
-
-export function redisPubSubWebSocketUrl(endpoint: { port: number; token: string }, connectionId: string, monitor = false): string {
-  const params = new URLSearchParams({ connectionId, monitor: String(monitor), token: endpoint.token });
-  return `ws://127.0.0.1:${endpoint.port}/api/redis/pubsub/ws?${params.toString()}`;
 }
 
 export async function redisPubSubConnect(connectionId: string, monitor = false): Promise<WebSocket> {
