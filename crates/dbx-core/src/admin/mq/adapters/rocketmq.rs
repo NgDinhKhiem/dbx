@@ -10,16 +10,15 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::ToSocketAddrs;
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
 use tokio::time::timeout;
 
-use crate::db::agent_driver::{AgentDriverClient, AgentLaunchSpec};
+use crate::db::agent_driver::AgentLaunchSpec;
+use crate::mq::agent_client::{MqAgentClient, MqAgentConnectPlan};
 use crate::mq::auth::MqAuth;
 use crate::mq::config::MqAdminConfig;
 use crate::mq::port::MessageQueueAdmin;
@@ -70,7 +69,7 @@ const TOPIC_LIST_FALLBACK_PAGE_SIZE: i32 = 200;
 const CONSUMER_GROUP_LIST_PAGE_SIZE: i32 = 500;
 
 pub struct RocketMqAdmin {
-    client: Arc<Mutex<AgentDriverClient>>,
+    client: MqAgentClient,
     config: MqAdminConfig,
 }
 
@@ -105,21 +104,16 @@ impl RocketMqAdmin {
     /// Callers must probe NameServer reachability before invoking this so the
     /// connect-timeout wall covers only process spawn + handshake + connect.
     pub async fn new(cfg: MqAdminConfig, launch: AgentLaunchSpec) -> Result<Self, String> {
-        let mut client = crate::agent_prewarm::spawn_agent_client(launch).await?;
-
         // Handshake / connect use Advanced connect timeout; ops RPC keep query timeout.
-        let _: serde_json::Value =
-            client.call_with_timeout("handshake", serde_json::json!({}), Some(cfg.connect_timeout())).await?;
-
-        // Build the connection params from MqAdminConfig
-        let conn_params = build_connection_params(&cfg);
-        let connect_params = serde_json::json!({ "connection": conn_params });
-        let _: serde_json::Value =
-            client.call_with_timeout("connect", connect_params, Some(cfg.connect_timeout())).await?;
+        let plan = MqAgentConnectPlan {
+            connect_params: serde_json::json!({ "connection": build_connection_params(&cfg) }),
+            timeout: Some(cfg.connect_timeout()),
+        };
+        let client = MqAgentClient::connect("rocketmq", launch, plan).await?;
 
         log::info!("RocketMQ admin connected via agent (namesrv: {})", namesrv_addr(&cfg));
 
-        Ok(Self { client: Arc::new(Mutex::new(client)), config: cfg })
+        Ok(Self { client, config: cfg })
     }
 
     /// Send a JSON-RPC call to the RocketMQ agent and deserialize the result.
@@ -128,8 +122,7 @@ impl RocketMqAdmin {
         method: &str,
         params: serde_json::Value,
     ) -> Result<T, String> {
-        let mut client = self.client.lock().await;
-        client.call_with_timeout(method, params, self.config.rpc_timeout()).await
+        self.client.call(method, params, self.config.rpc_timeout()).await
     }
 
     /// Send a JSON-RPC call that returns `{ok: true}` on success.

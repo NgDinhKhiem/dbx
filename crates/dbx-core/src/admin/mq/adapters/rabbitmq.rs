@@ -7,13 +7,11 @@
 //! 2. Perform JSON-RPC handshake + connect
 //! 3. Delegate all `MessageQueueAdmin` trait methods to JSON-RPC calls
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
-use tokio::sync::Mutex;
 
-use crate::db::agent_driver::{AgentDriverClient, AgentLaunchSpec};
+use crate::db::agent_driver::AgentLaunchSpec;
+use crate::mq::agent_client::{MqAgentClient, MqAgentConnectPlan};
 use crate::mq::auth::MqAuth;
 use crate::mq::config::MqAdminConfig;
 use crate::mq::port::MessageQueueAdmin;
@@ -54,27 +52,22 @@ const RABBITMQ_CAPABILITIES: MqCapabilities = MqCapabilities {
 };
 
 pub struct RabbitMqAdmin {
-    client: Arc<Mutex<AgentDriverClient>>,
+    client: MqAgentClient,
     config: MqAdminConfig,
 }
 
 impl RabbitMqAdmin {
     /// Spawn the RabbitMQ native agent, perform handshake, and connect.
     pub async fn new(cfg: MqAdminConfig, launch: AgentLaunchSpec) -> Result<Self, String> {
-        let mut client = crate::agent_prewarm::spawn_agent_client(launch).await?;
-
-        // Handshake
-        let _: serde_json::Value =
-            client.call_with_timeout("handshake", serde_json::json!({}), cfg.rpc_timeout()).await?;
-
-        // Build the connection params from MqAdminConfig
-        let conn_params = build_connection_params(&cfg)?;
-        let connect_params = serde_json::json!({ "connection": conn_params });
-        let _: serde_json::Value = client.call_with_timeout("connect", connect_params, cfg.rpc_timeout()).await?;
+        let plan = MqAgentConnectPlan {
+            connect_params: serde_json::json!({ "connection": build_connection_params(&cfg)? }),
+            timeout: cfg.rpc_timeout(),
+        };
+        let client = MqAgentClient::connect("rabbitmq", launch, plan).await?;
 
         log::info!("RabbitMQ admin connected via agent (addresses: {})", addresses(&cfg));
 
-        Ok(Self { client: Arc::new(Mutex::new(client)), config: cfg })
+        Ok(Self { client, config: cfg })
     }
 
     /// Send a JSON-RPC call to the RabbitMQ agent and deserialize the result.
@@ -83,8 +76,7 @@ impl RabbitMqAdmin {
         method: &str,
         params: serde_json::Value,
     ) -> Result<T, String> {
-        let mut client = self.client.lock().await;
-        client.call_with_timeout(method, params, self.config.rpc_timeout()).await
+        self.client.call(method, params, self.config.rpc_timeout()).await
     }
 
     /// Send a JSON-RPC call that returns `{ok: true}` on success.

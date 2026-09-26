@@ -37,6 +37,8 @@ pub const MAX_TOPIC_ROWS: usize = 200;
 pub const MAX_GROUP_ROWS: usize = 200;
 pub const MAX_LAG_ROWS: usize = 200;
 pub const MAX_PARTITION_ROWS: usize = 500;
+/// Groups listed with their error in `dbx_kafka_lag` when offsets failed to load.
+pub const MAX_GROUP_ERROR_ROWS: usize = 20;
 pub const THROUGHPUT_DEFAULT_SECONDS: u64 = 10;
 pub const THROUGHPUT_MIN_SECONDS: u64 = 2;
 pub const THROUGHPUT_MAX_SECONDS: u64 = 60;
@@ -595,13 +597,14 @@ pub fn aggregate_lag(snapshot: &KafkaConsumerGroupSnapshot, group: Option<&str>)
 pub fn shape_lag(snapshot: &KafkaConsumerGroupSnapshot, group: Option<&str>, limit: usize) -> Value {
     let rows = aggregate_lag(snapshot, group);
     let groups = rows.iter().map(|row| row.group.as_str()).collect::<BTreeSet<_>>();
-    let idle_groups = snapshot
-        .groups
-        .iter()
-        .filter(|candidate| group.is_none_or(|group| candidate.group_id == group))
-        .filter(|candidate| candidate.partitions.is_empty())
+    let in_scope =
+        || snapshot.groups.iter().filter(move |candidate| group.is_none_or(|group| candidate.group_id == group));
+    // A group whose offsets failed to load is not idle; report it separately.
+    let idle_groups = in_scope()
+        .filter(|candidate| candidate.partitions.is_empty() && candidate.error.is_none())
         .map(|candidate| candidate.group_id.as_str())
         .collect::<Vec<_>>();
+    let failed_groups = in_scope().filter(|candidate| candidate.error.is_some()).collect::<Vec<_>>();
     let mut output = json!({
         "total_lag": rows.iter().filter_map(|row| row.total_lag).sum::<i64>(),
         "groups": groups.len(),
@@ -612,6 +615,14 @@ pub fn shape_lag(snapshot: &KafkaConsumerGroupSnapshot, group: Option<&str>, lim
     });
     if !idle_groups.is_empty() {
         output["groups_without_offsets"] = json!(idle_groups);
+    }
+    if !failed_groups.is_empty() {
+        output["groups_with_errors"] = json!(failed_groups.len());
+        output["group_errors"] = json!(failed_groups
+            .iter()
+            .take(MAX_GROUP_ERROR_ROWS)
+            .map(|failed| json!({ "group": failed.group_id, "error": failed.error }))
+            .collect::<Vec<_>>());
     }
     put_note(&mut output, truncation_note(limit.min(rows.len()), rows.len(), "group/topic rows"));
     output
@@ -988,6 +999,26 @@ mod tests {
         assert_eq!(shaped["rows"][0]["max_partition_lag"], 1000);
         assert_eq!(shaped["truncated"], true);
         assert!(shaped["hint"].as_str().unwrap().contains("max_partition_lag"));
+        assert!(shaped.get("groups_with_errors").is_none(), "no error fields when every group loaded");
+    }
+
+    #[test]
+    fn lag_reports_groups_whose_offsets_failed_apart_from_idle_groups() {
+        let failed = KafkaConsumerGroupSummary {
+            error: Some("Committed offsets unavailable: TimeoutException".into()),
+            ..group("broken", Vec::new())
+        };
+        let snap = snapshot(vec![group("idle", Vec::new()), failed, group("ok", vec![partition("t", 0, 1, 3)])]);
+
+        let shaped = shape_lag(&snap, None, 10);
+        assert_eq!(shaped["groups_without_offsets"], json!(["idle"]));
+        assert_eq!(shaped["groups_with_errors"], 1);
+        assert_eq!(shaped["group_errors"][0]["group"], "broken");
+        assert!(shaped["group_errors"][0]["error"].as_str().unwrap().contains("Committed offsets unavailable"));
+        assert_eq!(shaped["total_lag"], 2);
+
+        let scoped = shape_lag(&snap, Some("ok"), 10);
+        assert!(scoped.get("groups_with_errors").is_none(), "errors outside the requested group are not reported");
     }
 
     fn sample(at_ms: u64, groups: Vec<KafkaConsumerGroupSummary>) -> ThroughputSample {
