@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { parseDashboardsPatterns } from "../dashboardsPatterns";
 import { clampColumnWidth, discoverTableMinWidth, sanitizeColumnWidths, withColumnWidth } from "@/lib/elasticsearch/discover/columnWidths";
 import { computeTopValues, fieldSegments, flattenSource, formatFieldValue, getHitFieldValue, HIGHLIGHT_POST_TAG, HIGHLIGHT_PRE_TAG, hitJson, parseHighlight, sourceSummary, truncateSegments } from "../documents";
 import { extractErrorInfo } from "../errors";
@@ -316,5 +317,36 @@ describe("discover column widths", () => {
 
   it("keeps room for auto-sized columns in the table minimum width", () => {
     expect(discoverTableMinWidth(24, [192, undefined, 300])).toBe(24 + 192 + 160 + 300);
+  });
+});
+
+describe("Dashboards index patterns", () => {
+  it("parses saved patterns, de-duplicates tenant copies and resolves the default", () => {
+    const body = JSON.stringify({
+      hits: {
+        hits: [
+          { _id: "index-pattern:a", _source: { type: "index-pattern", "index-pattern": { title: "logs-*" } } },
+          { _id: "index-pattern:b", _source: { type: "index-pattern", "index-pattern": { title: "logs-*", timeFieldName: "@timestamp" } } },
+          { _id: "index-pattern:c", _source: { type: "index-pattern", "index-pattern": { title: "metrics-*", timeFieldName: "ts" } } },
+          { _id: "index-pattern:d", _source: { type: "index-pattern", "index-pattern": { title: "" } } },
+          { _id: "config:1", _source: { type: "config", config: { defaultIndex: "c" } } },
+        ],
+      },
+    });
+    expect(parseDashboardsPatterns(body)).toEqual({
+      patterns: [
+        { title: "logs-*", timeField: "@timestamp" },
+        { title: "metrics-*", timeField: "ts" },
+      ],
+      defaultTitle: "metrics-*",
+    });
+    expect(parseDashboardsPatterns("not json")).toEqual({ patterns: [] });
+    expect(parseDashboardsPatterns("{}")).toEqual({ patterns: [] });
+  });
+
+  it("lists saved patterns before derived ones without duplicates", () => {
+    const suggestions = indexPatternSuggestions({ indices: ["logs-local-2026.09.24", "logs-local-2026.09.25"], aliases: [], dashboardsPatterns: [{ title: "logs-local-*", timeField: "@timestamp" }], typed: "" });
+    expect(suggestions[0]).toEqual({ value: "logs-local-*", kind: "dashboards", timeField: "@timestamp" });
+    expect(suggestions.filter((item) => item.value === "logs-local-*")).toHaveLength(1);
   });
 });

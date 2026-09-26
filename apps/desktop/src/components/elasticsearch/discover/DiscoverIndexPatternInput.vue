@@ -1,13 +1,15 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import { Database, LoaderCircle } from "@lucide/vue";
+import { Database, LayoutDashboard, LoaderCircle } from "@lucide/vue";
 import { indexPatternSuggestions, type IndexSuggestion } from "@/lib/elasticsearch/discover/indexPatterns";
 
 const props = defineProps<{
   modelValue: string;
   indices: readonly string[];
   aliases: readonly string[];
+  /** Index patterns saved in OpenSearch Dashboards / Kibana. */
+  dashboardsPatterns?: readonly { title: string; timeField?: string }[];
   loading?: boolean;
 }>();
 
@@ -28,7 +30,7 @@ watch(
   },
 );
 
-const suggestions = computed<IndexSuggestion[]>(() => (open.value ? indexPatternSuggestions({ indices: props.indices, aliases: props.aliases, typed: draft.value === props.modelValue ? "" : draft.value, limit: 60 }) : []));
+const suggestions = computed<IndexSuggestion[]>(() => (open.value ? indexPatternSuggestions({ indices: props.indices, aliases: props.aliases, dashboardsPatterns: props.dashboardsPatterns, typed: draft.value === props.modelValue ? "" : draft.value, limit: 60 }) : []));
 
 function showList() {
   if (!open.value) emit("open");
@@ -106,9 +108,11 @@ function onBlur() {
         :class="index === activeIndex ? 'bg-muted' : ''"
         @mousedown.prevent="commit(item.value)"
       >
+        <LayoutDashboard v-if="item.kind === 'dashboards'" class="size-3 shrink-0 text-primary" />
         <span class="min-w-0 flex-1 truncate font-mono">{{ item.value }}</span>
-        <span class="shrink-0 text-[10px] text-muted-foreground">
-          {{ item.kind === "pattern" ? t("esDiscover.patternMatches", { count: item.matches ?? 0 }) : item.kind === "alias" ? t("esDiscover.alias") : t("esDiscover.index") }}
+        <span class="shrink-0 text-[10px] text-muted-foreground" :data-testid="item.kind === 'dashboards' ? 'discover-dashboards-pattern' : undefined">
+          <template v-if="item.kind === 'dashboards'">{{ item.timeField ? t("esDiscover.dashboardsPatternTime", { field: item.timeField }) : t("esDiscover.dashboardsPattern") }}</template>
+          <template v-else>{{ item.kind === "pattern" ? t("esDiscover.patternMatches", { count: item.matches ?? 0 }) : item.kind === "alias" ? t("esDiscover.alias") : t("esDiscover.index") }}</template>
         </span>
       </button>
     </div>

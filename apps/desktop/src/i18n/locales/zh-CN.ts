@@ -4340,6 +4340,8 @@ export default withEnglishFallback({
     },
   },
   esDiscover: {
+    dashboardsPattern: "Dashboards",
+    dashboardsPatternTime: "Dashboards · {field}",
     resizeColumn: "调整列宽：{column}",
     resizeColumnHint: "拖动调整列宽，双击恢复",
     indexPattern: "索引模式",

@@ -1,10 +1,12 @@
-export type IndexSuggestionKind = "pattern" | "index" | "alias";
+export type IndexSuggestionKind = "dashboards" | "pattern" | "index" | "alias";
 
 export interface IndexSuggestion {
   value: string;
   kind: IndexSuggestionKind;
   /** Number of indices a derived wildcard pattern matches. */
   matches?: number;
+  /** Time field of a pattern saved in Dashboards. */
+  timeField?: string;
 }
 
 /**
@@ -41,6 +43,8 @@ export function matchesIndexPattern(name: string, pattern: string): boolean {
 export interface SuggestionInput {
   indices: readonly string[];
   aliases: readonly string[];
+  /** Index patterns saved in OpenSearch Dashboards / Kibana, listed first. */
+  dashboardsPatterns?: readonly { title: string; timeField?: string }[];
   typed: string;
   limit?: number;
 }
@@ -50,7 +54,7 @@ export interface SuggestionInput {
  * first (most indices first), then aliases, then concrete indices. Hidden
  * (dot-prefixed) names only show when the typed text starts with a dot.
  */
-export function indexPatternSuggestions({ indices, aliases, typed, limit = 50 }: SuggestionInput): IndexSuggestion[] {
+export function indexPatternSuggestions({ indices, aliases, dashboardsPatterns = [], typed, limit = 50 }: SuggestionInput): IndexSuggestion[] {
   const needle = typed.trim().replace(/\*/g, "").toLowerCase();
   const showHidden = needle.startsWith(".");
   const visible = (name: string) => showHidden || !name.startsWith(".");
@@ -80,5 +84,8 @@ export function indexPatternSuggestions({ indices, aliases, typed, limit = 50 }:
     .filter((index) => visible(index) && matchesNeedle(index))
     .sort()
     .map((value) => ({ value, kind: "index" }));
-  return [...patterns, ...aliasSuggestions, ...indexSuggestions].slice(0, limit);
+  const saved: IndexSuggestion[] = dashboardsPatterns.filter((pattern) => matchesNeedle(pattern.title)).map((pattern) => ({ value: pattern.title, kind: "dashboards" as const, ...(pattern.timeField ? { timeField: pattern.timeField } : {}) }));
+  const savedValues = new Set(saved.map((item) => item.value));
+  const derived = patterns.filter((item) => !savedValues.has(item.value));
+  return [...saved, ...derived, ...aliasSuggestions, ...indexSuggestions].slice(0, limit);
 }

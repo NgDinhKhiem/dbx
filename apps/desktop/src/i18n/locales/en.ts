@@ -4364,6 +4364,8 @@ export default {
     },
   },
   esDiscover: {
+    dashboardsPattern: "Dashboards",
+    dashboardsPatternTime: "Dashboards · {field}",
     resizeColumn: "Resize column {column}",
     resizeColumnHint: "Drag to resize, double-click to reset",
     indexPattern: "Index pattern",

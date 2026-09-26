@@ -59,7 +59,11 @@ function ok(body: unknown, tookMs = 5): RawResponse {
   return { status: 200, body: JSON.stringify(body), tookMs };
 }
 
+/** Saved objects returned for the Dashboards index-pattern lookup; `null` means no Dashboards (404). */
+let dashboardsHits: unknown[] | null = null;
+
 function route(_connectionId: string, request: RawRequest): Promise<RawResponse> {
+  if (request.path.startsWith("/.kibana")) return Promise.resolve(dashboardsHits ? ok({ hits: { hits: dashboardsHits } }) : { status: 404, body: '{"error":"index_not_found_exception"}', tookMs: 1 });
   if (request.path === "/") return Promise.resolve(ok({ version: { distribution: "opensearch", number: "1.3.19" } }));
   if (request.path.endsWith("/_mapping")) return Promise.resolve(ok(MAPPING));
   if (request.path.startsWith("/_cat/indices")) return Promise.resolve(ok([{ index: "logs-local-2026.09.24" }, { index: "logs-local-2026.09.25" }]));
@@ -142,6 +146,7 @@ beforeEach(() => {
   backend.elasticsearchRawRequest.mockReset();
   backend.elasticsearchRawRequest.mockImplementation(route);
   searchHandler = () => ok(searchResponse());
+  dashboardsHits = null;
 });
 
 afterEach(() => {
@@ -352,6 +357,39 @@ describe("ElasticsearchDiscover", () => {
       handle.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", shiftKey: true, bubbles: true }));
       await flush();
       expect(stateChanges.at(-1)?.columnWidths).toEqual({ level: 152 });
+    });
+  });
+
+  describe("Dashboards index patterns", () => {
+    const savedObjects = [
+      { _id: "index-pattern:p1", _source: { type: "index-pattern", "index-pattern": { title: "logs-*", timeFieldName: "@timestamp" } } },
+      { _id: "index-pattern:p2", _source: { type: "index-pattern", "index-pattern": { title: "logs-local-*", timeFieldName: "@timestamp" } } },
+      { _id: "config:1.3.19", _source: { type: "config", config: { defaultIndex: "p2" } } },
+    ];
+
+    it("opens on the Dashboards default index pattern when none is set", async () => {
+      dashboardsHits = savedObjects;
+      await mountDiscover();
+      expect(lastSearch()?.path).toBe("/logs-local-*/_search");
+      expect(JSON.stringify(lastSearch()?.body)).toContain("@timestamp");
+    });
+
+    it("lists saved patterns first in the index pattern suggestions", async () => {
+      dashboardsHits = savedObjects;
+      const { container } = await mountDiscover(baseState({ indexPattern: "transactions" }));
+      const input = query(container, "[data-testid=discover-index-pattern]") as HTMLInputElement;
+      input.dispatchEvent(new Event("focus"));
+      await flush();
+      const badges = [...container.querySelectorAll("[data-testid=discover-dashboards-pattern]")].map((element) => element.closest("button")?.textContent?.replace(/\s+/g, " ").trim());
+      expect(badges.length).toBe(2);
+      expect(badges[0]).toContain("logs-*");
+      expect(badges[0]).toContain("@timestamp");
+    });
+
+    it("works without Dashboards", async () => {
+      const { container } = await mountDiscover();
+      expect(searchCalls()).toHaveLength(0);
+      expect(container.querySelector("[data-testid=discover-index-pattern]")).not.toBeNull();
     });
   });
 });

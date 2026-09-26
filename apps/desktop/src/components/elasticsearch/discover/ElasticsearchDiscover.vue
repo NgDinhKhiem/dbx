@@ -14,6 +14,7 @@ import DiscoverIndexPatternInput from "./DiscoverIndexPatternInput.vue";
 import DiscoverTabularResult from "./DiscoverTabularResult.vue";
 import DiscoverTimeRangePicker from "./DiscoverTimeRangePicker.vue";
 import { detectDistribution, discoverRequest, encodeIndexPattern, isSuccessStatus } from "@/lib/elasticsearch/discover/discoverApi";
+import { DASHBOARDS_PATTERNS_PATH, dashboardsPatternsRequestBody, parseDashboardsPatterns, type DashboardsIndexPattern, type DashboardsPatternsResult } from "@/lib/elasticsearch/discover/dashboardsPatterns";
 import { DqlSyntaxError, formatDqlErrorPointer } from "@/lib/elasticsearch/discover/dql";
 import { errorFromUnknown, extractErrorInfo, type DiscoverErrorInfo } from "@/lib/elasticsearch/discover/errors";
 import { dateFieldNames, defaultTimeField, fieldsFromMappingResponse, withUnmappedFields } from "@/lib/elasticsearch/discover/mapping";
@@ -56,6 +57,9 @@ const columnWidths = ref<Record<string, number>>(sanitizeColumnWidths(initial?.c
 let distributionPromise: Promise<ClusterDistribution> | null = null;
 const indices = shallowRef<string[]>([]);
 const aliases = shallowRef<string[]>([]);
+/** Index patterns saved in OpenSearch Dashboards / Kibana (best effort). */
+const dashboardsPatterns = shallowRef<DashboardsIndexPattern[]>([]);
+let dashboardsPatternsLoad: Promise<DashboardsPatternsResult> | null = null;
 const indicesLoading = ref(false);
 let indicesLoadedAt = 0;
 const mappingFields = shallowRef<DiscoverField[]>([]);
@@ -133,7 +137,20 @@ function ensureDistribution(): Promise<ClusterDistribution> {
   return distributionPromise;
 }
 
+function loadDashboardsPatterns(): Promise<DashboardsPatternsResult> {
+  dashboardsPatternsLoad ??= discoverRequest(props.connectionId, { method: "POST", path: DASHBOARDS_PATTERNS_PATH, body: dashboardsPatternsRequestBody() })
+    .then((response) => (isSuccessStatus(response.status) ? parseDashboardsPatterns(response.body) : { patterns: [] }))
+    // No Dashboards, or no read access to its saved objects: plain suggestions only.
+    .catch(() => ({ patterns: [] }))
+    .then((result) => {
+      if (!disposed) dashboardsPatterns.value = markRaw(result.patterns);
+      return result;
+    });
+  return dashboardsPatternsLoad;
+}
+
 async function loadIndices() {
+  void loadDashboardsPatterns();
   if (indicesLoading.value || Date.now() - indicesLoadedAt < 30_000) return;
   indicesLoading.value = true;
   try {
@@ -326,6 +343,9 @@ async function loadMore() {
 
 // ---- user actions ------------------------------------------------------------------
 async function setIndexPattern(value: string) {
+  // A pattern saved in Dashboards brings its time field along.
+  const saved = dashboardsPatterns.value.find((pattern) => pattern.title === value);
+  if (saved?.timeField) timeFieldChoice.value = saved.timeField;
   indexPattern.value = value;
   resetResults();
   await loadMapping();
@@ -410,9 +430,14 @@ function onHistogramZoom(range: { from: string; to: string }) {
 onMounted(async () => {
   void ensureDistribution();
   if (indexPattern.value.trim()) {
+    void loadDashboardsPatterns();
     await loadMapping();
     await runSearch();
+    return;
   }
+  // Like Dashboards: without a pattern, start on its default index pattern.
+  const saved = await loadDashboardsPatterns();
+  if (!disposed && !indexPattern.value.trim() && saved.defaultTitle) await setIndexPattern(saved.defaultTitle);
 });
 
 onBeforeUnmount(() => {
@@ -428,7 +453,7 @@ defineExpose({ runSearch, state });
   <div class="flex h-full min-h-0 flex-col bg-background text-foreground" data-testid="elasticsearch-discover">
     <!-- Top bar -->
     <div class="flex shrink-0 flex-wrap items-center gap-2 border-b border-border px-2 py-2">
-      <DiscoverIndexPatternInput class="w-64 shrink-0" :model-value="indexPattern" :indices="indices" :aliases="aliases" :loading="indicesLoading || mappingLoading" @open="loadIndices" @update:model-value="setIndexPattern" />
+      <DiscoverIndexPatternInput class="w-64 shrink-0" :model-value="indexPattern" :indices="indices" :aliases="aliases" :dashboards-patterns="dashboardsPatterns" :loading="indicesLoading || mappingLoading" @open="loadIndices" @update:model-value="setIndexPattern" />
       <Select v-if="docMode" v-model="timeFieldSelectValue">
         <SelectTrigger size="sm" class="h-8 w-40 text-xs" :title="t('esDiscover.timeField')" data-testid="discover-time-field">
           <SelectValue />
