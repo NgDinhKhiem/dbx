@@ -327,10 +327,15 @@ async fn initializes_lists_tools_and_calls_a_tool() {
 
     let tools = client.peer().list_tools(None).await.expect("list tools");
     let names = tools.tools.iter().map(|tool| tool.name.as_ref()).collect::<Vec<_>>();
+    // Core tools, counted apart from the per-system observability families
+    // (dbx_kafka_*, dbx_opensearch_*), which their own tests enumerate.
+    let core =
+        names.iter().filter(|name| !name.starts_with("dbx_kafka_") && !name.starts_with("dbx_opensearch_")).count();
+    let kafka = names.iter().filter(|name| name.starts_with("dbx_kafka_")).count();
     #[cfg(feature = "mq-admin")]
-    assert_eq!(names.len(), 22);
+    assert_eq!((core, kafka), (22, 8));
     #[cfg(not(feature = "mq-admin"))]
-    assert_eq!(names.len(), 20);
+    assert_eq!((core, kafka), (20, 0));
     #[cfg(feature = "mq-admin")]
     assert!(names.contains(&"dbx_peek_messages"));
     #[cfg(not(feature = "mq-admin"))]

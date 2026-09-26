@@ -1025,6 +1025,7 @@ fn topic_info_from_agent_value(topic: &serde_json::Value) -> TopicInfo {
         short_name: name,
         partitioned: false,
         partitions: None,
+        replication_factor: None,
         persistent: topic.get("durable").and_then(|value| value.as_bool()).unwrap_or(true),
         internal: topic.get("internal").and_then(|value| value.as_bool()).unwrap_or(false),
         message_type: None,

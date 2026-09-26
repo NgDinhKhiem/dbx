@@ -1231,13 +1231,20 @@ async fn send_opensearch_sql_request(
 /// to an error from the SQL plugin (which always carries `error.details`, even
 /// for a 404 `IndexNotFoundException`).
 fn opensearch_sql_endpoint_missing(status: StatusCode, body: &str) -> bool {
+    opensearch_query_endpoint_missing(status.as_u16(), body)
+}
+
+/// [`opensearch_sql_endpoint_missing`] for raw responses: true when a
+/// `_plugins/_sql` / `_plugins/_ppl` request failed because the endpoint does
+/// not exist (use the `_opendistro` path instead).
+pub fn opensearch_query_endpoint_missing(status: u16, body: &str) -> bool {
     let plugin_error = serde_json::from_str::<serde_json::Value>(body)
         .ok()
         .is_some_and(|body| body.pointer("/error/details").is_some());
     if plugin_error {
         return false;
     }
-    match status.as_u16() {
+    match status {
         404 => true,
         // Without the plugin, `_plugins` is parsed as an index name or has no handler.
         400 | 405 => body.contains("_plugins") || body.contains("no handler found"),
@@ -2571,7 +2578,8 @@ fn search_query_request_is_read_only(language: SearchQueryLanguage, path: &str, 
     })
 }
 
-fn strip_leading_sql_comments(input: &str) -> &str {
+/// Skips leading `--` and `/* */` comments and whitespace.
+pub fn strip_leading_sql_comments(input: &str) -> &str {
     let mut rest = input;
     loop {
         rest = rest.trim_start();
@@ -2593,7 +2601,8 @@ fn sql_statement_is_read_only(query: &str) -> bool {
     matches!(leading_word(strip_leading_sql_comments(query)).as_str(), "select" | "show" | "describe" | "desc")
 }
 
-fn ppl_query_is_read_only(query: &str) -> bool {
+/// Whether a PPL query only reads (`source`/`search`/`describe`/`show`, no ML commands).
+pub fn ppl_query_is_read_only(query: &str) -> bool {
     let mut commands = query.split('|');
     let first = commands.next().map(leading_word).unwrap_or_default();
     // `ml`, `kmeans` and `ad` train or run ML models on the cluster.

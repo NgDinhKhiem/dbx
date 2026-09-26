@@ -320,6 +320,9 @@ pub struct TopicInfo {
     pub partitioned: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partitions: Option<u32>,
+    /// Kafka: replicas per partition (from the first partition's replica list).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replication_factor: Option<u32>,
     pub persistent: bool,
     /// Kafka/RocketMQ internal or system topic; hidden by default in the MQ console UI.
     #[serde(default)]

@@ -226,6 +226,7 @@ impl MessageQueueAdmin for KafkaAdmin {
             .map(|t| {
                 let name = t.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
                 let partitions = t.get("partitions").and_then(|v| v.as_u64()).map(|v| v as u32);
+                let replication_factor = t.get("replicationFactor").and_then(|v| v.as_u64()).map(|v| v as u32);
                 TopicInfo {
                     name: name.clone(),
                     short_name: name,
@@ -234,6 +235,7 @@ impl MessageQueueAdmin for KafkaAdmin {
                     // topics (fixes t8y2/dbx#6208).
                     partitioned: partitions.map(|p| p > 0).unwrap_or(false),
                     partitions,
+                    replication_factor,
                     persistent: true,
                     internal: t.get("internal").and_then(|v| v.as_bool()).unwrap_or(false),
                     message_type: None,
@@ -1496,5 +1498,70 @@ for line in sys.stdin:
         let topics = result.expect("topic listing should wait for the agent response");
         assert_eq!(topics.len(), 1);
         assert_eq!(topics[0].name, "delayed");
+    }
+    /// The observability tools read these adapter results; this pins the agent
+    /// payload fields they rely on (replication factor, per-partition offsets,
+    /// topic configs, group snapshot) against a fake agent.
+    #[tokio::test]
+    async fn observability_reads_map_agent_payloads() {
+        let script_path = std::env::temp_dir().join(format!("dbx-kafka-observe-{}.py", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &script_path,
+            r#"import json
+import sys
+
+print(json.dumps({"ready": True}), flush=True)
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request["method"]
+    if method == "mq_list_topics":
+        result = {"topics": [{"name": "orders", "partitions": 3, "replicationFactor": 2, "internal": False}]}
+    elif method == "mq_get_topic_stats":
+        result = {"name": request["params"]["name"], "partitions": 1, "replicationFactor": 1, "totalMessages": 7,
+                  "partitionStats": [{"partition": 0, "leader": 1, "replicas": [1], "isr": [1],
+                                      "beginOffset": 3, "endOffset": 10, "messageCount": 7}]}
+    elif method == "mq_get_topic_config":
+        result = {"configs": {"cleanup.policy": {"value": "delete", "source": "DEFAULT_CONFIG",
+                                                 "isSensitive": False, "isReadOnly": False, "isDefault": True}}}
+    elif method == "mq_get_consumer_group_snapshot":
+        result = {"groups": [{"groupId": "g", "state": "STABLE", "simpleGroup": False, "memberCount": 1,
+                              "topics": ["orders"], "totalLag": 4, "lagAvailable": True,
+                              "partitions": [{"topic": "orders", "partition": 0, "currentOffset": 6,
+                                              "endOffset": 10, "lag": 4}], "error": None}]}
+    else:
+        result = None
+    reply = {"jsonrpc": "2.0", "id": request["id"]}
+    if result is None:
+        reply["error"] = {"code": -1, "message": "unexpected " + method}
+    else:
+        reply["result"] = result
+    print(json.dumps(reply), flush=True)
+"#,
+        )
+        .expect("write test agent script");
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let client = AgentDriverClient::spawn(
+            AgentLaunchSpec::new(python).with_args([script_path.to_string_lossy().to_string()]),
+        )
+        .await
+        .expect("spawn test agent");
+        let config = kafka_config(serde_json::json!({ "bootstrapServers": "broker:9092" }), MqAuth::None, false);
+        let admin =
+            KafkaAdmin { client: Arc::new(Mutex::new(client)), config, acl_enabled: tokio::sync::OnceCell::new() };
+
+        let ns = NamespaceRef { tenant: "_kafka".to_string(), namespace: "default".to_string() };
+        let topics = admin.list_topics(&ns, ListTopicsOpts::default()).await.expect("topics");
+        let stats = admin.get_topic_stats(&topic_ref()).await.expect("stats");
+        let config = admin.get_topic_internal_stats(&topic_ref()).await.expect("config");
+        let groups = admin.get_kafka_consumer_group_snapshot().await.expect("groups");
+        drop(admin);
+        let _ = std::fs::remove_file(&script_path);
+
+        assert_eq!(topics[0].partitions, Some(3));
+        assert_eq!(topics[0].replication_factor, Some(2));
+        assert_eq!(stats.raw["partitionStats"][0]["beginOffset"], 3);
+        assert_eq!(stats.msg_in_counter, 7);
+        assert_eq!(config["configs"]["cleanup.policy"]["value"], "delete");
+        assert_eq!(groups.groups[0].partitions[0].lag, Some(4));
     }
 }

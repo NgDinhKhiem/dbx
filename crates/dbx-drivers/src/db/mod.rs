@@ -19,7 +19,9 @@ pub mod dynamodb_driver;
 #[path = "dynamodb_driver_disabled.rs"]
 pub mod dynamodb_driver;
 pub mod easysearch_driver;
+pub mod elasticsearch_dql;
 pub mod elasticsearch_driver;
+pub mod elasticsearch_mcp;
 pub mod elasticsearch_sql;
 pub mod file_validator;
 pub mod hbase_driver;

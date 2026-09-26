@@ -13,6 +13,7 @@
 pub mod adapters;
 pub mod auth;
 pub mod config;
+pub mod kafka_observability;
 pub mod port;
 pub mod service;
 pub mod token;
