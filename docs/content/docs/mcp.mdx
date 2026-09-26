@@ -111,6 +111,20 @@ DBX MCP provides the following tools (availability depends on build features and
 | `dbx_execute_redis_command` | Execute a Redis command |
 | `dbx_peek_messages` | Read Kafka messages without committing consumer offsets |
 | `dbx_send_message` | Send a message to a supported message queue topic or queue |
+| `dbx_kafka_cluster` | Kafka cluster overview: controller, brokers, topic count |
+| `dbx_kafka_list_topics` | Kafka topics with partition and replica counts |
+| `dbx_kafka_describe_topic` | Per-partition leader, replicas, ISR, start/end offsets and message count |
+| `dbx_kafka_topic_config` | Topic configuration (retention, cleanup policy, …), overrides first |
+| `dbx_kafka_list_consumer_groups` | Consumer groups with state, members and total lag |
+| `dbx_kafka_consumer_group` | Committed offset, end offset and lag per partition for one group |
+| `dbx_kafka_lag` | Lag for every group and topic, worst first, with `max_partition_lag` |
+| `dbx_kafka_throughput` | Produced/consumed msg/s over a sample and a status (caught up, stalled, falling behind, catching up, keeping pace) |
+| `dbx_opensearch_list_indices` | Dashboards/Kibana index patterns first, then concrete indices |
+| `dbx_opensearch_resolve_pattern` | Expand an index pattern into indices and aliases |
+| `dbx_opensearch_fields` | Fields of a pattern with type, searchable and aggregatable |
+| `dbx_opensearch_search` | DQL or Lucene search within a time window (default: last hour) |
+| `dbx_opensearch_sql` | Read-only SQL (`_plugins/_sql` on OpenSearch, `_sql` on Elasticsearch) |
+| `dbx_opensearch_ppl` | Piped Processing Language (OpenSearch) within a time window |
 | `dbx_open_table` | Open a table in the running DBX desktop app |
 | `dbx_execute_and_show` | Execute a query and display the result in DBX |
 
@@ -141,6 +155,22 @@ Connection-scoped sessions hide connection-mutating and desktop UI tools.
 - The JSON response contains `messages` with base64 payloads, lossless UTF-8 previews when available, message IDs and metadata. `incomplete` means the broker read reached a deadline or scan limit. `outputTruncated` means whole messages were omitted to fit the 256 KiB message output budget. A single oversized message may therefore yield no messages with `outputTruncated: true`; payloads are never silently clipped.
 
 This is a bounded snapshot, not a continuous consumer or a topic-wide text search. Other message queue types are rejected.
+
+## Kafka Observability
+
+Available in builds with `mq-admin`. All tools are read-only (no topic changes, no offset moves), take `connection_id` or `connection_name`, and respect MCP connection scopes and tool allowlists.
+
+- `dbx_kafka_lag` lists every group and topic worst first. `max_partition_lag` and `pattern` tell a slow consumer (`spread`: lag on every partition) from a stuck one (`concentrated`: lag on one partition).
+- `dbx_kafka_throughput` reads offsets twice, `sample_seconds` apart (default 10, 2–60), so it takes that long to answer. It reports produced and consumed messages per second, how fast the backlog changes, time to catch up and a status: `caught up`, `stalled`, `falling behind`, `catching up` or `keeping pace`.
+
+## OpenSearch Search with Time Windows
+
+For `elasticsearch` / `easysearch` connections (OpenSearch and Elasticsearch). Log indices are time-series, so `dbx_opensearch_search` and `dbx_opensearch_ppl` are bounded by a window:
+
+- `from` / `to` accept `now`, date math such as `now-15m`, `now-24h`, `now-7d`, or absolute timestamps. When omitted the window is the last hour. Every response states the exact UTC window used.
+- `time_field` defaults to the index pattern's time field saved in Dashboards, else `@timestamp`. Pass `all_time: true` only for indices without a time field.
+- `language` is `dql` (default, OpenSearch Dashboards Query Language) or `lucene`. Check `dbx_opensearch_fields` first: querying a field that is not searchable fails the whole search.
+- `dbx_opensearch_sql` accepts a single `SELECT`. On OpenSearch quote index names with backticks and use absolute UTC timestamps (OpenSearch 1.x SQL has no `NOW()`). PPL gets the window inserted right after `source=`.
 
 ## Batch SQL Execution
 
