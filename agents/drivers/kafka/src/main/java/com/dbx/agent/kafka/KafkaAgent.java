@@ -63,6 +63,10 @@ public final class KafkaAgent {
     private static KafkaProducer<String, byte[]> producer;
     private static JsonObject activeConnection;
     private static volatile boolean shutdownRequested;
+    /** Set once batched committed-offset fetches failed where single-group fetches worked. */
+    private static boolean batchedOffsetFetchUnsupported;
+    /** Budget of the batched committed-offset fetch before missed groups are fetched one by one. */
+    private static final int BATCHED_OFFSET_FETCH_BUDGET_MS = 5_000;
 
     private KafkaAgent() {}
 
@@ -269,6 +273,7 @@ public final class KafkaAgent {
             producer = null;
         }
         activeConnection = null;
+        batchedOffsetFetchUnsupported = false;
         restoreKerberosSystemProperties(BASELINE_KERBEROS_SYSTEM_PROPERTIES);
     }
 
@@ -1001,20 +1006,13 @@ public final class KafkaAgent {
             }
         }
 
-        // Batch-resolve committed offsets for every group in one Admin request.
-        Map<String, ListConsumerGroupOffsetsSpec> offsetSpecs = new LinkedHashMap<>();
-        for (String groupId : groupIds) {
-            offsetSpecs.put(groupId, new ListConsumerGroupOffsetsSpec());
-        }
+        // Resolve committed offsets for every group concurrently (see committedOffsetFutures).
         Map<String, Map<TopicPartition, OffsetAndMetadata>> committedOffsets = new HashMap<>();
-        ListConsumerGroupOffsetsResult offsetsResult = admin.listConsumerGroupOffsets(
-            offsetSpecs,
-            new ListConsumerGroupOffsetsOptions().timeoutMs(timeout)
-        );
+        Map<String, KafkaFuture<Map<TopicPartition, OffsetAndMetadata>>> offsetFutures =
+            committedOffsetFutures(admin, groupIds, timeout);
         for (String groupId : groupIds) {
             try {
-                Map<TopicPartition, OffsetAndMetadata> rows = offsetsResult
-                    .partitionsToOffsetAndMetadata(groupId)
+                Map<TopicPartition, OffsetAndMetadata> rows = offsetFutures.get(groupId)
                     .get(timeout, TimeUnit.MILLISECONDS);
                 committedOffsets.put(groupId, rows == null ? Collections.emptyMap() : rows);
             } catch (Exception error) {
@@ -1083,6 +1081,62 @@ public final class KafkaAgent {
             result.add(g);
         }
         return Collections.singletonMap("groups", result);
+    }
+
+    /**
+     * Committed-offset futures for every group. One batched request serves Kafka 3.0+
+     * brokers (OffsetFetch v8, FindCoordinator v4). Older brokers cannot batch: kafka-clients
+     * then fails most groups with "Timed out waiting for a node assignment" only when the
+     * request times out, while single-group requests answer in milliseconds. So the batch
+     * gets a short budget, groups it misses are fetched one request each (the Admin client
+     * runs them concurrently), and once that rescue works the connection skips the batch.
+     */
+    static Map<String, KafkaFuture<Map<TopicPartition, OffsetAndMetadata>>> committedOffsetFutures(
+        Admin admin,
+        List<String> groupIds,
+        int timeout
+    ) {
+        ListConsumerGroupOffsetsOptions singleOptions = new ListConsumerGroupOffsetsOptions().timeoutMs(timeout);
+        Map<String, KafkaFuture<Map<TopicPartition, OffsetAndMetadata>>> futures = new LinkedHashMap<>();
+        if (!batchedOffsetFetchUnsupported && groupIds.size() > 1) {
+            int batchBudget = Math.min(timeout, BATCHED_OFFSET_FETCH_BUDGET_MS);
+            Map<String, ListConsumerGroupOffsetsSpec> specs = new LinkedHashMap<>();
+            for (String groupId : groupIds) {
+                specs.put(groupId, new ListConsumerGroupOffsetsSpec());
+            }
+            ListConsumerGroupOffsetsResult batched = admin.listConsumerGroupOffsets(
+                specs,
+                new ListConsumerGroupOffsetsOptions().timeoutMs(batchBudget)
+            );
+            List<String> missed = new ArrayList<>();
+            for (String groupId : groupIds) {
+                KafkaFuture<Map<TopicPartition, OffsetAndMetadata>> future = batched.partitionsToOffsetAndMetadata(groupId);
+                futures.put(groupId, future);
+                try {
+                    future.get(batchBudget, TimeUnit.MILLISECONDS);
+                } catch (Exception error) {
+                    if (isTimeoutError(error)) {
+                        missed.add(groupId);
+                    }
+                }
+            }
+            for (String groupId : missed) {
+                futures.put(groupId, admin.listConsumerGroupOffsets(groupId, singleOptions).partitionsToOffsetAndMetadata());
+            }
+            if (!missed.isEmpty()) {
+                try {
+                    futures.get(missed.get(0)).get(timeout, TimeUnit.MILLISECONDS);
+                    batchedOffsetFetchUnsupported = true;
+                } catch (Exception ignored) {
+                    // The single-group fetch failed too; the caller reports it per group.
+                }
+            }
+            return futures;
+        }
+        for (String groupId : groupIds) {
+            futures.put(groupId, admin.listConsumerGroupOffsets(groupId, singleOptions).partitionsToOffsetAndMetadata());
+        }
+        return futures;
     }
 
     static List<Map<String, Object>> memberMaps(Collection<MemberDescription> members) {
@@ -1183,18 +1237,11 @@ public final class KafkaAgent {
             }
         }
 
-        Map<String, ListConsumerGroupOffsetsSpec> offsetSpecs = new LinkedHashMap<>();
-        for (String groupId : groupIds) {
-            offsetSpecs.put(groupId, new ListConsumerGroupOffsetsSpec());
-        }
-        ListConsumerGroupOffsetsResult offsetsResult = admin.listConsumerGroupOffsets(
-            offsetSpecs,
-            new ListConsumerGroupOffsetsOptions().timeoutMs(timeout)
-        );
+        Map<String, KafkaFuture<Map<TopicPartition, OffsetAndMetadata>>> offsetFutures =
+            committedOffsetFutures(admin, groupIds, timeout);
         for (String groupId : groupIds) {
             try {
-                Map<TopicPartition, OffsetAndMetadata> groupOffsets = offsetsResult
-                    .partitionsToOffsetAndMetadata(groupId)
+                Map<TopicPartition, OffsetAndMetadata> groupOffsets = offsetFutures.get(groupId)
                     .get(timeout, TimeUnit.MILLISECONDS);
                 committedOffsets.put(groupId, groupOffsets == null ? Collections.emptyMap() : groupOffsets);
                 committedOffsetsAvailable.put(groupId, true);
