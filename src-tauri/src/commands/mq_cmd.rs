@@ -19,6 +19,12 @@ pub async fn mq_test_connection(
     dbx_core::mq::service::mq_test_connection_core(&state, &connection_id).await
 }
 
+/// Start the agent runtime (JVM) for an agent-backed MQ connection without connecting.
+#[tauri::command]
+pub async fn mq_prewarm_agent(state: State<'_, Arc<AppState>>, connection_id: String) -> Result<bool, String> {
+    dbx_core::mq::service::mq_prewarm_agent_core(&state, &connection_id).await
+}
+
 // ---- Tenants ----
 
 #[tauri::command]

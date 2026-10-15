@@ -586,6 +586,8 @@ export function tabModeLabel(tab: QueryTab, t: Translate): string {
   if (tab.mode === "objects") return t("tabs.objects");
   if (tab.mode === "users") return t("tabs.users");
   if (tab.mode === "dolt-version-control") return t("doltVersionControl.title");
+  if (tab.mode === "es-discover") return t("tabs.esDiscover");
+  if (tab.mode === "es-console") return t("tabs.esConsole");
   return tab.mode;
 }
 
@@ -630,6 +632,7 @@ export function tabIconClass(tab: QueryTab): string {
   if (tab.mode === "data" || tab.mode === "hbase") return "text-green-500";
   if (tab.mode === "mongo") return "text-green-400";
   if (tab.mode === "vector") return "text-cyan-400";
+  if (tab.mode === "es-discover" || tab.mode === "es-console") return "text-teal-500";
   if (tab.mode === "structure") return "text-blue-500";
   return "text-blue-600 dark:text-blue-400";
 }

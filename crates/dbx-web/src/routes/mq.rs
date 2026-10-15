@@ -467,6 +467,19 @@ pub async fn test_connection(
     Ok(Json(result))
 }
 
+/// Warm the agent runtime (JVM) for an agent-backed MQ connection. Never connects
+/// to the broker; the UI calls it on startup/hover when driver prewarm is enabled.
+pub async fn prewarm_agent(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Json(req): Json<ConnReq>,
+) -> Result<Json<bool>, AppError> {
+    super::mcp_policy::ensure_scope(&state, &headers, &req.connection_id).await?;
+    let result =
+        dbx_core::mq::service::mq_prewarm_agent_core(&state.app, &req.connection_id).await.map_err(AppError::from)?;
+    Ok(Json(result))
+}
+
 pub async fn list_tenants(
     State(state): State<Arc<WebState>>,
     headers: HeaderMap,

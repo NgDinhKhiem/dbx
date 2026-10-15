@@ -12,6 +12,11 @@ pub struct EasysearchClient {
 }
 
 impl EasysearchClient {
+    /// See [`EsClient::recently_verified`].
+    pub fn recently_verified(&self) -> bool {
+        self.inner.recently_verified()
+    }
+
     pub fn from_config(
         url: &str,
         username: Option<&str>,
@@ -166,6 +171,17 @@ pub async fn execute_rest_query_with_cursor(
     elasticsearch_driver::execute_rest_query_with_sql_parser(&client.inner, input, parse_sql_response, cursor)
         .await
         .map_err(easysearch_error)
+}
+
+pub async fn execute_raw_request(
+    client: &EasysearchClient,
+    request: &elasticsearch_driver::ElasticsearchRawRequest,
+) -> Result<elasticsearch_driver::ElasticsearchRawResponse, String> {
+    elasticsearch_driver::execute_raw_request(&client.inner, request).await.map_err(easysearch_error)
+}
+
+pub async fn cluster_info(client: &EasysearchClient) -> Result<elasticsearch_driver::ElasticsearchClusterInfo, String> {
+    elasticsearch_driver::cluster_info(&client.inner).await.map_err(easysearch_error)
 }
 
 #[cfg(test)]

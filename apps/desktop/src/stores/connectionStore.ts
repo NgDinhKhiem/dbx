@@ -70,6 +70,7 @@ import {
 import {
   applyTableVGroupsToChildren,
   collectTableTreeNames,
+  clearTableVGroupPlacement as clearTableVGroupPlacementOp,
   createTableVGroup as createTableVGroupOp,
   deleteTableVGroups as deleteTableVGroupsOp,
   emptyTableVGroupLayout,
@@ -82,8 +83,11 @@ import {
   reorderTableVGroupEntry as reorderTableVGroupEntryOp,
   renameTableVGroup as renameTableVGroupOp,
   resolveTableVGroupScopeFromNode,
+  setTableVGroupRule as setTableVGroupRuleOp,
   setTableVGroupsEnabled as setTableVGroupsEnabledOp,
+  type TableVGroupRule,
   stripTableVGroupsFromChildren,
+  tableVGroupCandidateNames,
   tableVGroupKindOfContainerNode,
   tableVGroupPathForTable as tableVGroupPathForTableOp,
   tableVGroupScopeKey,
@@ -184,7 +188,7 @@ import { buildXuguTypeMemberNodes, isXuguTypeMemberContainer } from "@/lib/sideb
 import { isXuguPublicSynonymScope, isXuguSchedulerJobScope, isXuguSyntheticScope, sortXuguSchemaInfos, xuguSchemaDisplayName, XUGU_PUBLIC_SYNONYM_SCOPE, XUGU_SCHEDULER_JOB_SCOPE } from "@/lib/sidebar/xuguPublicSynonyms";
 import { filterNacosNamespacesForSidebar, normalizeNacosNamespacesForDisplay } from "@/lib/nacos/nacosNamespaceVisibility";
 import { buildPackageMemberNodes, markPackageNodesExpandable, packageMemberGroupOwnerId } from "@/lib/sidebar/packageMembers";
-import { configuredDatabaseProductName, connectionConfigFingerprint, normalizeDatabaseConnectionInfo } from "@/lib/connection/connectionDatabaseInfo";
+import { configuredDatabaseProductName, connectionConfigFingerprint, hasSubmittedSecretChange, normalizeDatabaseConnectionInfo } from "@/lib/connection/connectionDatabaseInfo";
 import { driverProfileObjectTreeProfileForConnection } from "@/lib/database/driverProfileExtensions";
 import { createMetadataLoadTrace, logMetadataLoadTrace, MetadataLoadCoordinator, type MetadataLoadTraceLogger } from "@/lib/metadata/metadataLoadCoordinator";
 import type { MetadataScopeInput } from "@/lib/metadata/metadataLoadScope";
@@ -303,6 +307,16 @@ function sidebarObjectGroupPageSize(): number {
  * the query reaches later tables.
  */
 export const SIDEBAR_TABLE_SEARCH_RESULT_BUDGET = 2000;
+
+/** Completion cache key holding the index list fetched by the sidebar tree. */
+function elasticsearchSidebarIndexSeedKey(connectionId: string): string {
+  return `${connectionId}:__sidebar_indices__`;
+}
+
+/** Index names plus aliases, the same shape `elasticsearchListIndices` returns. */
+export function elasticsearchCompletionIndexNames(collections: readonly { name: string; aliases?: string[] | null }[]): string[] {
+  return [...new Set(collections.flatMap((collection) => [collection.name, ...(collection.aliases ?? [])].filter((name) => name.trim())))];
+}
 
 function isFlatMqConnection(config: ConnectionConfig | undefined): boolean {
   if (!config || config.db_type !== "mq") return false;
@@ -1954,7 +1968,9 @@ export const useConnectionStore = defineStore("connection", () => {
       treeNodeLoads.invalidateDescendants(parent.id);
     }
     if (parent.children && parent.children.length > 0) {
-      const oldMap = new Map(parent.children.map((c) => [c.id, c] as const));
+      // Rows may sit inside projected virtual groups; look through them so
+      // grouped rows keep their expansion and loaded children.
+      const oldMap = new Map(stripTableVGroupsFromChildren(parent.children).map((c) => [c.id, c] as const));
       const nextIds = new Set(children.map((child) => child.id));
       // Discarded shells collect here so their persisted-cache deletes can be
       // aggregated into one prefix request per ancestor (issue #9779).
@@ -3792,6 +3808,8 @@ export const useConnectionStore = defineStore("connection", () => {
     for (const key of Object.keys(elasticsearchCompletionIndicesCache.value)) {
       if (key === exactCacheKey || key.startsWith(cachePrefix)) delete elasticsearchCompletionIndicesCache.value[key];
     }
+    // The sidebar seed is database-independent, so any invalidation for the connection drops it.
+    delete elasticsearchCompletionIndicesCache.value[elasticsearchSidebarIndexSeedKey(connectionId)];
     for (const key of Object.keys(elasticsearchCompletionFieldsCache.value)) {
       if (key === exactCacheKey || key.startsWith(cachePrefix)) delete elasticsearchCompletionFieldsCache.value[key];
     }
@@ -3913,7 +3931,10 @@ export const useConnectionStore = defineStore("connection", () => {
     if (config.save_password === false) config.password = "";
     const idx = connections.value.findIndex((c) => c.id === config.id);
     if (idx < 0) return;
-    const runtimeConfigChanged = connectionConfigFingerprint(connections.value[idx]) !== connectionConfigFingerprint(config);
+    // A typed or cleared secret is a change even though fingerprints ignore
+    // secret values (saved copies only hold blanks): the live connection must
+    // be dropped so the next connect uses the new credentials.
+    const runtimeConfigChanged = connectionConfigFingerprint(connections.value[idx]) !== connectionConfigFingerprint(config) || hasSubmittedSecretChange(config, connections.value[idx]);
     const nextConnections = [...connections.value];
     nextConnections[idx] = config;
     await persistTimeoutInheritance(config.id, config.connect_timeout_inherit === true, config.query_timeout_inherit === true);
@@ -5612,6 +5633,9 @@ export const useConnectionStore = defineStore("connection", () => {
       const collections = isMeilisearch
         ? sortSidebarNames(await withMetadataLoadTimeout(connectionId, api.meilisearchListIndexes(connectionId), "Meilisearch indexes")).map((name) => ({ name, aliases: [] as string[] }))
         : [...(await withMetadataLoadTimeout(connectionId, api.documentListCollections(connectionId, "default"), isSolr ? "Solr cores" : "Elasticsearch indices"))].sort((left, right) => compareSidebarNames(left.name, right.name));
+      // The sidebar already fetched every index and alias: seed the editor/console
+      // completion cache so autocomplete needs no second listing round trip.
+      if (!isMeilisearch && !isSolr) seedElasticsearchCompletionIndices(connectionId, collections);
       const indexNodes = collections.map((collection) => {
         const aliases = collection.aliases?.filter((alias) => alias.trim());
         return {
@@ -8397,16 +8421,24 @@ export const useConnectionStore = defineStore("connection", () => {
     });
   }
 
+  function seedElasticsearchCompletionIndices(connectionId: string, collections: readonly { name: string; aliases?: string[] | null }[]) {
+    elasticsearchCompletionIndicesCache.value[elasticsearchSidebarIndexSeedKey(connectionId)] = elasticsearchCompletionIndexNames(collections);
+    evictOldestCacheEntries(elasticsearchCompletionIndicesCache.value, COMPLETION_CACHE_MAX);
+  }
+
   async function listElasticsearchCompletionIndices(connectionId: string, database: string): Promise<string[]> {
     const cacheKey = `${connectionId}:${database}`;
-    if (elasticsearchCompletionIndicesCache.value[cacheKey]) {
-      return elasticsearchCompletionIndicesCache.value[cacheKey];
-    }
-    await ensureConnected(connectionId);
-    const indices = await api.elasticsearchListIndices(connectionId);
-    elasticsearchCompletionIndicesCache.value[cacheKey] = indices;
-    evictOldestCacheEntries(elasticsearchCompletionIndicesCache.value, COMPLETION_CACHE_MAX);
-    return elasticsearchCompletionIndicesCache.value[cacheKey];
+    // Index names do not depend on the editor's database; reuse the sidebar listing when present.
+    const cached = elasticsearchCompletionIndicesCache.value[cacheKey] ?? elasticsearchCompletionIndicesCache.value[elasticsearchSidebarIndexSeedKey(connectionId)];
+    if (cached) return cached;
+    // Concurrent editors/consoles share one listing request.
+    return withCompletionInFlight(`${connectionId}:es-indices`, async () => {
+      await ensureConnected(connectionId);
+      const indices = await api.elasticsearchListIndices(connectionId);
+      elasticsearchCompletionIndicesCache.value[cacheKey] = indices;
+      evictOldestCacheEntries(elasticsearchCompletionIndicesCache.value, COMPLETION_CACHE_MAX);
+      return indices;
+    });
   }
 
   async function listElasticsearchCompletionFields(connectionId: string, index: string): Promise<ElasticsearchCompletionField[]> {
@@ -10051,12 +10083,30 @@ export const useConnectionStore = defineStore("connection", () => {
       const resolved = resolveTableVGroupScope(scope);
       return resolved ? tableVGroupLayouts.value[resolved.scopeKey] : undefined;
     },
-    createTableVGroup(scope: TableVGroupScope, name: string, parentGroupId?: string | null) {
+    /** Names currently loaded in the container a scope arranges (regex preview). */
+    tableVGroupCandidateNamesFor(scope: TableVGroupScope): string[] {
+      const resolved = resolveTableVGroupScope(scope);
+      if (!resolved) return [];
+      const container = findTableVGroupContainerNode(treeNodes.value, resolved.scope);
+      return container ? tableVGroupCandidateNames(container) : [];
+    },
+    /** Scope of the database groups directly under a connection. */
+    databaseVGroupScope(connectionId: string): TableVGroupScope {
+      return { connectionId, objectType: "databases" };
+    },
+    createTableVGroup(scope: TableVGroupScope, name: string, parentGroupId?: string | null, rule?: TableVGroupRule | null) {
       const resolved = resolveTableVGroupScope(scope);
       if (!resolved) return null;
-      const result = createTableVGroupOp(tableVGroupLayouts.value[resolved.scopeKey] ?? emptyTableVGroupLayout(), name, parentGroupId);
+      const result = createTableVGroupOp(tableVGroupLayouts.value[resolved.scopeKey] ?? emptyTableVGroupLayout(), name, parentGroupId, rule);
       updateTableVGroupLayout(resolved.scope, resolved.scopeKey, result.layout);
       return result.groupId;
+    },
+    setTableVGroupRule(scope: TableVGroupScope, groupId: string, rule: TableVGroupRule | null) {
+      updateTableVGroupLayoutFor(scope, (layout) => setTableVGroupRuleOp(layout, groupId, rule));
+    },
+    /** Let rule groups decide again where this row goes. */
+    clearTableVGroupPlacement(scope: TableVGroupScope, tableName: string, rowType?: string) {
+      updateTableVGroupLayoutFor(scope, (layout) => clearTableVGroupPlacementOp(layout, tableName, rowType), tableName, rowType);
     },
     renameTableVGroup(scope: TableVGroupScope, groupId: string, name: string) {
       updateTableVGroupLayoutFor(scope, (layout) => renameTableVGroupOp(layout, groupId, name));

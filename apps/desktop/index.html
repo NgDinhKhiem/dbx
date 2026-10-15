@@ -54,14 +54,15 @@
         let mode = null;
         let cornerStyle = null;
 
-        // localStorage can throw when WebView storage is unavailable; keep the existing light fallback.
+        // localStorage can throw when WebView storage is unavailable; fall back to the dark default.
         try {
           mode = localStorage.getItem("dbx-theme");
           cornerStyle = localStorage.getItem("dbx-corner-style");
         } catch {}
 
         const followsSystem = mode === "system" || mode === "soft-system";
-        let dark = mode === "dark" || mode === "soft-dark";
+        // Dark unless the user chose light (matches normalizeAppThemeMode's dark default).
+        let dark = mode !== "light" && mode !== "soft-light";
 
         if (followsSystem) {
           try {

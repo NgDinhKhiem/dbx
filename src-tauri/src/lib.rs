@@ -1577,7 +1577,11 @@ pub fn run() {
             let t = Instant::now();
             append_startup_probe(format!("opening storage file=dbx.db data_dir_mode={data_dir_mode}"));
             let storage = tauri::async_runtime::block_on(async {
-                let s = Storage::open_unmigrated(&db_path).await.expect("Failed to open storage");
+                let s = Storage::open_unmigrated(&db_path)
+                    .await
+                    .expect("Failed to open storage")
+                    // The desktop app keeps its encryption key in a local file, never the Keychain.
+                    .with_secret_key_policy(dbx_core::persistence::secret_codec::SecretKeyPolicy::LocalKeyFile);
                 eprintln!("[STARTUP]   Storage::open in {:?}", t.elapsed());
                 append_startup_probe(format!("storage opened in {:?}", t.elapsed()));
                 let t2 = Instant::now();
@@ -2400,6 +2404,8 @@ pub fn run() {
             commands::document_cmd::elasticsearch_count_documents,
             commands::document_cmd::elasticsearch_get_index_metadata,
             commands::document_cmd::elasticsearch_delete_all_documents,
+            commands::document_cmd::elasticsearch_raw_request,
+            commands::document_cmd::elasticsearch_cluster_info,
             commands::document_cmd::document_list_gridfs_buckets,
             commands::document_cmd::document_create_gridfs_bucket,
             commands::document_cmd::document_delete_gridfs_bucket,
@@ -2465,6 +2471,8 @@ pub fn run() {
             commands::mongo_cmd::mongo_find_one_and_delete,
             #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_test_connection,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_prewarm_agent,
             #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_list_tenants,
             #[cfg(feature = "mq-admin")]

@@ -11,8 +11,10 @@
 //! that caches one adapter per connection.
 
 pub mod adapters;
+pub(crate) mod agent_client;
 pub mod auth;
 pub mod config;
+pub mod kafka_observability;
 pub mod port;
 pub mod service;
 pub mod token;

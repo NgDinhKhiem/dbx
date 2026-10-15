@@ -1,3 +1,4 @@
+use dbx_core::connection_secrets::{redact_connections_for_client, ClientConnectionInput};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -95,8 +96,15 @@ fn rollback_session_credential_writes(app: &AppState, writes: &SessionCredential
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectRequest {
-    pub config: ConnectionConfig,
+    /// Configuration as the UI sends it: stored secrets are blank and named in
+    /// `saved_secrets`; resolve it with `resolve_request_config` before use.
+    pub config: ClientConnectionInput,
     pub client_attempt: Option<u64>,
+}
+
+/// Fills the stored secrets back into a configuration received from the UI.
+async fn resolve_request_config(state: &WebState, input: &ClientConnectionInput) -> Result<ConnectionConfig, AppError> {
+    state.app.storage.resolve_client_connection(input).await.map_err(AppError::from)
 }
 
 #[derive(Deserialize)]
@@ -166,7 +174,7 @@ pub struct WriteUnlockStateResponse {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SaveConnectionsRequest {
-    pub configs: Vec<ConnectionConfig>,
+    pub configs: Vec<ClientConnectionInput>,
 }
 
 #[derive(Deserialize)]
@@ -375,7 +383,8 @@ pub async fn test_connection(
     State(state): State<Arc<WebState>>,
     Json(body): Json<ConnectRequest>,
 ) -> Result<Json<String>, AppError> {
-    run_temporary_connection_test(&state.app, body.config, false)
+    let config = resolve_request_config(&state, &body.config).await?;
+    run_temporary_connection_test(&state.app, config, false)
         .await
         .map(|result| Json(result.message))
         .map_err(AppError::from)
@@ -385,14 +394,16 @@ pub async fn test_connection_with_info(
     State(state): State<Arc<WebState>>,
     Json(body): Json<ConnectRequest>,
 ) -> Result<Json<ConnectionTestResult>, AppError> {
-    run_temporary_connection_test(&state.app, body.config, true).await.map(Json).map_err(AppError::from)
+    let config = resolve_request_config(&state, &body.config).await?;
+    run_temporary_connection_test(&state.app, config, true).await.map(Json).map_err(AppError::from)
 }
 
 pub async fn test_ssh_tunnel(
     State(state): State<Arc<WebState>>,
     Json(body): Json<ConnectRequest>,
 ) -> Result<Json<String>, AppError> {
-    state.app.test_connection_ssh_tunnel(&body.config.canonicalized()).await.map(Json).map_err(AppError::from)
+    let config = resolve_request_config(&state, &body.config).await?;
+    state.app.test_connection_ssh_tunnel(&config.canonicalized()).await.map(Json).map_err(AppError::from)
 }
 
 pub async fn connect_db(
@@ -400,7 +411,7 @@ pub async fn connect_db(
     headers: HeaderMap,
     Json(body): Json<ConnectRequest>,
 ) -> Result<Json<String>, AppError> {
-    let config = body.config;
+    let config = resolve_request_config(&state, &body.config).await?;
     // 演示模式：只允许连接已保存的连接，端点身份以存储为准，防止伪造 body
     // 配置把服务器拨向任意主机（见 demo 模块）。
     if state.demo_mode {
@@ -549,7 +560,7 @@ pub async fn connection_final_proxy_port(
     headers: HeaderMap,
     Json(body): Json<ConnectRequest>,
 ) -> Result<Json<u16>, AppError> {
-    let runtime_config = body.config.canonicalized();
+    let runtime_config = resolve_request_config(&state, &body.config).await?.canonicalized();
     if !runtime_config.has_effective_transport_layers() {
         return Err(AppError::from("Connection has no configured transport layers".to_string()));
     }
@@ -723,7 +734,12 @@ pub async fn save_connections(
     headers: HeaderMap,
     Json(body): Json<SaveConnectionsRequest>,
 ) -> Result<Json<()>, AppError> {
-    for config in &body.configs {
+    // Blank secrets keep their stored values; typed ones replace them.
+    let mut resolved_configs = Vec::with_capacity(body.configs.len());
+    for input in &body.configs {
+        resolved_configs.push(resolve_request_config(&state, input).await?);
+    }
+    for config in &resolved_configs {
         if config.db_type == dbx_core::models::connection::DatabaseType::Sqlite {
             dbx_core::db::sqlite::validate_persistent_attachments(
                 &config.host,
@@ -733,9 +749,9 @@ pub async fn save_connections(
             .map_err(AppError::from)?;
         }
     }
-    state.app.storage.save_connections(&body.configs).await.map_err(AppError::from)?;
+    let saved_configs = state.app.storage.save_client_connections(&body.configs).await.map_err(AppError::from)?;
     let owner = session_token_from_headers(&headers).unwrap_or_default();
-    let runtime_configs = body.configs.iter().cloned().map(prepare_runtime_config).collect::<Vec<_>>();
+    let runtime_configs = saved_configs.into_iter().map(prepare_runtime_config).collect::<Vec<_>>();
     let sanitized_configs = runtime_configs.iter().map(|(config, _)| config.clone()).collect::<Vec<_>>();
     let sync = sync_connection_configs(&state, &sanitized_configs).await;
     for (config, secrets) in &runtime_configs {
@@ -795,13 +811,14 @@ pub async fn mcp_remove_connection(
 pub async fn load_connections(
     State(state): State<Arc<WebState>>,
     _headers: HeaderMap,
-) -> Result<Json<Vec<ConnectionConfig>>, AppError> {
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     let configs = state.app.storage.load_connections().await.map_err(AppError::from)?;
     let sync = sync_connection_configs(&state, &configs).await;
     remove_connection_pools_for_connection_ids(&state, &sync.connection_pool_ids_to_drop).await;
     drop_nacos_adapters_for_connection_ids(&state, &sync.nacos_adapter_ids_to_drop).await;
     drop_mq_adapters_for_connection_ids(&state, &sync.mq_adapter_ids_to_drop).await;
-    Ok(Json(configs))
+    // The runtime keeps the full configurations; the browser gets them without secrets.
+    Ok(Json(redact_connections_for_client(&configs).map_err(AppError::from)?))
 }
 
 struct ConnectionConfigSync {
@@ -1132,16 +1149,18 @@ mod tests {
 
         let legacy = test_connection(
             State(state.clone()),
-            Json(ConnectRequest { config: config.clone(), client_attempt: None }),
+            Json(ConnectRequest { config: config.clone().into(), client_attempt: None }),
         )
         .await
         .unwrap_or_else(|error| panic!("{}", error.message));
         assert_eq!(legacy.0, "Connection successful");
 
-        let detailed =
-            test_connection_with_info(State(state.clone()), Json(ConnectRequest { config, client_attempt: None }))
-                .await
-                .unwrap_or_else(|error| panic!("{}", error.message));
+        let detailed = test_connection_with_info(
+            State(state.clone()),
+            Json(ConnectRequest { config: config.into(), client_attempt: None }),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{}", error.message));
         assert_eq!(detailed.0.message, "Connection successful");
         assert_eq!(detailed.0.database_info, None);
         assert!(state.app.configs.read().await.keys().all(|key| !key.starts_with("__test_")));
@@ -1169,10 +1188,13 @@ mod tests {
         let (state, dir) = test_web_state().await;
         let config = plugin_config("plugin-connect");
 
-        let error =
-            connect_db(State(state.clone()), HeaderMap::new(), Json(ConnectRequest { config, client_attempt: None }))
-                .await
-                .unwrap_err();
+        let error = connect_db(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(ConnectRequest { config: config.into(), client_attempt: None }),
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(error.message, "Plugin connection is missing plugin_id");
         assert!(state.app.with_connection_pools(|pools| !pools.contains_key("plugin-connect")).await);
@@ -1232,9 +1254,10 @@ mod tests {
         let admin_url = spawn_pulsar_clusters_server().await;
         let config = mq_config("pulsar-probe", &admin_url);
 
-        let result = test_connection(State(state.clone()), Json(ConnectRequest { config, client_attempt: None }))
-            .await
-            .unwrap_or_else(|error| panic!("{}", error.message));
+        let result =
+            test_connection(State(state.clone()), Json(ConnectRequest { config: config.into(), client_attempt: None }))
+                .await
+                .unwrap_or_else(|error| panic!("{}", error.message));
         assert_eq!(result.0, "Connection successful");
 
         assert!(state.app.configs.read().await.keys().all(|key| !key.starts_with("__test_")));
@@ -1276,7 +1299,7 @@ mod tests {
         let connect_error = connect_db(
             State(state.clone()),
             HeaderMap::new(),
-            Json(ConnectRequest { config: invalid.clone(), client_attempt: None }),
+            Json(ConnectRequest { config: invalid.clone().into(), client_attempt: None }),
         )
         .await
         .unwrap_err();
@@ -1297,7 +1320,7 @@ mod tests {
         let proxy_error = connection_final_proxy_port(
             State(state.clone()),
             HeaderMap::new(),
-            Json(ConnectRequest { config: invalid, client_attempt: None }),
+            Json(ConnectRequest { config: invalid.into(), client_attempt: None }),
         )
         .await
         .unwrap_err();
@@ -1351,7 +1374,7 @@ mod tests {
         let result = save_connections(
             State(state.clone()),
             HeaderMap::new(),
-            Json(SaveConnectionsRequest { configs: vec![config.clone()] }),
+            Json(SaveConnectionsRequest { configs: vec![config.clone().into()] }),
         )
         .await;
         assert!(result.is_ok());
@@ -1546,7 +1569,7 @@ mod tests {
         let result = save_connections(
             State(state.clone()),
             HeaderMap::new(),
-            Json(SaveConnectionsRequest { configs: vec![updated.clone()] }),
+            Json(SaveConnectionsRequest { configs: vec![updated.clone().into()] }),
         )
         .await;
         assert!(result.is_ok());
@@ -1588,7 +1611,7 @@ mod tests {
         let result = connect_db(
             State(state.clone()),
             HeaderMap::new(),
-            Json(ConnectRequest { config: updated.clone(), client_attempt: None }),
+            Json(ConnectRequest { config: updated.clone().into(), client_attempt: None }),
         )
         .await;
         assert!(result.is_ok());
@@ -1629,7 +1652,7 @@ mod tests {
             connect_db(
                 State(connect_guard),
                 headers_a,
-                Json(ConnectRequest { config: config.clone(), client_attempt: None }),
+                Json(ConnectRequest { config: config.clone().into(), client_attempt: None }),
             )
             .await
         })
@@ -1667,10 +1690,13 @@ mod tests {
         let config = nacos_config("nacos-a");
         let headers_a = cookie_headers("token-a");
 
-        let _ =
-            save_connections(State(state.clone()), headers_a, Json(SaveConnectionsRequest { configs: vec![config] }))
-                .await
-                .unwrap();
+        let _ = save_connections(
+            State(state.clone()),
+            headers_a,
+            Json(SaveConnectionsRequest { configs: vec![config.into()] }),
+        )
+        .await
+        .unwrap();
 
         let runtime = state.app.configs.read().await.get("nacos-a").cloned().unwrap();
         assert!(runtime.password.is_empty());
@@ -1753,7 +1779,7 @@ mod tests {
         let result = connection_final_proxy_port(
             State(state.clone()),
             cookie_headers("token-a"),
-            Json(ConnectRequest { config, client_attempt: None }),
+            Json(ConnectRequest { config: config.into(), client_attempt: None }),
         )
         .await;
         assert!(result.is_ok(), "{result:?}");
@@ -1785,7 +1811,7 @@ mod tests {
         let result = connect_db(
             State(state.clone()),
             headers_a,
-            Json(ConnectRequest { config: config.clone(), client_attempt: None }),
+            Json(ConnectRequest { config: config.clone().into(), client_attempt: None }),
         )
         .await;
         assert!(result.is_err());
@@ -1978,7 +2004,7 @@ mod tests {
         let result = save_connections(
             State(state.clone()),
             HeaderMap::new(),
-            Json(SaveConnectionsRequest { configs: vec![kept.clone()] }),
+            Json(SaveConnectionsRequest { configs: vec![kept.clone().into()] }),
         )
         .await;
         assert!(result.is_ok());
@@ -2015,7 +2041,7 @@ mod tests {
         let result = save_connections(
             State(state.clone()),
             HeaderMap::new(),
-            Json(SaveConnectionsRequest { configs: vec![kept.clone()] }),
+            Json(SaveConnectionsRequest { configs: vec![kept.clone().into()] }),
         )
         .await;
         assert!(result.is_ok());

@@ -225,6 +225,8 @@ const BRIDGE_ROUTES: &[&str] = &[
     "/data/mongo/update-documents",
     "/data/mongo/delete-documents",
     "/data/redis/execute-command",
+    "/data/mq/kafka-observe",
+    "/data/elasticsearch/read",
     "/data/execute-query",
     "/execute-query",
     "/reload-connections",
@@ -430,6 +432,8 @@ pub fn start(app_handle: AppHandle, state: Arc<AppState>, data_dir: PathBuf) {
                     "/data/mongo/update-documents" => handle_mongo_update_documents_data(&st, body, &mut stream).await,
                     "/data/mongo/delete-documents" => handle_mongo_delete_documents_data(&st, body, &mut stream).await,
                     "/data/redis/execute-command" => handle_redis_execute_command_data(&st, body, &mut stream).await,
+                    "/data/mq/kafka-observe" => handle_kafka_observe_data(&st, body, &mut stream).await,
+                    "/data/elasticsearch/read" => handle_elasticsearch_read_data(&st, body, &mut stream).await,
                     "/data/execute-query" => handle_execute_query_data(&st, body, &mut stream).await,
                     "/execute-query" => handle_execute_query(&app, &st, body, &mut stream).await,
                     "/reload-connections" => {
@@ -2270,6 +2274,97 @@ async fn handle_mongo_delete_documents_data(state: &Arc<AppState>, body: &str, s
     .await
     {
         Ok(deleted) => respond_json(stream, &serde_json::json!({ "affected_rows": deleted })).await,
+        Err(e) => respond_error(stream, "500 Internal Server Error", &e).await,
+    }
+}
+
+/// Read-only Kafka observability (`dbx_kafka_*` MCP tools). One generic endpoint:
+/// the body carries a tagged `KafkaObserveRequest` (`{"op": "consumerGroups"}`, ...).
+#[cfg(feature = "mq-admin")]
+async fn handle_kafka_observe_data(state: &Arc<AppState>, body: &str, stream: &mut tokio::net::TcpStream) {
+    #[derive(Deserialize)]
+    struct KafkaObserveBody {
+        #[serde(default)]
+        connection_name: String,
+        connection_id: Option<String>,
+        request: dbx_core::mq::kafka_observability::KafkaObserveRequest,
+    }
+    let Ok(req) = serde_json::from_str::<KafkaObserveBody>(body) else {
+        respond_error(stream, "400 Bad Request", "Invalid JSON").await;
+        return;
+    };
+    let config = match resolve_connection(state, req.connection_id.as_deref(), &req.connection_name).await {
+        Ok(config) => config,
+        Err(e) => {
+            respond_error(stream, "404 Not Found", &e).await;
+            return;
+        }
+    };
+    match dbx_core::mq::kafka_observability::kafka_observe_core(state, &config.id, req.request).await {
+        Ok(value) => respond_json(stream, &value).await,
+        Err(e) => respond_error(stream, "500 Internal Server Error", &e).await,
+    }
+}
+
+#[cfg(not(feature = "mq-admin"))]
+async fn handle_kafka_observe_data(_state: &Arc<AppState>, _body: &str, stream: &mut tokio::net::TcpStream) {
+    respond_error(stream, "501 Not Implemented", "Message queue support is not compiled into this DBX build.").await;
+}
+
+/// Read-only Elasticsearch / OpenSearch access (`dbx_opensearch_*` MCP tools).
+/// One generic endpoint: a raw read request (`method`, `path`, `body`), or the
+/// cached cluster info when `cluster_info` is true. Writes are refused.
+async fn handle_elasticsearch_read_data(state: &Arc<AppState>, body: &str, stream: &mut tokio::net::TcpStream) {
+    #[derive(Deserialize)]
+    struct ElasticsearchReadBody {
+        #[serde(default)]
+        connection_name: String,
+        connection_id: Option<String>,
+        #[serde(default)]
+        cluster_info: bool,
+        #[serde(default)]
+        method: String,
+        #[serde(default)]
+        path: String,
+        body: Option<String>,
+    }
+    let Ok(req) = serde_json::from_str::<ElasticsearchReadBody>(body) else {
+        respond_error(stream, "400 Bad Request", "Invalid JSON").await;
+        return;
+    };
+    let config = match resolve_connection(state, req.connection_id.as_deref(), &req.connection_name).await {
+        Ok(config) => config,
+        Err(e) => {
+            respond_error(stream, "404 Not Found", &e).await;
+            return;
+        }
+    };
+    if req.cluster_info {
+        match dbx_core::document_ops::elasticsearch_cluster_info_core(state, &config.id).await {
+            Ok(info) => respond_json(stream, &info).await,
+            Err(e) => respond_error(stream, "500 Internal Server Error", &e).await,
+        }
+        return;
+    }
+    let read_only =
+        dbx_core::db::elasticsearch_driver::ElasticsearchRawRequest::parse(&req.method, &req.path, req.body.clone())
+            .map(|request| request.is_read_only());
+    match read_only {
+        Ok(true) => {}
+        Ok(false) => {
+            respond_error(stream, "403 Forbidden", "MCP_READ_ONLY: only read-only Elasticsearch requests are allowed.")
+                .await;
+            return;
+        }
+        Err(e) => {
+            respond_error(stream, "400 Bad Request", &e).await;
+            return;
+        }
+    }
+    match dbx_core::document_ops::elasticsearch_raw_request_core(state, &config.id, &req.method, &req.path, req.body)
+        .await
+    {
+        Ok(response) => respond_json(stream, &response).await,
         Err(e) => respond_error(stream, "500 Internal Server Error", &e).await,
     }
 }

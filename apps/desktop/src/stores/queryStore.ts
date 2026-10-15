@@ -2,6 +2,7 @@ import { UPDATE_RESTORE_KEY, assertUpdateAllowsInteraction } from "@/lib/app/upd
 import { defineStore } from "pinia";
 import { isRedisMonitorCommand, startRedisMonitor } from "@/lib/redis/redisMonitor";
 import { uuid } from "@/lib/common/utils";
+import { discoverTabIndexPattern } from "@/lib/tabs/esDiscoverTab";
 import { computed, markRaw, nextTick, onScopeDispose, reactive, ref, toRaw, watch, type ComputedRef } from "vue";
 import { useI18n } from "vue-i18n";
 import { useToast } from "@/composables/useToast";
@@ -3366,6 +3367,52 @@ export const useQueryStore = defineStore("query", () => {
       isCancelling: false,
       isExplaining: false,
       mode: "solr-admin",
+    };
+    return registerOpenTab(tab);
+  }
+
+  /** OpenSearch/Elasticsearch Discover. `tab.sql` holds the view state as JSON. */
+  function openElasticsearchDiscover(connectionId: string, indexPattern?: string) {
+    const pattern = indexPattern?.trim() || "";
+    const existing = tabs.value.find((tab) => tab.mode === "es-discover" && tab.connectionId === connectionId && discoverTabIndexPattern(tab) === pattern);
+    if (existing) {
+      switchTab(existing.id);
+      return existing.id;
+    }
+    const conn = useConnectionStore().getConfig(connectionId);
+    const scope = pattern || conn?.name || "";
+    const tab: QueryTab = {
+      id: uuid(),
+      title: scope ? `${scope} - ${t("tabs.esDiscover")}` : t("tabs.esDiscover"),
+      connectionId,
+      database: "",
+      sql: pattern ? JSON.stringify({ indexPattern: pattern }) : "",
+      isExecuting: false,
+      isCancelling: false,
+      isExplaining: false,
+      mode: "es-discover",
+    };
+    return registerOpenTab(tab);
+  }
+
+  /** OpenSearch/Elasticsearch Dev Tools console. `tab.sql` holds the editor text. */
+  function openElasticsearchConsole(connectionId: string) {
+    const existing = tabs.value.find((tab) => tab.mode === "es-console" && tab.connectionId === connectionId);
+    if (existing) {
+      switchTab(existing.id);
+      return existing.id;
+    }
+    const conn = useConnectionStore().getConfig(connectionId);
+    const tab: QueryTab = {
+      id: uuid(),
+      title: conn?.name ? `${conn.name} - ${t("tabs.esConsole")}` : t("tabs.esConsole"),
+      connectionId,
+      database: "",
+      sql: "",
+      isExecuting: false,
+      isCancelling: false,
+      isExplaining: false,
+      mode: "es-console",
     };
     return registerOpenTab(tab);
   }
@@ -9159,6 +9206,8 @@ export const useQueryStore = defineStore("query", () => {
     openXuguDashboard,
     openNacosDashboard,
     openSolrAdmin,
+    openElasticsearchDiscover,
+    openElasticsearchConsole,
     openDamengUsers,
     openDamengRoles,
     openDamengJobAdmin,

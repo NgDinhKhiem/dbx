@@ -27,6 +27,7 @@ pub fn is_agent_type(db_type: &DatabaseType) -> bool {
 }
 
 pub async fn stop_daemons(manager: &AgentManager) {
+    crate::agent_prewarm::spare_pool().clear();
     manager.daemons.lock().await.clear();
     let runtimes = std::mem::take(&mut *manager.connection_runtimes.lock().await);
     for runtime in runtimes.into_values().filter_map(|cell| cell.get().cloned()) {
@@ -35,6 +36,8 @@ pub async fn stop_daemons(manager: &AgentManager) {
 }
 
 pub async fn stop_daemon_by_key(manager: &AgentManager, agent_key: &str) {
+    // Spares may run a jar/JRE that is being replaced; they are cheap to warm again.
+    crate::agent_prewarm::spare_pool().clear();
     manager.daemons.lock().await.remove(agent_key);
     let runtimes = {
         let mut runtimes = manager.connection_runtimes.lock().await;

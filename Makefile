@@ -3,7 +3,7 @@
 PNPM ?= pnpm
 TAURI_DEV_PORT ?= 1420
 
-.PHONY: help install docs-install check-tauri-dev-port dev dev-fast dev-web dev-backend build package clean docs docs-build check test cargo-check-fast cargo-test-fast db db-list db-verify db-down db-reset db-check db-completion
+.PHONY: help install full deps docs-install check-tauri-dev-port dev dev-fast dev-web dev-backend build package clean docs docs-build check test cargo-check-fast cargo-test-fast db db-list db-verify db-down db-reset db-check db-completion
 
 export DB
 export DB_VERSION
@@ -53,10 +53,22 @@ help:
 	@printf '  %-23s %s\n' 'make db-completion' 'Show Bash/Zsh completion setup'
 	@printf '%s\n' ''
 	@printf '%s\n' 'Setup:'
-	@printf '  %-23s %s\n' 'make install' 'Install root project dependencies'
+	@printf '  %-23s %s\n' 'make deps' 'Install root project dependencies'
+	@printf '  %-23s %s\n' 'make install' 'Build DBX and install/update it in /Applications (data kept)'
+	@printf '  %-23s %s\n' 'make install full' 'Same, with a release-grade (slower) build'
 
-install:
+deps:
 	$(PNPM) install --frozen-lockfile
+
+# Build DBX and install/update it in /Applications (macOS); data and settings
+# are kept. `make install full` does a release-grade build. More options:
+# make install ARGS="--skip-build --no-launch" (see scripts/install-macos-app.sh --help).
+install:
+	scripts/install-macos-app.sh $(if $(filter full,$(MAKECMDGOALS)),--full) $(ARGS)
+
+# Modifier for `make install full`; does nothing on its own.
+full:
+	@:
 
 docs-install:
 	cd docs && $(PNPM) install --frozen-lockfile

@@ -9,13 +9,13 @@
 //! 3. Delegate all `MessageQueueAdmin` trait methods to JSON-RPC calls
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
-use tokio::sync::Mutex;
 
-use crate::db::agent_driver::{AgentDriverClient, AgentLaunchSpec};
+use crate::db::agent_driver::AgentLaunchSpec;
+use crate::mq::agent_client::{MqAgentClient, MqAgentConnectPlan};
 use crate::mq::auth::MqAuth;
 use crate::mq::config::MqAdminConfig;
 use crate::mq::port::MessageQueueAdmin;
@@ -53,27 +53,44 @@ const KAFKA_CAPABILITIES: MqCapabilities = MqCapabilities {
 };
 
 pub struct KafkaAdmin {
-    client: Arc<Mutex<AgentDriverClient>>,
+    client: MqAgentClient,
     config: MqAdminConfig,
+    /// Whether the brokers run an authorizer, learned once per adapter from the
+    /// live admin client. Unset until a probe gives a definite answer.
+    acl_enabled: tokio::sync::OnceCell<bool>,
 }
 
 impl KafkaAdmin {
-    /// Spawn the Kafka Java agent, perform handshake, and connect.
+    /// Spawn the Kafka Java agent (or take a prewarmed one), perform handshake, and connect.
     pub async fn new(cfg: MqAdminConfig, launch: AgentLaunchSpec) -> Result<Self, String> {
-        let mut client = AgentDriverClient::spawn(launch).await?;
-
-        // Handshake
-        let _: serde_json::Value =
-            client.call_with_timeout("handshake", serde_json::json!({}), cfg.rpc_timeout()).await?;
-
-        // Build the connection params from MqAdminConfig
-        let conn_params = build_connection_params(&cfg);
-        let connect_params = serde_json::json!({ "connection": conn_params });
-        let _: serde_json::Value = client.call_with_timeout("connect", connect_params, cfg.rpc_timeout()).await?;
+        let client = MqAgentClient::connect("kafka", launch, kafka_connect_plan(&cfg)).await?;
 
         log::info!("Kafka admin connected via agent (bootstrap servers: {})", bootstrap_servers(&cfg));
 
-        Ok(Self { client: Arc::new(Mutex::new(client)), config: cfg })
+        Ok(Self { client, config: cfg, acl_enabled: tokio::sync::OnceCell::new() })
+    }
+
+    /// ACL support of the connected cluster. Uses the agent's live admin client
+    /// (`mq_list_acls`) instead of the agent `test_connection` RPC, which builds
+    /// and tears down a whole new AdminClient (new TCP/TLS/SASL sessions) per call.
+    /// Only definite answers are cached; transient failures keep the capability on.
+    async fn acl_enabled(&self) -> bool {
+        if let Some(enabled) = self.acl_enabled.get() {
+            return *enabled;
+        }
+        let probe = self.call::<serde_json::Value>("mq_list_acls", serde_json::json!({})).await;
+        match kafka_acl_probe_outcome(probe.as_ref().map(|_| ()).map_err(String::as_str)) {
+            Some(enabled) => {
+                let _ = self.acl_enabled.set(enabled);
+                enabled
+            }
+            None => {
+                if let Err(err) = &probe {
+                    log::warn!("Kafka ACL capability probe failed; leaving the capability enabled: {err}");
+                }
+                true
+            }
+        }
     }
 
     /// Send a JSON-RPC call to the Kafka agent and deserialize the result.
@@ -82,8 +99,7 @@ impl KafkaAdmin {
         method: &str,
         params: serde_json::Value,
     ) -> Result<T, String> {
-        let mut client = self.client.lock().await;
-        client.call_with_timeout(method, params, self.config.rpc_timeout()).await
+        self.client.call(method, params, self.config.rpc_timeout()).await
     }
 
     /// The Kafka agent bounds these operations with its configured request timeout.
@@ -93,8 +109,17 @@ impl KafkaAdmin {
         method: &str,
         params: serde_json::Value,
     ) -> Result<T, String> {
-        let mut client = self.client.lock().await;
-        client.call_with_timeout(method, params, None).await
+        self.client.call(method, params, None).await
+    }
+
+    /// Consumer-group scans run several Admin stages in sequence, each bounded by
+    /// the agent's `timeout_ms`; wait for the agent's (possibly partial) answer.
+    async fn call_group_scan<T: DeserializeOwned + Send + 'static>(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<T, String> {
+        self.client.call(method, params, consumer_group_scan_rpc_timeout(&self.config)).await
     }
 
     /// Send a JSON-RPC call that returns `{ok: true}` on success.
@@ -114,17 +139,23 @@ impl MessageQueueAdmin for KafkaAdmin {
         MqSystemKind::Kafka
     }
 
+    /// `connect` already verifies the cluster with `describeCluster`.
+    fn build_includes_connect_test(&self) -> bool {
+        true
+    }
+
     async fn test_connection(&self) -> Result<MqClusterInfo, String> {
-        let conn_params = build_connection_params(&self.config);
-        let result: serde_json::Value =
-            self.call("test_connection", serde_json::json!({ "connection": conn_params })).await?;
+        // Probe through the agent's connected AdminClient: one metadata round trip on
+        // pooled broker connections. This also serves keepalive and the admin console,
+        // so it must not open fresh broker sessions each time.
+        let result: serde_json::Value = self.call("mq_describe_cluster", serde_json::json!({})).await?;
 
         let cluster_id = result.get("clusterId").and_then(|v| v.as_str()).map(String::from);
         let brokers = result.get("brokers").cloned().unwrap_or(serde_json::json!([]));
 
         // When the broker has no authorizer configured, disable permissions in the UI
         // so the frontend hides the tab instead of showing raw errors.
-        let acl_enabled = result.get("aclEnabled").and_then(|v| v.as_bool()).unwrap_or(true);
+        let acl_enabled = self.acl_enabled().await;
         let mut caps = KAFKA_CAPABILITIES;
         if !acl_enabled {
             caps.supports_permissions = false;
@@ -194,6 +225,7 @@ impl MessageQueueAdmin for KafkaAdmin {
             .map(|t| {
                 let name = t.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
                 let partitions = t.get("partitions").and_then(|v| v.as_u64()).map(|v| v as u32);
+                let replication_factor = t.get("replicationFactor").and_then(|v| v.as_u64()).map(|v| v as u32);
                 TopicInfo {
                     name: name.clone(),
                     short_name: name,
@@ -202,6 +234,7 @@ impl MessageQueueAdmin for KafkaAdmin {
                     // topics (fixes t8y2/dbx#6208).
                     partitioned: partitions.map(|p| p > 0).unwrap_or(false),
                     partitions,
+                    replication_factor,
                     persistent: true,
                     internal: t.get("internal").and_then(|v| v.as_bool()).unwrap_or(false),
                     message_type: None,
@@ -274,8 +307,9 @@ impl MessageQueueAdmin for KafkaAdmin {
         // handful of Kafka Admin calls. Subscriptions are filtered in memory below.
         // (The previous 1 + 2N serial RPC pattern — describe + lag per group — took
         // tens of seconds on remote clusters with many groups, see #7163.)
-        let result: serde_json::Value =
-            self.call("mq_list_consumer_groups", serde_json::json!({ "topic": topic.topic })).await?;
+        let result: serde_json::Value = self
+            .call_group_scan("mq_list_consumer_groups", consumer_group_list_params(&self.config, &topic.topic))
+            .await?;
         let groups = result.get("groups").and_then(|v| v.as_array()).cloned().unwrap_or_default();
 
         // For each group, check both active assignments and committed offsets.
@@ -290,7 +324,7 @@ impl MessageQueueAdmin for KafkaAdmin {
     }
 
     async fn get_kafka_consumer_group_snapshot(&self) -> Result<KafkaConsumerGroupSnapshot, String> {
-        self.call("mq_get_consumer_group_snapshot", consumer_group_snapshot_params(&self.config)).await
+        self.call_group_scan("mq_get_consumer_group_snapshot", consumer_group_snapshot_params(&self.config)).await
     }
 
     async fn create_subscription(&self, _topic: &TopicRef, _sub: &str, _pos: ResetPosition) -> Result<(), String> {
@@ -597,6 +631,17 @@ impl MessageQueueAdmin for KafkaAdmin {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Classify the ACL probe (`describeAcls` on the live admin client):
+/// `Some(true)` when ACLs are listable, `Some(false)` when the broker has no
+/// authorizer, `None` when the answer is unknown (timeouts, missing rights).
+fn kafka_acl_probe_outcome(result: Result<(), &str>) -> Option<bool> {
+    match result {
+        Ok(()) => Some(true),
+        Err(message) if message.contains("SecurityDisabled") || message.contains("No Authorizer") => Some(false),
+        Err(_) => None,
+    }
+}
+
 /// Extract Kafka bootstrap servers from MqAdminConfig.extra.
 fn bootstrap_servers(cfg: &MqAdminConfig) -> String {
     cfg.extra.get("bootstrapServers").and_then(|v| v.as_str()).unwrap_or("").to_string()
@@ -649,10 +694,41 @@ fn build_connection_params(cfg: &MqAdminConfig) -> serde_json::Value {
     })
 }
 
+fn kafka_connect_plan(cfg: &MqAdminConfig) -> MqAgentConnectPlan {
+    MqAgentConnectPlan {
+        connect_params: serde_json::json!({ "connection": build_connection_params(cfg) }),
+        timeout: cfg.rpc_timeout(),
+    }
+}
+
 fn consumer_group_snapshot_params(cfg: &MqAdminConfig) -> serde_json::Value {
     serde_json::json!({
         "timeout_ms": cfg.request_timeout_ms(),
     })
+}
+
+fn consumer_group_list_params(cfg: &MqAdminConfig, topic: &str) -> serde_json::Value {
+    serde_json::json!({
+        "topic": topic,
+        "timeout_ms": cfg.request_timeout_ms(),
+    })
+}
+
+/// Sequential Admin stages of a consumer-group scan (`mq_get_consumer_group_snapshot`,
+/// `mq_list_consumer_groups`): list groups, describe them, fetch committed offsets,
+/// fetch end offsets. The agent bounds each stage by `timeout_ms` and reports
+/// per-group failures instead of failing the scan.
+const CONSUMER_GROUP_SCAN_STAGES: u32 = 4;
+/// Time for the agent to serialize and ship a large scan after its last stage.
+const CONSUMER_GROUP_SCAN_GRACE: Duration = Duration::from_secs(10);
+
+/// Client-side wall for a consumer-group scan. A stage that waits out its whole
+/// budget (for example committed offsets that a broker never serves) must yield
+/// the agent's partial answer, not a client timeout that kills the agent.
+/// Other RPCs keep the plain query timeout.
+fn consumer_group_scan_rpc_timeout(cfg: &MqAdminConfig) -> Option<Duration> {
+    cfg.rpc_timeout()
+        .map(|timeout| timeout.saturating_mul(CONSUMER_GROUP_SCAN_STAGES).saturating_add(CONSUMER_GROUP_SCAN_GRACE))
 }
 
 fn peek_messages_params(
@@ -866,6 +942,12 @@ mod tests {
         }
     }
 
+    async fn test_admin(launch: AgentLaunchSpec, config: MqAdminConfig) -> KafkaAdmin {
+        let client = crate::db::agent_driver::AgentDriverClient::spawn(launch.clone()).await.expect("spawn test agent");
+        let client = MqAgentClient::from_client("kafka", launch, kafka_connect_plan(&config), client);
+        KafkaAdmin { client, config, acl_enabled: tokio::sync::OnceCell::new() }
+    }
+
     fn topic_ref() -> TopicRef {
         TopicRef {
             tenant: "_kafka".to_string(),
@@ -919,6 +1001,63 @@ mod tests {
 
         assert_eq!(params.get("timeout_ms").and_then(serde_json::Value::as_u64), Some(3_600_000));
         assert_eq!(cfg.rpc_timeout(), None);
+    }
+
+    #[test]
+    fn consumer_group_scans_get_a_stage_scaled_timeout_and_other_rpcs_keep_the_query_timeout() {
+        let mut cfg = kafka_config(serde_json::json!({ "bootstrapServers": "broker:9092" }), MqAuth::None, false);
+        assert_eq!(cfg.rpc_timeout(), Some(Duration::from_secs(30)));
+        assert_eq!(consumer_group_scan_rpc_timeout(&cfg), Some(Duration::from_secs(4 * 30 + 10)));
+
+        cfg.query_timeout_secs = 5;
+        assert_eq!(cfg.rpc_timeout(), Some(Duration::from_secs(5)));
+        assert_eq!(consumer_group_scan_rpc_timeout(&cfg), Some(Duration::from_secs(30)));
+        let params = consumer_group_list_params(&cfg, "orders");
+        assert_eq!(params["topic"], "orders");
+        assert_eq!(params["timeout_ms"], 5_000, "the agent bounds each stage by the query timeout");
+
+        cfg.query_timeout_secs = 0;
+        assert_eq!(consumer_group_scan_rpc_timeout(&cfg), None, "unlimited stays unlimited");
+    }
+
+    /// A snapshot slower than the query timeout (an Admin stage waiting out its
+    /// budget) returns the agent's answer instead of a client-side timeout.
+    #[tokio::test]
+    async fn consumer_group_snapshot_waits_past_the_query_timeout_for_the_agent_answer() {
+        let script_path = std::env::temp_dir().join(format!("dbx-kafka-slow-snapshot-{}.py", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &script_path,
+            r#"import json
+import sys
+import time
+
+print(json.dumps({"ready": True}), flush=True)
+for line in sys.stdin:
+    request = json.loads(line)
+    if request["method"] == "mq_get_consumer_group_snapshot":
+        time.sleep(1.5)
+        result = {"groups": [{"groupId": "g", "state": "EMPTY", "topics": [], "lagAvailable": False,
+                              "partitions": [], "error": "Committed offsets unavailable: TimeoutException"}]}
+    else:
+        result = {"ok": True}
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+"#,
+        )
+        .expect("write test agent script");
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let mut config = kafka_config(serde_json::json!({ "bootstrapServers": "broker:9092" }), MqAuth::None, false);
+        config.query_timeout_secs = 1;
+        let admin =
+            test_admin(AgentLaunchSpec::new(python).with_args([script_path.to_string_lossy().to_string()]), config)
+                .await;
+
+        let snapshot = admin.get_kafka_consumer_group_snapshot().await;
+        drop(admin);
+        let _ = std::fs::remove_file(&script_path);
+
+        let snapshot = snapshot.expect("the scan must not be cut off at the 1s query timeout");
+        assert_eq!(snapshot.groups[0].group_id, "g");
+        assert!(snapshot.groups[0].error.as_deref().unwrap().contains("Committed offsets unavailable"));
     }
 
     #[test]
@@ -1335,6 +1474,73 @@ mod tests {
         assert!(!partitions.map(|p| p > 0).unwrap_or(false));
     }
 
+    #[test]
+    fn acl_probe_outcome_only_caches_definite_answers() {
+        assert_eq!(kafka_acl_probe_outcome(Ok(())), Some(true));
+        assert_eq!(
+            kafka_acl_probe_outcome(Err(
+                "org.apache.kafka.common.errors.SecurityDisabledException: No Authorizer is configured on the broker"
+            )),
+            Some(false)
+        );
+        assert_eq!(kafka_acl_probe_outcome(Err("Timed out waiting for a node assignment")), None);
+        assert_eq!(kafka_acl_probe_outcome(Err("ClusterAuthorizationException: not authorized")), None);
+    }
+
+    #[tokio::test]
+    async fn test_connection_reuses_the_live_admin_client_and_caches_acl_support() {
+        let dir = std::env::temp_dir().join(format!("dbx-kafka-live-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let log_path = dir.join("calls.log");
+        let script_path = dir.join("agent.py");
+        std::fs::write(
+            &script_path,
+            format!(
+                r#"import json
+import sys
+
+log = open({log:?}, "a")
+print(json.dumps({{"ready": True}}), flush=True)
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request["method"]
+    log.write(method + "\n")
+    log.flush()
+    if method == "mq_describe_cluster":
+        reply = {{"result": {{"clusterId": "c1", "brokers": [{{"id": 1, "host": "b1", "port": 9092}}], "nodeCount": 1}}}}
+    elif method == "mq_list_acls":
+        reply = {{"error": {{"code": -1, "message": "org.apache.kafka.common.errors.SecurityDisabledException: No Authorizer is configured on the broker"}}}}
+    else:
+        reply = {{"error": {{"code": -1, "message": "unexpected " + method}}}}
+    reply.update({{"jsonrpc": "2.0", "id": request["id"]}})
+    print(json.dumps(reply), flush=True)
+"#,
+                log = log_path.to_string_lossy()
+            ),
+        )
+        .expect("write test agent script");
+
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let config = kafka_config(serde_json::json!({ "bootstrapServers": "broker:9092" }), MqAuth::None, false);
+        let admin =
+            test_admin(AgentLaunchSpec::new(python).with_args([script_path.to_string_lossy().to_string()]), config)
+                .await;
+
+        assert!(admin.build_includes_connect_test(), "connect already runs describeCluster");
+        let first = admin.test_connection().await.expect("first probe");
+        let second = admin.test_connection().await.expect("second probe");
+        drop(admin);
+        let calls = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(!first.capabilities.supports_permissions, "no authorizer disables the permissions tab");
+        assert!(!second.capabilities.supports_permissions);
+        assert_eq!(first.extra["clusterId"], "c1");
+        assert_eq!(first.extra["brokers"][0]["host"], "b1");
+        let calls = calls.lines().collect::<Vec<_>>();
+        assert_eq!(calls, vec!["mq_describe_cluster", "mq_list_acls", "mq_describe_cluster"]);
+    }
+
     #[tokio::test]
     async fn topic_listing_does_not_preempt_agent_timeout_fallback() {
         let script_path = std::env::temp_dir().join(format!("dbx-kafka-topic-timeout-{}.py", uuid::Uuid::new_v4()));
@@ -1359,15 +1565,12 @@ for line in sys.stdin:
         .expect("write test agent script");
 
         let python = if cfg!(windows) { "python" } else { "python3" };
-        let client = AgentDriverClient::spawn(
-            AgentLaunchSpec::new(python).with_args([script_path.to_string_lossy().to_string()]),
-        )
-        .await
-        .expect("spawn test agent");
         // The delayed response models the Kafka agent returning its fallback after metadata timeout.
         let mut config = kafka_config(serde_json::json!({ "bootstrapServers": "broker:9092" }), MqAuth::None, false);
         config.query_timeout_secs = 1;
-        let admin = KafkaAdmin { client: Arc::new(Mutex::new(client)), config };
+        let admin =
+            test_admin(AgentLaunchSpec::new(python).with_args([script_path.to_string_lossy().to_string()]), config)
+                .await;
 
         let result = admin
             .list_topics(
@@ -1381,5 +1584,120 @@ for line in sys.stdin:
         let topics = result.expect("topic listing should wait for the agent response");
         assert_eq!(topics.len(), 1);
         assert_eq!(topics[0].name, "delayed");
+    }
+    /// The observability tools read these adapter results; this pins the agent
+    /// payload fields they rely on (replication factor, per-partition offsets,
+    /// topic configs, group snapshot) against a fake agent.
+    #[tokio::test]
+    async fn observability_reads_map_agent_payloads() {
+        let script_path = std::env::temp_dir().join(format!("dbx-kafka-observe-{}.py", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &script_path,
+            r#"import json
+import sys
+
+print(json.dumps({"ready": True}), flush=True)
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request["method"]
+    if method == "mq_list_topics":
+        result = {"topics": [{"name": "orders", "partitions": 3, "replicationFactor": 2, "internal": False}]}
+    elif method == "mq_get_topic_stats":
+        result = {"name": request["params"]["name"], "partitions": 1, "replicationFactor": 1, "totalMessages": 7,
+                  "partitionStats": [{"partition": 0, "leader": 1, "replicas": [1], "isr": [1],
+                                      "beginOffset": 3, "endOffset": 10, "messageCount": 7}]}
+    elif method == "mq_get_topic_config":
+        result = {"configs": {"cleanup.policy": {"value": "delete", "source": "DEFAULT_CONFIG",
+                                                 "isSensitive": False, "isReadOnly": False, "isDefault": True}}}
+    elif method == "mq_get_consumer_group_snapshot":
+        result = {"groups": [{"groupId": "g", "state": "STABLE", "simpleGroup": False, "memberCount": 1,
+                              "topics": ["orders"], "totalLag": 4, "lagAvailable": True,
+                              "partitions": [{"topic": "orders", "partition": 0, "currentOffset": 6,
+                                              "endOffset": 10, "lag": 4}], "error": None}]}
+    else:
+        result = None
+    reply = {"jsonrpc": "2.0", "id": request["id"]}
+    if result is None:
+        reply["error"] = {"code": -1, "message": "unexpected " + method}
+    else:
+        reply["result"] = result
+    print(json.dumps(reply), flush=True)
+"#,
+        )
+        .expect("write test agent script");
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let config = kafka_config(serde_json::json!({ "bootstrapServers": "broker:9092" }), MqAuth::None, false);
+        let admin =
+            test_admin(AgentLaunchSpec::new(python).with_args([script_path.to_string_lossy().to_string()]), config)
+                .await;
+
+        let ns = NamespaceRef { tenant: "_kafka".to_string(), namespace: "default".to_string() };
+        let topics = admin.list_topics(&ns, ListTopicsOpts::default()).await.expect("topics");
+        let stats = admin.get_topic_stats(&topic_ref()).await.expect("stats");
+        let config = admin.get_topic_internal_stats(&topic_ref()).await.expect("config");
+        let groups = admin.get_kafka_consumer_group_snapshot().await.expect("groups");
+        drop(admin);
+        let _ = std::fs::remove_file(&script_path);
+
+        assert_eq!(topics[0].partitions, Some(3));
+        assert_eq!(topics[0].replication_factor, Some(2));
+        assert_eq!(stats.raw["partitionStats"][0]["beginOffset"], 3);
+        assert_eq!(stats.msg_in_counter, 7);
+        assert_eq!(config["configs"]["cleanup.policy"]["value"], "delete");
+        assert_eq!(groups.groups[0].partitions[0].lag, Some(4));
+    }
+
+    /// Live timing of the observability reads against a real broker:
+    /// `DBX_KAFKA_LIVE_BOOTSTRAP=host:port DBX_KAFKA_LIVE_CLASSPATH=<agent jar[:patched classes]>
+    /// cargo test -p dbx-core --lib kafka_observability_live_timings -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "needs a live Kafka broker and a Kafka agent jar"]
+    async fn kafka_observability_live_timings() {
+        use crate::mq::kafka_observability as kafka;
+        let bootstrap = std::env::var("DBX_KAFKA_LIVE_BOOTSTRAP").expect("DBX_KAFKA_LIVE_BOOTSTRAP");
+        let classpath = std::env::var("DBX_KAFKA_LIVE_CLASSPATH").expect("DBX_KAFKA_LIVE_CLASSPATH");
+        let group = std::env::var("DBX_KAFKA_LIVE_GROUP").ok();
+        let launch = AgentLaunchSpec::new("java").with_args(["-cp", &classpath, "com.dbx.agent.kafka.KafkaAgent"]);
+        let config = kafka_config(serde_json::json!({ "bootstrapServers": bootstrap }), MqAuth::None, false);
+        let admin = KafkaAdmin::new(config, launch).await.expect("connect");
+        let timed = |label: &str, started: std::time::Instant, detail: String| {
+            eprintln!("{label}: {:.2}s {detail}", started.elapsed().as_secs_f64());
+        };
+
+        let started = std::time::Instant::now();
+        let snapshot = admin.get_kafka_consumer_group_snapshot().await.expect("lag snapshot");
+        let lag = kafka::shape_lag(&snapshot, None, kafka::MAX_LAG_ROWS);
+        timed(
+            "lag(all groups)",
+            started,
+            format!("rows={} errors={}", lag["rows"].as_array().map_or(0, Vec::len), lag["groups_with_errors"]),
+        );
+
+        let started = std::time::Instant::now();
+        let snapshot = admin.get_kafka_consumer_group_snapshot().await.expect("group snapshot");
+        let groups = kafka::shape_consumer_groups(&snapshot, kafka::MAX_GROUP_ROWS);
+        timed("list_consumer_groups", started, format!("groups={}", groups["group_count"]));
+
+        let group = group.unwrap_or_else(|| snapshot.groups[0].group_id.clone());
+        let started = std::time::Instant::now();
+        let snapshot = admin.get_kafka_consumer_group_snapshot().await.expect("group snapshot");
+        let one = kafka::shape_consumer_group(
+            kafka::find_group(&snapshot, &group).expect("group"),
+            kafka::MAX_PARTITION_ROWS,
+        );
+        timed(
+            "consumer_group",
+            started,
+            format!("{group}: partitions={} error={}", one["partitions"].as_array().map_or(0, Vec::len), one["error"]),
+        );
+
+        let started = std::time::Instant::now();
+        let clock = kafka::TokioClock::default();
+        let (first, second) =
+            kafka::sample_twice(&clock, Duration::from_secs(5), || admin.get_kafka_consumer_group_snapshot())
+                .await
+                .expect("throughput samples");
+        let throughput = kafka::shape_throughput(&first, &second, None, kafka::MAX_LAG_ROWS);
+        timed("throughput(5s)", started, format!("statuses={}", throughput["statuses"]));
     }
 }

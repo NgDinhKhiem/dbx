@@ -13,6 +13,12 @@ use crate::backend::{format_query_result, new_connection_config, parse_database_
 use crate::mongo::{self, MongoCommand, MongoSafetyError};
 use crate::session::{McpSession, McpSessionStore};
 use crate::transaction::{TransactionFailure, TransactionResult, TransactionStatus};
+
+#[cfg(feature = "mq-admin")]
+#[path = "kafka_tools.rs"]
+pub(crate) mod kafka_tools;
+#[path = "opensearch_tools.rs"]
+pub(crate) mod opensearch_tools;
 use dbx_core::{
     agent_tools::{
         format_query_result_as_text, normalize_sql_for_confirmation, QueryCellWindow, MAX_EXECUTE_QUERY_ROWS,
@@ -462,6 +468,9 @@ impl DbxMcpServer {
             tool_router.disable_route("dbx_send_message");
             tool_router.disable_route("dbx_peek_messages");
         }
+        #[cfg(feature = "mq-admin")]
+        tool_router.merge(Self::kafka_tool_router());
+        tool_router.merge(Self::opensearch_tool_router());
         Self { backend, scope, sessions: McpSessionStore::new(), tool_router }
     }
 
@@ -4092,9 +4101,19 @@ mod tests {
         let tools = server.tool_router.list_all();
         let names = tools.iter().map(|tool| tool.name.as_ref()).collect::<Vec<_>>();
         #[cfg(feature = "mq-admin")]
-        assert_eq!(tools.len(), 22);
+        assert_eq!(
+            tools.len(),
+            22 + kafka_tools::KAFKA_TOOL_NAMES.len() + opensearch_tools::OPENSEARCH_TOOL_NAMES.len()
+        );
+        for opensearch_tool in opensearch_tools::OPENSEARCH_TOOL_NAMES {
+            assert!(names.contains(opensearch_tool), "{opensearch_tool} should be registered");
+        }
+        #[cfg(feature = "mq-admin")]
+        for kafka_tool in kafka_tools::KAFKA_TOOL_NAMES {
+            assert!(names.contains(kafka_tool), "{kafka_tool} should be registered");
+        }
         #[cfg(not(feature = "mq-admin"))]
-        assert_eq!(tools.len(), 20);
+        assert_eq!(tools.len(), 20 + opensearch_tools::OPENSEARCH_TOOL_NAMES.len());
         #[cfg(feature = "mq-admin")]
         assert!(names.contains(&"dbx_peek_messages"));
         #[cfg(not(feature = "mq-admin"))]
@@ -4247,6 +4266,9 @@ mod tests {
 
         #[cfg(feature = "mq-admin")]
         checks.push(("dbx_peek_messages", &["count", "partition", "offset"]));
+        checks.push(("dbx_opensearch_search", &["query", "language", "from", "to", "time_field", "all_time", "limit"]));
+        checks.push(("dbx_opensearch_ppl", &["from", "to", "time_field", "all_time", "limit"]));
+        checks.push(("dbx_opensearch_sql", &["limit"]));
         for (tool_name, fields) in checks {
             let tool = tools.iter().find(|tool| tool.name == *tool_name).expect("tool should be registered");
             let properties = tool
@@ -4361,9 +4383,12 @@ mod tests {
         );
         let names = server.tool_router.list_all().into_iter().map(|tool| tool.name).collect::<Vec<_>>();
         #[cfg(feature = "mq-admin")]
-        assert_eq!(names.len(), 17);
+        assert_eq!(
+            names.len(),
+            17 + kafka_tools::KAFKA_TOOL_NAMES.len() + opensearch_tools::OPENSEARCH_TOOL_NAMES.len()
+        );
         #[cfg(not(feature = "mq-admin"))]
-        assert_eq!(names.len(), 15);
+        assert_eq!(names.len(), 15 + opensearch_tools::OPENSEARCH_TOOL_NAMES.len());
         assert!(!names.iter().any(|name| name == "dbx_add_connection"));
         assert!(!names.iter().any(|name| name == "dbx_duplicate_connection"));
         assert!(!names.iter().any(|name| name == "dbx_remove_connection"));

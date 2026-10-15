@@ -90,6 +90,7 @@ export const EDITOR_SETTINGS_DRAFT_KEYS = [
   "dataTabReuseMode",
   "openDataTabsNextToActive",
   "prefillNewQueryWithSelect",
+  "prewarmDrivers",
   "generateSqlIncludeDatabaseName",
   "generateSqlQuoteIdentifiers",
   "formatSqlOnSqlFileSave",

@@ -5,6 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use dbx_core::db::elasticsearch_driver::{ElasticsearchClusterInfo, ElasticsearchRawRequest, ElasticsearchRawResponse};
 use dbx_core::{
     agent_events::{ToolCall, ToolResult},
     agent_tools::{self, format_query_result_as_text, AgentSqlPermissions, QueryCellWindow},
@@ -266,6 +267,16 @@ pub trait DbxBackend: Send + Sync {
         let _ = (connection, topic, count, options);
         Err("Message queue reading is not supported by this backend.".to_string())
     }
+    /// Read-only Kafka observability fetch (`dbx_kafka_*` tools).
+    #[cfg(feature = "mq-admin")]
+    async fn kafka_observe(
+        &self,
+        connection: &ConnectionConfig,
+        request: dbx_core::mq::kafka_observability::KafkaObserveRequest,
+    ) -> Result<Value, String> {
+        let _ = (connection, request);
+        Err("Kafka observability is not supported by this backend.".to_string())
+    }
     async fn execute_query(
         &self,
         connection: &ConnectionConfig,
@@ -412,6 +423,37 @@ pub trait DbxBackend: Send + Sync {
     ) -> Result<dbx_core::docs::SchemaSnapshot, String> {
         let _ = (connection, database, options);
         Err("Documentation snapshots are not supported by this backend.".to_string())
+    }
+    /// Read-only REST request against an Elasticsearch / OpenSearch /
+    /// Easysearch connection (`dbx_opensearch_*` tools). Callers only send
+    /// read endpoints; non-2xx responses are data, not errors.
+    async fn elasticsearch_read_request(
+        &self,
+        connection: &ConnectionConfig,
+        method: &str,
+        path: &str,
+        body: Option<String>,
+    ) -> Result<ElasticsearchRawResponse, String> {
+        let _ = (connection, method, path, body);
+        Err("Elasticsearch requests are not supported by this backend.".to_string())
+    }
+    /// Distribution and version of the search cluster (cached per connection).
+    async fn elasticsearch_cluster_info(
+        &self,
+        connection: &ConnectionConfig,
+    ) -> Result<ElasticsearchClusterInfo, String> {
+        let _ = connection;
+        Err("Elasticsearch cluster info is not supported by this backend.".to_string())
+    }
+}
+
+/// Rejects anything but read endpoints before it reaches a cluster.
+fn ensure_elasticsearch_read_request(method: &str, path: &str, body: Option<&String>) -> Result<(), String> {
+    let request = ElasticsearchRawRequest::parse(method, path, body.cloned())?;
+    if request.is_read_only() {
+        Ok(())
+    } else {
+        Err(format!("MCP_READ_ONLY: {} {} is not a read-only request.", request.method(), request.path()))
     }
 }
 
@@ -1004,6 +1046,15 @@ impl DbxBackend for LocalBackend {
         .await
     }
 
+    #[cfg(feature = "mq-admin")]
+    async fn kafka_observe(
+        &self,
+        connection: &ConnectionConfig,
+        request: dbx_core::mq::kafka_observability::KafkaObserveRequest,
+    ) -> Result<Value, String> {
+        dbx_core::mq::kafka_observability::kafka_observe_core(&self.state, &connection.id, request).await
+    }
+
     async fn open_transaction_owner(
         &self,
         connection: &ConnectionConfig,
@@ -1292,6 +1343,24 @@ impl DbxBackend for LocalBackend {
             Err(response.text().await.unwrap_or_else(|_| "DBX bridge request failed.".to_string()))
         }
     }
+
+    async fn elasticsearch_read_request(
+        &self,
+        connection: &ConnectionConfig,
+        method: &str,
+        path: &str,
+        body: Option<String>,
+    ) -> Result<ElasticsearchRawResponse, String> {
+        ensure_elasticsearch_read_request(method, path, body.as_ref())?;
+        dbx_core::document_ops::elasticsearch_raw_request_core(&self.state, &connection.id, method, path, body).await
+    }
+
+    async fn elasticsearch_cluster_info(
+        &self,
+        connection: &ConnectionConfig,
+    ) -> Result<ElasticsearchClusterInfo, String> {
+        dbx_core::document_ops::elasticsearch_cluster_info_core(&self.state, &connection.id).await
+    }
 }
 
 #[async_trait]
@@ -1504,6 +1573,20 @@ impl DbxBackend for WebBackend {
             "/api/mq/subscriptions/peek-messages",
             Some(json!({ "connectionId": connection.id, "topic": topic, "sub": "__dbx_kafka_viewer__", "count": count, "options": options })),
         ).await?.json().await.map_err(|error| format!("Invalid message peek response: {error}"))
+    }
+
+    #[cfg(feature = "mq-admin")]
+    async fn kafka_observe(
+        &self,
+        connection: &ConnectionConfig,
+        request: dbx_core::mq::kafka_observability::KafkaObserveRequest,
+    ) -> Result<Value, String> {
+        let (path, body) = request.web_api_request(&connection.id);
+        self.request(reqwest::Method::POST, path, Some(body))
+            .await?
+            .json()
+            .await
+            .map_err(|error| format!("Invalid Kafka response from {path}: {error}"))
     }
 
     async fn execute_query(
@@ -1825,6 +1908,39 @@ impl DbxBackend for WebBackend {
         .json()
         .await
         .map_err(|error| format!("Invalid docs snapshot response: {error}"))
+    }
+
+    async fn elasticsearch_read_request(
+        &self,
+        connection: &ConnectionConfig,
+        method: &str,
+        path: &str,
+        body: Option<String>,
+    ) -> Result<ElasticsearchRawResponse, String> {
+        ensure_elasticsearch_read_request(method, path, body.as_ref())?;
+        self.ensure_connected(connection).await?;
+        let payload = json!({ "connectionId": connection.id, "method": method, "path": path, "body": body });
+        self.request(reqwest::Method::POST, "/api/elasticsearch/raw-request", Some(payload))
+            .await?
+            .json()
+            .await
+            .map_err(|error| format!("Invalid Elasticsearch response: {error}"))
+    }
+
+    async fn elasticsearch_cluster_info(
+        &self,
+        connection: &ConnectionConfig,
+    ) -> Result<ElasticsearchClusterInfo, String> {
+        self.ensure_connected(connection).await?;
+        self.request(
+            reqwest::Method::POST,
+            "/api/elasticsearch/cluster-info",
+            Some(json!({ "connectionId": connection.id })),
+        )
+        .await?
+        .json()
+        .await
+        .map_err(|error| format!("Invalid Elasticsearch cluster info response: {error}"))
     }
 
     async fn execute_redis_command(

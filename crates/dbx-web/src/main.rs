@@ -236,6 +236,7 @@ fn comma_separated_env(name: &str) -> Vec<String> {
 fn add_mq_routes(router: Router<Arc<WebState>>) -> Router<Arc<WebState>> {
     router
         .route("/mq/test-connection", post(routes::mq::test_connection))
+        .route("/mq/prewarm-agent", post(routes::mq::prewarm_agent))
         .route("/mq/tenants/list", post(routes::mq::list_tenants))
         .route("/mq/tenants/get", post(routes::mq::get_tenant))
         .route("/mq/tenants/create", post(routes::mq::create_tenant))
@@ -1041,6 +1042,8 @@ async fn serve() {
             "/document-store/elasticsearch/documents/delete-all",
             post(routes::document_store::elasticsearch_delete_all_documents),
         )
+        .route("/elasticsearch/raw-request", post(routes::document_store::elasticsearch_raw_request))
+        .route("/elasticsearch/cluster-info", post(routes::document_store::elasticsearch_cluster_info))
         .route("/document-store/list-gridfs-buckets", post(routes::document_store::list_gridfs_buckets))
         .route("/document-store/create-gridfs-bucket", post(routes::document_store::create_gridfs_bucket))
         .route("/document-store/delete-gridfs-bucket", post(routes::document_store::delete_gridfs_bucket))

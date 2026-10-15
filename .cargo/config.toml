@@ -16,6 +16,11 @@
 [env]
 # Enable SQLite's built-in math functions for rusqlite's bundled libsqlite3.
 LIBSQLITE3_FLAGS = "SQLITE_ENABLE_MATH_FUNCTIONS"
+# Tests and `cargo run` in this repository never use the OS credential store
+# (macOS Keychain prompts on every rebuilt test binary); the default key
+# policy uses the per-user key file instead, like the desktop app. Release
+# builds are unaffected.
+DBX_DISABLE_OS_KEYRING = "1"
 
 [target.x86_64-pc-windows-msvc]
 linker = "rust-lld"

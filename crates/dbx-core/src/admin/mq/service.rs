@@ -842,15 +842,52 @@ async fn get_adapter(
     state.mq_registry.get_or_build_config(conn_id, mqc, agent_launch).await.map(|build| build.adapter)
 }
 
+/// Warm the agent runtime for an agent-backed MQ connection: start its JVM in the
+/// background so the first connect skips process start-up. Never connects to the
+/// broker and never starts SSH/proxy transport layers. Returns `true` when a spare
+/// process is starting or already warm.
+pub async fn mq_prewarm_agent_core(state: &AppState, conn_id: &str) -> Result<bool, String> {
+    let cfg = state.configs.read().await.get(conn_id).cloned().ok_or("Connection not found")?;
+    if cfg.db_type != crate::models::connection::DatabaseType::MessageQueue {
+        return Ok(false);
+    }
+    // A live adapter already owns a warm agent.
+    if state.mq_registry.has_cached_connection(conn_id).await {
+        return Ok(false);
+    }
+    // Pure parse of the saved config: no endpoint resolution, tunnels or credentials.
+    let mqc = MqAdminConfig::from_connection(&cfg)?;
+    let Some(agent_key) = mq_agent_key(mqc.system_kind) else {
+        return Ok(false);
+    };
+    if !state.agent_manager.load_state().installed_drivers.contains_key(agent_key) {
+        return Ok(false);
+    }
+    let Some(launch) = resolve_mq_agent_launch_spec(&mqc, state) else {
+        return Ok(false);
+    };
+    let outcome = crate::agent_prewarm::spare_pool().prewarm(launch);
+    log::debug!("MQ agent prewarm for '{conn_id}': {outcome:?}");
+    Ok(matches!(
+        outcome,
+        crate::agent_prewarm::PrewarmOutcome::Started | crate::agent_prewarm::PrewarmOutcome::AlreadyWarm
+    ))
+}
+
+/// Driver store key of the agent that serves an MQ system, if it is agent-backed.
+fn mq_agent_key(system_kind: MqSystemKind) -> Option<&'static str> {
+    match system_kind {
+        MqSystemKind::Kafka => Some("kafka"),
+        MqSystemKind::RocketMq => Some("rocketmq"),
+        MqSystemKind::RabbitMq => Some("rabbitmq"),
+        _ => None,
+    }
+}
+
 /// Resolve the MQ agent launch spec for agent-backed systems (Kafka, RocketMQ, RabbitMQ).
 /// Returns `None` for native REST systems so the registry skips agent resolution.
 pub fn resolve_mq_agent_launch_spec(mqc: &MqAdminConfig, state: &AppState) -> Option<AgentLaunchSpec> {
-    let agent_key = match mqc.system_kind {
-        MqSystemKind::Kafka => "kafka",
-        MqSystemKind::RocketMq => "rocketmq",
-        MqSystemKind::RabbitMq => "rabbitmq",
-        _ => return None,
-    };
+    let agent_key = mq_agent_key(mqc.system_kind)?;
     let agent_state = state.agent_manager.load_state();
     let jre_key = agent_state
         .installed_drivers
@@ -991,6 +1028,30 @@ mod tests {
         let state = AppState::new_with_plugin_dir(storage, dir.join("plugins"));
         state.configs.write().await.insert(config.id.clone(), config);
         (state, dir)
+    }
+
+    #[tokio::test]
+    async fn prewarm_only_targets_agent_backed_message_queues() {
+        // Pulsar is a native REST adapter: nothing to warm, and no connection is opened.
+        let (state, dir) = test_state_with(mq_connection(false)).await;
+        assert_eq!(mq_prewarm_agent_core(&state, "readonly-mq").await, Ok(false));
+        assert!(!state.mq_registry.has_cached_connection("readonly-mq").await);
+
+        let mut sql = mq_connection(false);
+        sql.id = "sql".to_string();
+        sql.db_type = DatabaseType::Mysql;
+        state.configs.write().await.insert(sql.id.clone(), sql);
+        assert_eq!(mq_prewarm_agent_core(&state, "sql").await, Ok(false));
+        assert!(mq_prewarm_agent_core(&state, "missing").await.is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn agent_keys_cover_agent_backed_systems_only() {
+        assert_eq!(mq_agent_key(MqSystemKind::Kafka), Some("kafka"));
+        assert_eq!(mq_agent_key(MqSystemKind::RocketMq), Some("rocketmq"));
+        assert_eq!(mq_agent_key(MqSystemKind::RabbitMq), Some("rabbitmq"));
+        assert_eq!(mq_agent_key(MqSystemKind::Pulsar), None);
     }
 
     #[tokio::test]

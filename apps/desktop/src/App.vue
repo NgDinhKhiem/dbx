@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { scheduleStartupDriverPrewarm } from "@/lib/connection/driverPrewarmRuntime";
 import { blockingDesktopAiRunsForUpdate } from "@/lib/ai/desktopAiRunRegistry";
 import { setupUpdatePreparation, prepareUpdateWithDraftRecovery, isUpdatePreparationActive } from "@/lib/app/updatePreparation";
 import { ref, computed, watch, onMounted, onUnmounted, nextTick, defineAsyncComponent, provide } from "vue";
@@ -3923,6 +3924,9 @@ async function initApp() {
       });
 
     restoreActiveConnectionContext();
+    // Start agent runtimes (e.g. the Kafka JVM) in the background once startup settles.
+    // Only warms driver processes; never connects to a saved database or broker.
+    scheduleStartupDriverPrewarm();
   } catch (e: any) {
     toast(t("connection.loadFailed", { message: e?.message || String(e) }), 5000);
   }

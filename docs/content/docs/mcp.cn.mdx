@@ -111,6 +111,20 @@ DBX MCP 当前提供以下工具（具体可用工具取决于构建功能及权
 | `dbx_execute_redis_command` | 执行 Redis 命令 |
 | `dbx_peek_messages` | 读取 Kafka 消息，不提交消费位点 |
 | `dbx_send_message` | 向支持的消息队列 Topic 或队列发送消息 |
+| `dbx_kafka_cluster` | Kafka 集群概览：控制器、Broker、主题数量 |
+| `dbx_kafka_list_topics` | Kafka 主题及其分区数和副本数 |
+| `dbx_kafka_describe_topic` | 每个分区的 Leader、副本、ISR、起止位点和消息数 |
+| `dbx_kafka_topic_config` | 主题配置（保留时间、清理策略等），覆盖项在前 |
+| `dbx_kafka_list_consumer_groups` | 消费组及其状态、成员数和总延迟 |
+| `dbx_kafka_consumer_group` | 单个消费组每个分区的已提交位点、末尾位点和延迟 |
+| `dbx_kafka_lag` | 所有消费组和主题的延迟，最严重的在前，含 `max_partition_lag` |
+| `dbx_kafka_throughput` | 采样期间的生产/消费速率及状态（已追上、停滞、落后、追赶中、持平） |
+| `dbx_opensearch_list_indices` | 先列出 Dashboards/Kibana 索引模式，再列出具体索引 |
+| `dbx_opensearch_resolve_pattern` | 把索引模式展开为具体索引和别名 |
+| `dbx_opensearch_fields` | 索引模式的字段、类型、是否可搜索和可聚合 |
+| `dbx_opensearch_search` | 在时间窗口内用 DQL 或 Lucene 搜索（默认最近 1 小时） |
+| `dbx_opensearch_sql` | 只读 SQL（OpenSearch 用 `_plugins/_sql`，Elasticsearch 用 `_sql`） |
+| `dbx_opensearch_ppl` | 在时间窗口内执行 PPL（仅 OpenSearch） |
 | `dbx_open_table` | 在运行中的 DBX 桌面端打开表 |
 | `dbx_execute_and_show` | 执行查询并在 DBX 中展示结果 |
 
@@ -141,6 +155,22 @@ DBX MCP 当前提供以下工具（具体可用工具取决于构建功能及权
 - JSON 结果包含 `messages`，保留 base64 消息体、可无损解码时的 UTF-8 预览、消息 ID 和元数据。`incomplete` 表示读取达到超时或扫描上限；`outputTruncated` 表示为满足 256 KiB 消息输出预算而省略了整条消息。如果首条消息过大，可能返回空列表并标记 `outputTruncated: true`，不会静默截断消息体。
 
 该工具读取有限条消息快照，不提供持续订阅或全 Topic 文本搜索。其他消息队列类型会被拒绝。
+
+## Kafka 可观测性
+
+包含 `mq-admin` 的构建中可用。所有工具均为只读（不修改主题、不移动位点），通过 `connection_id` 或 `connection_name` 选择连接，并遵守 MCP 连接范围及工具白名单。
+
+- `dbx_kafka_lag` 按严重程度列出所有消费组和主题。`max_partition_lag` 和 `pattern` 可区分消费慢（`spread`：延迟分布在所有分区）和消费卡住（`concentrated`：延迟集中在一个分区）。
+- `dbx_kafka_throughput` 间隔 `sample_seconds`（默认 10，范围 2–60）读取两次位点，因此需要相应时间才返回。结果包含每秒生产/消费消息数、积压变化速度、追上所需时间，以及状态：已追上、停滞、落后、追赶中或持平。
+
+## OpenSearch 时间窗口搜索
+
+适用于 `elasticsearch` / `easysearch` 连接（OpenSearch 和 Elasticsearch）。日志索引是时间序列，因此 `dbx_opensearch_search` 和 `dbx_opensearch_ppl` 按时间窗口限定：
+
+- `from` / `to` 支持 `now`、`now-15m`、`now-24h`、`now-7d` 等日期运算或绝对时间；省略时为最近 1 小时。每个结果都会说明实际使用的 UTC 时间窗口。
+- `time_field` 默认使用 Dashboards 中该索引模式保存的时间字段，否则为 `@timestamp`。仅对没有时间字段的索引传 `all_time: true`。
+- `language` 为 `dql`（默认）或 `lucene`。建议先调用 `dbx_opensearch_fields`：查询不可搜索的字段会导致整个搜索失败。
+- `dbx_opensearch_sql` 只接受单条 `SELECT`。在 OpenSearch 上用反引号引用索引名，并使用绝对 UTC 时间（OpenSearch 1.x SQL 没有 `NOW()`）。PPL 的时间窗口会插入到 `source=` 之后。
 
 ## 批量 SQL 执行
 

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { discoverTabIndexPattern, parseDiscoverTabState } from "@/lib/tabs/esDiscoverTab";
 import { computed, ref, defineAsyncComponent, watch, nextTick, onMounted, onUnmounted } from "vue";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStorage";
 import { appendDebugLog, isDebugLoggingEnabled } from "@/lib/backend/debugLog";
@@ -130,6 +131,8 @@ const DamengJobAdmin = defineAsyncComponent(() => import("@/components/admin/Dam
 const DamengUserAdmin = defineAsyncComponent(() => import("@/components/admin/DamengUserAdmin.vue"));
 const DamengRoleAdmin = defineAsyncComponent(() => import("@/components/admin/DamengRoleAdmin.vue"));
 const SolrAdmin = defineAsyncComponent(() => import("@/components/solr/SolrAdmin.vue"));
+const ElasticsearchDiscover = defineAsyncComponent(() => import("@/components/elasticsearch/discover/ElasticsearchDiscover.vue"));
+const ElasticsearchConsole = defineAsyncComponent(() => import("@/components/elasticsearch/console/ElasticsearchConsole.vue"));
 const PluginFilesystemTab = defineAsyncComponent(() => import("@/components/plugins/PluginFilesystemTab.vue"));
 const ExplainPlanViewer = defineAsyncComponent(() => import("@/components/explain/ExplainPlanViewer.vue"));
 const QueryChart = defineAsyncComponent(() => import("@/components/chart/QueryChart.vue"));
@@ -2865,6 +2868,24 @@ defineExpose({
     <template v-else-if="activeTab.mode === 'solr-admin'">
       <div class="min-h-0 flex-1">
         <SolrAdmin :key="activeTab.id" :connection-id="activeTab.connectionId" />
+      </div>
+    </template>
+
+    <template v-else-if="activeTab.mode === 'es-discover'">
+      <div class="min-h-0 flex-1">
+        <ElasticsearchDiscover
+          :key="activeTab.id"
+          :connection-id="activeTab.connectionId"
+          :initial-index-pattern="discoverTabIndexPattern(activeTab) || undefined"
+          :initial-state="parseDiscoverTabState(activeTab.sql) as any"
+          @state-change="(state: unknown) => queryStore.updateSql(activeTab!.id, JSON.stringify(state))"
+        />
+      </div>
+    </template>
+
+    <template v-else-if="activeTab.mode === 'es-console'">
+      <div class="min-h-0 flex-1">
+        <ElasticsearchConsole :key="activeTab.id" :connection-id="activeTab.connectionId" :initial-text="activeTab.sql || undefined" @text-change="(text: string) => queryStore.updateSql(activeTab!.id, text)" />
       </div>
     </template>
 

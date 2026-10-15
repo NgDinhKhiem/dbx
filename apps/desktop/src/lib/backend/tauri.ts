@@ -4558,6 +4558,41 @@ export async function elasticsearchDeleteAllDocuments(connectionId: string, inde
   });
 }
 
+export type ElasticsearchRawRequestMethod = "GET" | "POST" | "PUT" | "DELETE" | "HEAD" | "PATCH";
+
+/** Dev Tools console request; `path` may carry a query string and a missing leading slash is added. */
+export interface ElasticsearchRawRequest {
+  method: ElasticsearchRawRequestMethod;
+  path: string;
+  body?: string;
+}
+
+/** Raw HTTP answer from the cluster. Non-2xx statuses are returned here, not thrown. */
+export interface ElasticsearchRawResponse {
+  status: number;
+  body: string;
+  tookMs: number;
+}
+
+/** Cluster distribution from `GET /` (`"opensearch"`, `"elasticsearch"`, `"easysearch"`); null when unknown. */
+export interface ElasticsearchClusterInfo {
+  distribution: string | null;
+  version: string | null;
+}
+
+export async function elasticsearchRawRequest(connectionId: string, request: ElasticsearchRawRequest): Promise<ElasticsearchRawResponse> {
+  return invoke("elasticsearch_raw_request", {
+    connectionId,
+    method: request.method,
+    path: request.path,
+    body: request.body,
+  });
+}
+
+export async function elasticsearchClusterInfo(connectionId: string): Promise<ElasticsearchClusterInfo> {
+  return invoke("elasticsearch_cluster_info", { connectionId });
+}
+
 export async function mongoCountDocuments(connectionId: string, database: string, collection: string, filter?: string, mode?: "accurate" | "legacy", executionId?: string): Promise<number> {
   return invoke("mongo_count_documents", {
     connectionId,

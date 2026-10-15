@@ -24,9 +24,48 @@ export const deleteConnectionsWithGroup = ref(false);
 export const showTableVGroupDialog = ref(false);
 export const tableVGroupName = ref("");
 /** Scope snapshot + creation payload for the table vgroup naming dialog. */
-export const tableVGroupDialogScope = shallowRef<TreeNode | null>(null);
+export const tableVGroupDialogScope = shallowRef<TreeNode | TableVGroupScope | null>(null);
 export const tableVGroupDialogParentGroupId = ref<string | null>(null);
 export const tableVGroupDialogTableNames = ref<string[]>([]);
+/** Row type of `tableVGroupDialogTableNames` (defaults to the scope row's type). */
+export const tableVGroupDialogRowType = ref<string | undefined>(undefined);
+/** Regex mode: create a rule group, or edit the rule of `tableVGroupDialogEditGroupId`. */
+export const tableVGroupDialogRuleMode = ref(false);
+export const tableVGroupDialogPattern = ref("");
+export const tableVGroupDialogIgnoreCase = ref(true);
+export const tableVGroupDialogEditGroupId = ref<string | null>(null);
+/** Names currently loaded in the container, for the live regex preview. */
+export const tableVGroupDialogCandidateNames = ref<string[]>([]);
+export const tableVGroupDialogKind = ref<"databases" | "tables">("tables");
+
+export interface OpenTableVGroupDialogOptions {
+  scope: TreeNode | TableVGroupScope;
+  kind?: "databases" | "tables";
+  parentGroupId?: string | null;
+  tableNames?: string[];
+  rowType?: string;
+  ruleMode?: boolean;
+  candidateNames?: string[];
+  editGroupId?: string | null;
+  pattern?: string;
+  ignoreCase?: boolean;
+}
+
+/** Open the group dialog with every field reset, so no state leaks between uses. */
+export function openTableVGroupDialog(options: OpenTableVGroupDialogOptions) {
+  tableVGroupDialogScope.value = options.scope;
+  tableVGroupDialogKind.value = options.kind ?? "tables";
+  tableVGroupDialogParentGroupId.value = options.parentGroupId ?? null;
+  tableVGroupDialogTableNames.value = options.tableNames ?? [];
+  tableVGroupDialogRowType.value = options.rowType;
+  tableVGroupDialogRuleMode.value = options.ruleMode === true;
+  tableVGroupDialogCandidateNames.value = options.candidateNames ?? [];
+  tableVGroupDialogEditGroupId.value = options.editGroupId ?? null;
+  tableVGroupDialogPattern.value = options.pattern ?? "";
+  tableVGroupDialogIgnoreCase.value = options.ignoreCase !== false;
+  tableVGroupName.value = "";
+  showTableVGroupDialog.value = true;
+}
 export const showTableVGroupDeleteConfirm = ref(false);
 /** Scope + group snapshot for the table vgroup delete confirmation. */
 export const tableVGroupDeleteTarget = shallowRef<{ scope: TableVGroupScope; groupId: string; name: string } | null>(null);
@@ -291,4 +330,11 @@ export function resetSidebarTreeDialogState() {
   tableVGroupDialogScope.value = null;
   tableVGroupDialogParentGroupId.value = null;
   tableVGroupDialogTableNames.value = [];
+  tableVGroupDialogRowType.value = undefined;
+  tableVGroupDialogRuleMode.value = false;
+  tableVGroupDialogPattern.value = "";
+  tableVGroupDialogIgnoreCase.value = true;
+  tableVGroupDialogEditGroupId.value = null;
+  tableVGroupDialogCandidateNames.value = [];
+  tableVGroupDialogKind.value = "tables";
 }

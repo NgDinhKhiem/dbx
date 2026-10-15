@@ -43,6 +43,7 @@ import {
 import OracleDatabaseLinksDialog from "@/components/objects/OracleDatabaseLinksDialog.vue";
 const showDatabaseLinks = ref(false);
 import { useConnectionStore } from "@/stores/connectionStore";
+import { requestDriverPrewarm } from "@/lib/connection/driverPrewarmRuntime";
 import { useQueryStore } from "@/stores/queryStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useToast } from "@/composables/useToast";
@@ -74,9 +75,9 @@ import { formatSidebarObjectStorage } from "@/lib/sidebar/sidebarDatabaseStorage
 import { effectiveRedisDatabaseIndex } from "@/lib/redis/redisDatabaseIndex";
 import { dataTabOpenModeFromTreeClick } from "@/lib/sidebar/dataTabOpenPolicy";
 import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
-import { isTableVGroupGroupableRowType, selectedTableVGroupMoveTargets, tableVGroupIdFromNodeId } from "@/lib/table/tableVGroup";
+import { isDatabaseVGroupRow, isTableVGroupGroupableRowType, selectedTableVGroupMoveTargets, tableVGroupIdFromNodeId, tableVGroupPathForTable, tableVGroupRowName } from "@/lib/table/tableVGroup";
 import { findTreeNodeById } from "@/lib/sql/newQueryContext";
-import { resolveTableVGroupDropTarget, setTableVGroupDropTargetNodeId, tableVGroupDropTargetNodeId } from "@/lib/sidebar/sidebarTableVGroupDrag";
+import { resolveDatabaseVGroupDropTarget, resolveTableVGroupDropTarget, setTableVGroupDropTargetNodeId, tableVGroupDropTargetNodeId } from "@/lib/sidebar/sidebarTableVGroupDrag";
 import { connectionDisplayUrlScheme } from "@/lib/connection/connectionPresentation";
 import { isFocusSearchShortcut } from "@/lib/editor/keyboardShortcuts";
 import { encodeSpannerResourcePath } from "@/lib/connection/spannerResourcePath";
@@ -165,6 +166,8 @@ function scheduleLabelOverflowMeasure() {
 }
 
 function handleMouseEnter() {
+  // Hovering a connection signals intent: warm its driver runtime (no connect).
+  if (props.node.type === "connection") requestDriverPrewarm(props.node.connectionId);
   if (!shouldMeasureLabelOverflow()) {
     labelOverflowing.value = false;
     return;
@@ -252,7 +255,8 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
     case "connection-group":
       return { icon: node.isExpanded ? FolderOpen : FolderClosed, colorClass: "text-amber-500" };
     case "table-vgroup":
-      return { icon: node.isExpanded ? FolderOpen : FolderClosed, colorClass: "text-emerald-500" };
+      // Rule (regex) groups get their own color so they read differently from manual groups.
+      return { icon: node.isExpanded ? FolderOpen : FolderClosed, colorClass: node.vgroupPattern ? "text-violet-500" : "text-emerald-500" };
     case "database":
       return { icon: Database, colorClass: "text-yellow-500" };
     case "tablespace":
@@ -459,6 +463,7 @@ function treeNodeSecondaryValue(node: TreeNode): string | undefined {
   if (node.type === "type-member") return (node.meta as CustomTypeTreeMemberMeta | undefined)?.displayValue;
   if (node.type === "datafile") return node.xuguDatafilePath;
   if (node.type === "elasticsearch-index") return elasticsearchIndexAliasLabel(node);
+  if (node.type === "table-vgroup" && node.vgroupPattern) return `/${node.vgroupPattern}/`;
   return undefined;
 }
 
@@ -1382,6 +1387,7 @@ function startTableReferenceDrag(payload: QueryEditorTableReferencePayload) {
   vgroupDragTableNames = selectedTableVGroupMoveTargets(activeNode.value, selectedTreeNodesInVisibleOrder())
     .filter((node) => isTableVGroupGroupableRowType(node.type))
     .map((node) => node.label);
+  vgroupDragDatabaseNames = databaseVGroupDragNames();
   setActiveTableReferencePayload(payload);
   document.getSelection()?.removeAllRanges();
   referenceDragFeedback = beginTableReferenceDragFeedback(tableReferenceDragLabel(payload));
@@ -1392,6 +1398,7 @@ function finishTableReferenceDrag() {
   pendingTableReferenceDrag = null;
   draggingTableReferencePayload = null;
   vgroupDragTableNames = [];
+  vgroupDragDatabaseNames = [];
   setTableVGroupDropTargetNodeId(null);
   referenceDragFeedback?.end();
   referenceDragFeedback = null;
@@ -1402,8 +1409,31 @@ function finishTableReferenceDrag() {
 
 /** 本次拖拽要移动进分组的表名（拖拽开始时按选中区解析，见 startTableReferenceDrag）。 */
 let vgroupDragTableNames: string[] = [];
+/** Database names this drag can move between database groups (same connection). */
+let vgroupDragDatabaseNames: string[] = [];
+
+/** Dragging a database row moves it, or the selected database rows of its connection, between database groups. */
+function databaseVGroupDragNames(): string[] {
+  const node = activeNode.value;
+  if (node.type !== "database" || !node.connectionId || !isDatabaseVGroupRow(connectionStore.treeNodes, node)) return [];
+  const selected = selectedTreeNodesInVisibleOrder().filter((candidate) => candidate.type === "database" && candidate.connectionId === node.connectionId && isDatabaseVGroupRow(connectionStore.treeNodes, candidate));
+  const targets = selected.some((candidate) => candidate.id === node.id) ? selected : [node];
+  return targets.map((target) => tableVGroupRowName(target)).filter(Boolean);
+}
+
+/** Apply a database drop: into a group, or out of its group when released on the connection. */
+function dropDatabasesOnVGroup(connectionId: string, groupId: string | null) {
+  const scope = connectionStore.databaseVGroupScope(connectionId);
+  const layout = connectionStore.tableVGroupLayoutFor(scope);
+  for (const name of vgroupDragDatabaseNames) {
+    // Released on the connection: only rows that sit in a group move out.
+    if (!groupId && !tableVGroupPathForTable(layout, name, "database").length) continue;
+    connectionStore.moveTableToVGroup(scope, name, groupId, "database");
+  }
+}
 
 function tableVGroupDropTargetFor(payload: QueryEditorTableReferencePayload, event: MouseEvent) {
+  if (vgroupDragDatabaseNames.length && activeNode.value.connectionId) return resolveDatabaseVGroupDropTarget(event.clientX, event.clientY, connectionStore.treeNodes, activeNode.value.connectionId);
   if (!vgroupDragTableNames.length) return null;
   // 拖拽源是树行（多选同类型），落点解析按行类别过滤跨类别容器。
   return resolveTableVGroupDropTarget(event.clientX, event.clientY, connectionStore.treeNodes, { ...payload, objectType: activeNode.value.type });
@@ -1434,7 +1464,9 @@ function onTableReferenceMouseUp(event: MouseEvent) {
   if (payload) {
     suppressNextTableReferenceClick = true;
     const dropTarget = tableVGroupDropTargetFor(payload, event);
-    if (dropTarget) {
+    if (dropTarget && vgroupDragDatabaseNames.length && activeNode.value.connectionId) {
+      dropDatabasesOnVGroup(activeNode.value.connectionId, dropTarget.groupId);
+    } else if (dropTarget) {
       for (const tableName of vgroupDragTableNames) connectionStore.moveTableToVGroup(dropTarget.node, tableName, dropTarget.groupId, activeNode.value.type);
     } else {
       const target = document.elementFromPoint(event.clientX, event.clientY);

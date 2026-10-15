@@ -619,6 +619,65 @@ pub async fn elasticsearch_get_index_metadata_core(
     }
 }
 
+/// Dev Tools console request against an Elasticsearch / OpenSearch /
+/// Easysearch connection, sent through the pooled client so auth, TLS, the
+/// Kibana / OpenSearch Dashboards proxy mode and timeouts all apply. Non-2xx
+/// responses are returned as data; only transport failures are errors.
+pub async fn elasticsearch_raw_request_core(
+    state: &AppState,
+    connection_id: &str,
+    method: &str,
+    path: &str,
+    body: Option<String>,
+) -> Result<elasticsearch_driver::ElasticsearchRawResponse, String> {
+    let request = elasticsearch_driver::ElasticsearchRawRequest::parse(method, path, body)?;
+    // Checked before connecting so a blocked request never reaches the cluster.
+    if let Some(name) = crate::query::connection_readonly_name(state, connection_id).await {
+        if !request.is_read_only() {
+            return Err(format!(
+                "READ_ONLY: connection '{name}' has read-only protection enabled. {} {} is not a read-only \
+                 request; only GET/HEAD and search-style POST requests are allowed.",
+                request.method(),
+                request.path()
+            ));
+        }
+    }
+    ensure_document_pool(state, connection_id).await?;
+    let pool = state.pool_handle(connection_id).await.ok_or("Not found")?;
+    match &pool {
+        PoolKind::Elasticsearch(client) => {
+            let client = client.clone();
+            elasticsearch_driver::execute_raw_request(&client, &request).await
+        }
+        PoolKind::Easysearch(client) => {
+            let client = client.clone();
+            easysearch_driver::execute_raw_request(&client, &request).await
+        }
+        _ => Err("Not an Elasticsearch connection".to_string()),
+    }
+}
+
+/// Distribution (`opensearch`, `elasticsearch`, `easysearch`) and version of
+/// the cluster behind the connection, detected once per pooled client.
+pub async fn elasticsearch_cluster_info_core(
+    state: &AppState,
+    connection_id: &str,
+) -> Result<elasticsearch_driver::ElasticsearchClusterInfo, String> {
+    ensure_document_pool(state, connection_id).await?;
+    let pool = state.pool_handle(connection_id).await.ok_or("Not found")?;
+    match &pool {
+        PoolKind::Elasticsearch(client) => {
+            let client = client.clone();
+            elasticsearch_driver::cluster_info(&client).await
+        }
+        PoolKind::Easysearch(client) => {
+            let client = client.clone();
+            easysearch_driver::cluster_info(&client).await
+        }
+        _ => Err("Not an Elasticsearch connection".to_string()),
+    }
+}
+
 /// 清空索引数据：删除全部文档，保留 mapping、settings 与别名。
 pub async fn elasticsearch_delete_all_documents_core(
     state: &AppState,
@@ -1132,6 +1191,107 @@ mod tests {
         MongoGridFsBucketInfo,
     };
     use crate::db::mongo_driver::MongoCollectionKind;
+
+    async fn elasticsearch_state(port: u16, read_only: bool) -> (crate::connection::AppState, tempfile::TempDir) {
+        let config: crate::models::connection::ConnectionConfig = serde_json::from_value(serde_json::json!({
+            "id": "es",
+            "name": "prod-es",
+            "db_type": "elasticsearch",
+            "host": "127.0.0.1",
+            "port": port,
+            "username": "",
+            "password": "",
+            "read_only": read_only
+        }))
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::Storage::open(&dir.path().join("storage.db")).await.expect("open storage");
+        let state = crate::connection::AppState::new_with_plugin_dir(storage, dir.path().join("plugins"));
+        state.configs.write().await.insert(config.id.clone(), config);
+        (state, dir)
+    }
+
+    /// Answers each accepted connection with the next canned `(status, body)`.
+    async fn serve_http(
+        listener: tokio::net::TcpListener,
+        responses: Vec<(u16, &'static str)>,
+    ) -> tokio::task::JoinHandle<Vec<String>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::spawn(async move {
+            let mut request_lines = Vec::new();
+            for (status, body) in responses {
+                // Pool setup may open bare TCP reachability probes; skip those.
+                let (mut socket, request) = loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut buffer = vec![0_u8; 8192];
+                    let read = socket.read(&mut buffer).await.unwrap_or(0);
+                    if read > 0 {
+                        break (socket, String::from_utf8_lossy(&buffer[..read]).to_string());
+                    }
+                };
+                request_lines.push(request.lines().next().unwrap_or_default().to_string());
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+            request_lines
+        })
+    }
+
+    #[tokio::test]
+    async fn elasticsearch_raw_request_blocks_writes_on_read_only_connections_before_connecting() {
+        // Nothing listens on this port: a blocked request must fail before any connection attempt.
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let (state, _dir) = elasticsearch_state(port, true).await;
+        for (method, path) in [("PUT", "/logs"), ("DELETE", "/logs"), ("POST", "/logs/_doc"), ("PATCH", "/x")] {
+            let error = super::elasticsearch_raw_request_core(&state, "es", method, path, Some("{}".to_string()))
+                .await
+                .unwrap_err();
+            assert!(error.starts_with("READ_ONLY:"), "{method} {path}: {error}");
+            assert!(error.contains("prod-es"), "{error}");
+        }
+        let error = super::elasticsearch_raw_request_core(&state, "es", "TRACE", "/", None).await.unwrap_err();
+        assert!(error.contains("Unsupported HTTP method"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn elasticsearch_raw_request_allows_reads_on_read_only_connections_and_returns_errors_as_data() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = serve_http(
+            listener,
+            vec![
+                (200, r#"{"version":{"distribution":"opensearch","number":"2.11.1"}}"#),
+                (503, r#"{"status":"red"}"#),
+                // Reusing a pooled search client re-runs the connectivity check.
+                (200, r#"{"version":{"distribution":"opensearch","number":"2.11.1"}}"#),
+            ],
+        )
+        .await;
+        let (state, _dir) = elasticsearch_state(port, true).await;
+
+        let response = super::elasticsearch_raw_request_core(
+            &state,
+            "es",
+            "POST",
+            "logs-*/_search?size=0",
+            Some("{}".to_string()),
+        )
+        .await
+        .unwrap();
+        // The connection check already read `GET /`, so cluster info comes from the cached probe.
+        let info = super::elasticsearch_cluster_info_core(&state, "es").await.unwrap();
+        server.abort();
+
+        assert_eq!((response.status, response.body.as_str()), (503, r#"{"status":"red"}"#));
+        assert_eq!(info.distribution.as_deref(), Some("opensearch"));
+        assert_eq!(info.version.as_deref(), Some("2.11.1"));
+    }
 
     #[test]
     fn sorts_names_case_insensitively() {

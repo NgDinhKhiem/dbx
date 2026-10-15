@@ -381,7 +381,9 @@ pub fn run_if_requested() -> bool {
         let result = runtime.block_on(async {
             let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
             dbx_core::sql_dialect::dialect_loader::register_core_dialects();
-            let storage = Storage::open_unmigrated(&dir.join("dbx.db")).await?;
+            let storage = Storage::open_unmigrated(&dir.join("dbx.db")).await?
+                // Same key source as the app: a local file, never the Keychain.
+                .with_secret_key_policy(dbx_core::persistence::secret_codec::SecretKeyPolicy::LocalKeyFile);
             let state = Arc::new(AppState::new_with_plugin_dir(storage, dir.join("plugins")));
             let stop = CancellationToken::new();
             let drain = CancellationToken::new();

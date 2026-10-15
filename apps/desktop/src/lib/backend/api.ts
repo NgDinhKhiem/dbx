@@ -740,6 +740,7 @@ export const hbaseDeleteTable = forward("hbaseDeleteTable");
 
 // Message Queue
 export const mqTestConnection = forward("mqTestConnection");
+export const mqPrewarmAgent = forward("mqPrewarmAgent");
 export const mqListTenants = forward("mqListTenants");
 export const mqGetTenant = forward("mqGetTenant");
 export const mqCreateTenant = forward("mqCreateTenant");
@@ -893,6 +894,8 @@ export const mongoFindOneAndDelete = forward("mongoFindOneAndDelete");
 export const elasticsearchListIndices = forward("elasticsearchListIndices");
 export const elasticsearchGetIndexMetadata = forward("elasticsearchGetIndexMetadata");
 export const elasticsearchDeleteAllDocuments = forward("elasticsearchDeleteAllDocuments");
+export const elasticsearchRawRequest = forward("elasticsearchRawRequest");
+export const elasticsearchClusterInfo = forward("elasticsearchClusterInfo");
 export const vectorListCollections = forward("vectorListCollections");
 
 // History
@@ -1114,6 +1117,10 @@ export type {
   GlobalSearchRequest,
   GlobalSearchMatch,
   GlobalSearchSettings,
+  ElasticsearchRawRequestMethod,
+  ElasticsearchRawRequest,
+  ElasticsearchRawResponse,
+  ElasticsearchClusterInfo,
 } from "@/lib/backend/tauri";
 
 // MQTT

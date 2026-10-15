@@ -9,7 +9,6 @@ use dbx_core::agent_service::AgentProgressEvent;
 use dbx_core::jdbc::{
     self, JdbcDriverInfo, JdbcLocalBundleInfo, JdbcMavenBundleInfo, JdbcMavenInstallRequest, JdbcPluginStatus,
 };
-use dbx_core::models::connection::ConnectionConfig;
 use dbx_core::plugins::{
     ActivePluginSession, InstalledPlugin, InstalledPluginInfo, PluginConnectionActionResult,
     PluginFilesystemListResult, PluginFilesystemMutationResult, PluginFilesystemReadResult, PluginInstallPolicy,
@@ -325,9 +324,10 @@ pub async fn invoke_plugin(
 #[tauri::command]
 pub async fn invoke_plugin_connection_action(
     state: State<'_, Arc<AppState>>,
-    config: ConnectionConfig,
+    config: dbx_core::connection_secrets::ClientConnectionInput,
     action_id: String,
 ) -> Result<PluginConnectionActionResult, String> {
+    let config = state.storage.resolve_client_connection(&config).await?;
     state.invoke_plugin_connection_action(config, &action_id).await
 }
 

@@ -122,7 +122,8 @@ describe("connectionStore database info", () => {
     connectionNode.isExpanded = true;
     const existingChildIds = connectionNode.children?.map((child) => child.id);
 
-    await store.updateConnection({ ...config, note: "Production reporting" });
+    // The UI re-submits the saved copy (secrets blank + saved_secrets), not the typed password.
+    await store.updateConnection({ ...store.getConfig(config.id)!, note: "Production reporting" });
 
     expect(saveConnections).toHaveBeenLastCalledWith([expect.objectContaining({ id: config.id, note: "Production reporting" })]);
     expect(store.getConfig(config.id)?.note).toBe("Production reporting");

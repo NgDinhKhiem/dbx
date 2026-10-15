@@ -16,7 +16,8 @@ import {
 } from "@/lib/mcp/mcpPolicySelection";
 
 const settingsDialogSource = readFileSync(new URL("../../../components/editor/EditorSettingsDialog.vue", import.meta.url), "utf8");
-const mcpServerSource = readFileSync(new URL("../../../../../../crates/dbx-mcp/src/server.rs", import.meta.url), "utf8");
+// Tools are registered in server.rs and in its per-engine child modules.
+const mcpServerSource = ["server.rs", "kafka_tools.rs", "opensearch_tools.rs"].map((file) => readFileSync(new URL(`../../../../../../crates/dbx-mcp/src/${file}`, import.meta.url), "utf8")).join("\n");
 
 describe("MCP execution permission selection", () => {
   it("maps the persisted policy to the three UI modes", () => {

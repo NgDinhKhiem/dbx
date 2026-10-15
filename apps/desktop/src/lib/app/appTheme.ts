@@ -182,7 +182,8 @@ export function normalizeAppThemeMode(value: string | null): AppThemeMode {
   if (value === "soft-dark") return "dark";
   if (value === "soft-system") return "system";
   if (value === "dark" || value === "light" || value === "system") return value;
-  return "light";
+  // No saved (or unknown) preference: start in dark mode.
+  return "dark";
 }
 
 export function normalizeAppThemePalette(value: string | null): AppThemePalette {

@@ -1,7 +1,7 @@
-import type { ConnectionGroup, TableVGroupLayout, TableVGroupOrderEntry, TreeNode } from "@/types/database";
+import type { TableVGroupDefinition, TableVGroupLayout, TableVGroupOrderEntry, TreeNode } from "@/types/database";
 import { uuid } from "@/lib/common/utils";
 
-export type { TableVGroupLayout, TableVGroupOrderEntry };
+export type { TableVGroupDefinition, TableVGroupLayout, TableVGroupOrderEntry };
 
 /**
  * Table virtual groups (issue #3470): a purely local, per-scope arrangement of
@@ -18,7 +18,7 @@ export type TableVGroupDropPosition = "before" | "after" | "inside";
  * procedures / triggers 对应 #9446 方向一与 #9733；其余容器类别为同一机制的
  * 全量补齐（与 groupDefs 的库级对象容器一一对应）。
  */
-export type TableVGroupObjectKind = "tables" | "views" | "materialized_views" | "procedures" | "functions" | "triggers" | "sequences" | "events" | "synonyms" | "jobs" | "packages" | "types";
+export type TableVGroupObjectKind = "databases" | "tables" | "views" | "materialized_views" | "procedures" | "functions" | "triggers" | "sequences" | "events" | "synonyms" | "jobs" | "packages" | "types";
 
 export interface TableVGroupScope {
   connectionId?: string;
@@ -46,6 +46,8 @@ export function tableVGroupsEnabled(layout: TableVGroupLayout | null | undefined
 }
 
 export function tableVGroupScopeKey(scope: TableVGroupScope): string | null {
+  // Database groups live directly under the connection: no database/schema part.
+  if (scope.objectType === "databases") return scope.connectionId ? [scope.connectionId, "", "", "", "", "databases"].join("\u0000") : null;
   if (!scope.connectionId || !scope.database) return null;
   const parts = [scope.connectionId, scope.linkedServer ?? "", scope.catalog ?? "", scope.database, scope.schema ?? ""];
   // 仅非表容器在尾部追加类别段：表分组的 key 与历史持久化逐字节一致，零迁移。
@@ -71,6 +73,8 @@ export function tableVGroupIdFromNodeId(nodeId: string): string | null {
  */
 export function tableVGroupKindOfContainerNode(node: Pick<TreeNode, "type" | "tableName">): TableVGroupObjectKind | null {
   switch (node.type) {
+    case "connection":
+      return "databases";
     case "database":
     case "schema":
     case "linked-server-schema":
@@ -106,6 +110,7 @@ export function tableVGroupKindOfContainerNode(node: Pick<TreeNode, "type" | "ta
 
 /** 各类别容器里可被分组的行 type；成员身份仍是容器内的行 label。 */
 const TABLE_VGROUP_KIND_ROW_TYPES: Record<TableVGroupObjectKind, Record<string, true>> = {
+  databases: { database: true, schema: true },
   tables: { table: true },
   views: { view: true },
   materialized_views: { materialized_view: true },
@@ -273,9 +278,14 @@ export function reorderTableVGroupEntry(layout: TableVGroupLayout, draggedEntryI
   return { ...layout, order };
 }
 
-export function createTableVGroup(layout: TableVGroupLayout, name: string, parentGroupId?: string | null): { layout: TableVGroupLayout; groupId: string } {
+export interface TableVGroupRule {
+  pattern: string;
+  ignoreCase?: boolean;
+}
+
+export function createTableVGroup(layout: TableVGroupLayout, name: string, parentGroupId?: string | null, rule?: TableVGroupRule | null): { layout: TableVGroupLayout; groupId: string } {
   const groupId = uuid();
-  const group: ConnectionGroup = { id: groupId, name, collapsed: false };
+  const group: TableVGroupDefinition = { id: groupId, name, collapsed: false, ...(rule?.pattern ? { pattern: rule.pattern, patternIgnoreCase: rule.ignoreCase !== false } : {}) };
   const order = cloneEntries(layout.order);
   const entry: TableVGroupOrderEntry = { type: "group", id: groupId, children: [] };
 
@@ -308,6 +318,39 @@ export function renameTableVGroup(layout: TableVGroupLayout, groupId: string, na
     ...layout,
     groups: layout.groups.map((group) => (group.id === groupId ? { ...group, name } : group)),
   };
+}
+
+/** Set (or clear, with a null rule) the regular expression of a group. */
+export function setTableVGroupRule(layout: TableVGroupLayout, groupId: string, rule: TableVGroupRule | null): TableVGroupLayout {
+  return {
+    ...layout,
+    groups: layout.groups.map((group) => {
+      if (group.id !== groupId) return group;
+      const { pattern: _pattern, patternIgnoreCase: _ignoreCase, ...rest } = group;
+      return rule?.pattern ? { ...rest, pattern: rule.pattern, patternIgnoreCase: rule.ignoreCase !== false } : rest;
+    }),
+  };
+}
+
+/**
+ * Drop a row's explicit placement (inside a group or pinned at the top level),
+ * so rule groups decide again where it goes.
+ */
+export function clearTableVGroupPlacement(layout: TableVGroupLayout, tableName: string, rowType?: string): TableVGroupLayout {
+  if (!hasTableVGroupEntries(layout)) return layout;
+  return { ...layout, order: removeTableFromEntries(cloneEntries(layout.order), tableName, rowType) };
+}
+
+/** Whether the layout places this row explicitly (in a group or pinned at the top level). */
+export function tableVGroupHasExplicitPlacement(layout: TableVGroupLayout | null | undefined, tableName: string, rowType?: string): boolean {
+  if (!hasTableVGroupEntries(layout)) return false;
+  const walk = (entries: TableVGroupOrderEntry[]): boolean => entries.some((entry) => matchesTableEntry(entry, tableName, rowType) || (entry.type === "group" && walk(entryChildren(entry))));
+  return walk(layout.order);
+}
+
+/** Whether any group of the layout has a rule. */
+export function tableVGroupLayoutHasRules(layout: TableVGroupLayout | null | undefined): boolean {
+  return !!layout && layout.groups.some((group) => !!group.pattern);
 }
 
 /** Deleting groups keeps their tables: members flatten back into the parent level. */
@@ -408,6 +451,67 @@ function findRowIn(lookup: TableVGroupRowLookup, name: string, rowType?: string)
 
 const tableRowKey = (type: string, label: string): string => `${type}\u0000${label}`;
 
+/**
+ * The name a row is grouped by. Database and schema rows use their real name:
+ * their label can be shortened or localized for display.
+ */
+export function tableVGroupRowName(node: Pick<TreeNode, "type" | "label" | "database" | "schema">): string {
+  if (node.type === "database") return node.database ?? node.label;
+  if (node.type === "schema" && node.schema) return node.schema;
+  return node.label;
+}
+
+export const TABLE_VGROUP_PATTERN_MAX_LENGTH = 500;
+const tableVGroupPatternCache = new Map<string, RegExp | null>();
+
+/** Compile a rule group's pattern; invalid or oversized patterns never match. */
+export function compileTableVGroupPattern(pattern: string | undefined, ignoreCase = true): RegExp | null {
+  if (!pattern || pattern.length > TABLE_VGROUP_PATTERN_MAX_LENGTH) return null;
+  const cacheKey = `${ignoreCase ? "i" : ""}\u0000${pattern}`;
+  const cached = tableVGroupPatternCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+  let compiled: RegExp | null;
+  try {
+    compiled = new RegExp(pattern, ignoreCase ? "i" : "");
+  } catch {
+    compiled = null;
+  }
+  if (tableVGroupPatternCache.size >= 256) tableVGroupPatternCache.clear();
+  tableVGroupPatternCache.set(cacheKey, compiled);
+  return compiled;
+}
+
+/** Why a pattern cannot be used, or null when it is valid. */
+export function tableVGroupPatternError(pattern: string, ignoreCase = true): string | null {
+  if (!pattern.trim()) return "empty";
+  if (pattern.length > TABLE_VGROUP_PATTERN_MAX_LENGTH) return "too_long";
+  try {
+    new RegExp(pattern, ignoreCase ? "i" : "");
+    return null;
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+}
+
+/** Names from `names` the pattern matches (for the dialog preview). */
+export function tableVGroupPatternMatches(names: readonly string[], pattern: string, ignoreCase = true): string[] {
+  const regex = compileTableVGroupPattern(pattern, ignoreCase);
+  return regex ? names.filter((name) => regex.test(name)) : [];
+}
+
+/** Groupable row names currently loaded under a container node (projection stripped). */
+export function tableVGroupCandidateNames(container: TreeNode): string[] {
+  const kind = tableVGroupKindOfContainerNode(container);
+  if (!kind) return [];
+  const rowTypes = TABLE_VGROUP_KIND_ROW_TYPES[kind];
+  const names: string[] = [];
+  for (const node of stripTableVGroupsFromChildren(container.children ?? [])) {
+    const name = tableVGroupRowName(node);
+    if (rowTypes[node.type] && name && !names.includes(name)) names.push(name);
+  }
+  return names;
+}
+
 function buildVGroupChildNodes(entries: TableVGroupOrderEntry[], layout: TableVGroupLayout, lookup: TableVGroupRowLookup, scope: TableVGroupScope): TreeNode[] {
   const nodes: TreeNode[] = [];
   for (const entry of entries) {
@@ -429,6 +533,7 @@ function buildVGroupChildNodes(entries: TableVGroupOrderEntry[], layout: TableVG
       linkedServer: scope.linkedServer,
       vgroupId: entry.id,
       vgroupKind: scope.objectType ?? "tables",
+      ...(group.pattern ? { vgroupPattern: group.pattern } : {}),
       isExpanded: !group.collapsed,
       children: buildVGroupChildNodes(entryChildren(entry), layout, lookup, scope),
     });
@@ -464,6 +569,7 @@ function buildVGroupRootNodes(entries: TableVGroupOrderEntry[], layout: TableVGr
         linkedServer: scope.linkedServer,
         vgroupId: entry.id,
         vgroupKind: scope.objectType ?? "tables",
+        ...(group.pattern ? { vgroupPattern: group.pattern } : {}),
         isExpanded: !group.collapsed,
         children: buildVGroupChildNodes(entryChildren(entry), layout, lookup, scope),
       },
@@ -471,6 +577,23 @@ function buildVGroupRootNodes(entries: TableVGroupOrderEntry[], layout: TableVGr
       sortIndex: -1_000_000 + groupSeq++,
     });
   }
+  return out;
+}
+
+/** Projected group nodes that carry a valid rule, depth-first in layout order. */
+function collectRuleGroupNodes(nodes: TreeNode[], layout: TableVGroupLayout): Array<{ node: TreeNode; regex: RegExp }> {
+  if (!layout.groups.some((group) => group.pattern)) return [];
+  const out: Array<{ node: TreeNode; regex: RegExp }> = [];
+  const walk = (list: TreeNode[]) => {
+    for (const node of list) {
+      if (node.type !== "table-vgroup") continue;
+      const group = layout.groups.find((candidate) => candidate.id === node.vgroupId);
+      const regex = compileTableVGroupPattern(group?.pattern, group?.patternIgnoreCase !== false);
+      if (regex) out.push({ node, regex });
+      walk(node.children ?? []);
+    }
+  };
+  walk(nodes);
   return out;
 }
 
@@ -496,9 +619,10 @@ export function applyTableVGroupsToChildren(children: TreeNode[], layout: TableV
   for (let i = 0; i < flatChildren.length; i++) {
     const node = flatChildren[i]!;
     // 键为 (行类型, 名字)：包 spec/body 同名双行可各自独立成组员；同名首行别名供历史条目按名匹配。
-    if (rowTypes[node.type] && !rows.byKey.has(tableRowKey(node.type, node.label))) {
-      rows.byKey.set(tableRowKey(node.type, node.label), { node, flatIndex: i });
-      if (!rows.byLabel.has(node.label)) rows.byLabel.set(node.label, { node, flatIndex: i });
+    const name = rowTypes[node.type] ? tableVGroupRowName(node) : "";
+    if (name && !rows.byKey.has(tableRowKey(node.type, name))) {
+      rows.byKey.set(tableRowKey(node.type, name), { node, flatIndex: i });
+      if (!rows.byLabel.has(name)) rows.byLabel.set(name, { node, flatIndex: i });
     } else passthrough.push({ node, sortIndex: i });
   }
   if (!rows.byKey.size) return flatChildren;
@@ -513,8 +637,22 @@ export function applyTableVGroupsToChildren(children: TreeNode[], layout: TableV
     }
   };
   consume(rootBuilt.map((item) => item.node));
+  // Rule groups collect the rows the layout does not place explicitly: first
+  // matching group in layout order wins, members keep their list order.
+  const ruleGroups = collectRuleGroupNodes(
+    rootBuilt.map((item) => item.node),
+    activeLayout,
+  );
   for (const row of rows.byKey.values()) {
-    if (!consumed.has(row.node)) passthrough.push({ node: row.node, sortIndex: row.flatIndex });
+    if (consumed.has(row.node)) continue;
+    const name = tableVGroupRowName(row.node);
+    const target = ruleGroups.find((group) => group.regex.test(name));
+    if (target) {
+      (target.node.children ??= []).push(row.node);
+      consumed.add(row.node);
+      continue;
+    }
+    passthrough.push({ node: row.node, sortIndex: row.flatIndex });
   }
 
   const merged = [...rootBuilt, ...passthrough];
@@ -585,7 +723,7 @@ export function findTableVGroupContainerNode(nodes: TreeNode[], scope: TableVGro
   if (!candidates.length) return null;
 
   if (memberLabel) {
-    const holder = candidates.find((node) => (node.children ?? []).some((child) => memberRowTypes[child.type] && child.label === memberLabel));
+    const holder = candidates.find((node) => (node.children ?? []).some((child) => memberRowTypes[child.type] && tableVGroupRowName(child) === memberLabel));
     if (holder) return holder;
   }
   return candidates.find((node) => (node.children ?? []).some((child) => memberRowTypes[child.type] || child.type === "table-vgroup")) ?? candidates[0]!;
@@ -603,14 +741,15 @@ export function normalizeTableVGroupLayout(value: unknown): TableVGroupLayout {
   if (!Array.isArray(raw.groups) || !Array.isArray(raw.order)) return layout;
 
   const seenGroupIds = new Set<string>();
-  const groups: ConnectionGroup[] = [];
+  const groups: TableVGroupDefinition[] = [];
   for (const group of raw.groups) {
     if (!group || typeof group !== "object") continue;
-    const candidate = group as Partial<ConnectionGroup>;
+    const candidate = group as Partial<TableVGroupDefinition>;
     if (typeof candidate.id !== "string" || !candidate.id || typeof candidate.name !== "string" || !candidate.name) continue;
     if (seenGroupIds.has(candidate.id)) continue;
     seenGroupIds.add(candidate.id);
-    groups.push({ id: candidate.id, name: candidate.name, collapsed: candidate.collapsed === true });
+    const pattern = typeof candidate.pattern === "string" && candidate.pattern && candidate.pattern.length <= TABLE_VGROUP_PATTERN_MAX_LENGTH ? candidate.pattern : undefined;
+    groups.push({ id: candidate.id, name: candidate.name, collapsed: candidate.collapsed === true, ...(pattern ? { pattern, patternIgnoreCase: candidate.patternIgnoreCase !== false } : {}) });
   }
 
   const validGroupIds = new Set(groups.map((group) => group.id));
@@ -734,7 +873,38 @@ export function resolveTableVGroupScopeFromNode(nodes: TreeNode[], node: TreeNod
     return { ...tableVGroupScopeFieldsOf(host), objectType: tableVGroupKindOfContainerNode(holder) ?? "tables" };
   }
   const container = findTableVGroupContainerNode(nodes, row as TreeNode);
-  return tableVGroupScopeFieldsOf(container ? tableVGroupScopeHostOf(nodes, container) : (row as TreeNode));
+  const fields = tableVGroupScopeFieldsOf(container ? tableVGroupScopeHostOf(nodes, container) : (row as TreeNode));
+  // A plain scope value keeps its container kind (database groups, views…);
+  // tables stays implicit so its scope key is unchanged.
+  const kind = row.objectType ?? (container ? tableVGroupKindOfContainerNode(container) : null);
+  return kind && kind !== "tables" ? { ...fields, objectType: kind } : fields;
+}
+
+/** Container whose rows a group (or a container row itself) arranges. */
+export function tableVGroupContainerOf(nodes: TreeNode[], node: TreeNode): TreeNode | null {
+  if (node.type === "table-vgroup") return findTableVGroupHolderContainer(nodes, node);
+  return isTableVGroupContainerNode(node) ? node : null;
+}
+
+/**
+ * Whether a database/schema row sits directly under its connection (possibly
+ * inside database groups), i.e. can be placed into database groups.
+ */
+export function isDatabaseVGroupRow(nodes: TreeNode[], node: TreeNode): boolean {
+  if ((node.type !== "database" && node.type !== "schema") || !node.connectionId) return false;
+  const findConnection = (list: TreeNode[]): TreeNode | null => {
+    for (const candidate of list) {
+      if (candidate.type === "connection" && candidate.connectionId === node.connectionId) return candidate;
+      if (candidate.type === "connection-group" && candidate.children) {
+        const found = findConnection(candidate.children);
+        if (found) return found;
+      }
+    }
+    return null;
+  };
+  const holdsRow = (list?: TreeNode[]): boolean => (list ?? []).some((child) => child.id === node.id || (child.type === "table-vgroup" && holdsRow(child.children)));
+  const connection = findConnection(nodes);
+  return !!connection && holdsRow(connection.children);
 }
 
 /**
@@ -762,7 +932,8 @@ export function collectTableTreeNames(nodes: readonly TreeNode[], kind: TableVGr
   const names = new Set<string>();
   const walk = (list: readonly TreeNode[]) => {
     for (const node of list) {
-      if (rowTypes[node.type] && node.label) names.add(node.label);
+      const name = rowTypes[node.type] ? tableVGroupRowName(node) : "";
+      if (name) names.add(name);
       if (node.children) walk(node.children);
     }
   };
